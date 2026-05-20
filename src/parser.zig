@@ -13,7 +13,7 @@ pub const ParseError = error {
 };
 
 fn isIdentifierChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_';
+    return (std.ascii.isAlphanumeric(c) or c == '_' or c == '\'');
 }
 
 pub const Parser = struct {

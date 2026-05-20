@@ -50,12 +50,12 @@ pub const Assembly = struct {
         self.symbols.deinit();
     }
 
-    pub fn writeOut(self: *Assembly, filepath: []const u8) !void {
-        const file = try std.fs.cwd().createFile(filepath, .{});
-        defer file.close();
+    pub fn writeOut(self: *Assembly, io: std.Io, filepath: []const u8) !void {
+        const file = try std.Io.Dir.cwd().createFile(io, filepath, .{});
+        defer file.close(io);
 
         var buffer: [4096]u8 = undefined;
-        var writer = file.writer(&buffer);
+        var writer = file.writer(io, &buffer);
 
         try writer.interface.print("#include <stdint.h>\n", .{});
         try writer.interface.print("\n", .{});
@@ -70,7 +70,7 @@ pub const Assembly = struct {
             }
             try writer.interface.writeAll("\n");
         }
-        try writer.interface.writeAll("}");
+        try writer.interface.writeAll("};\n");
         try writer.interface.flush();
 
         i = 0;
@@ -84,7 +84,7 @@ pub const Assembly = struct {
             }
             try writer.interface.writeAll("\n");
         }
-        try writer.interface.writeAll("}");
+        try writer.interface.writeAll("};");
         try writer.interface.flush();
     }
 
@@ -127,7 +127,7 @@ pub const Assembly = struct {
         _ = p.tabulation();
         const imm: u8 = p.parseInteger(u8) catch |err| blk: {
             if (err == P.ParseError.NoMatch) {
-                const label = try p.alphanumeric1();
+                const label = try p.identifier1();
                 try self.relocations.append(self.allocator, .{
                     .addr = self.pc, 
                     .name = try self.allocator.dupe(u8, label),
@@ -192,7 +192,7 @@ pub const Assembly = struct {
             p.pos = ppos;
         }
 
-        const directive = try p.parseDataDirective();
+        const directive = p.parseDataDirective() catch return;
         _ = p.tabulation();
 
         const start = p.pos;
@@ -291,7 +291,7 @@ pub const Assembly = struct {
             p.pos = ppos;
         }
 
-        const mnemonic = try p.alphanumeric1();
+        const mnemonic = p.alphanumeric1() catch return;
         const instr = std.meta.stringToEnum(isa.InstructionName, mnemonic)
             orelse return AssemblyError.InvalidInstruction;
 
@@ -311,6 +311,10 @@ pub const Assembly = struct {
     pub fn assembleLine(self: *Assembly, p: *P.Parser) !void {
         _ = p.whitespace();
         if (p.eof()) return;
+        if (p.isNewline()) {
+            try p.newline();
+            return self.assembleLine(p);
+        }
 
         const pc = self.pc;
         errdefer self.pc = pc;
@@ -373,14 +377,14 @@ pub const Assembly = struct {
         }
     }
 
-    pub fn assembleEntireFile(self: *Assembly, filepath: []const u8) !void {
-        var file = try std.fs.cwd().openFile(filepath, .{});
-        defer file.close();
+    pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
+        var file = try std.Io.Dir.cwd().openFile(io, filepath, .{});
+        defer file.close(io);
         
         //FIXME: 1MB max capacity
         var buffer: [1024 * 1024]u8 = undefined;
-        const size =  try file.readAll(&buffer);
-        var p: P.Parser = P.Parser{.input = buffer[0..size]};
+        const data = try std.Io.Dir.readFile(std.Io.Dir.cwd(), io, filepath, &buffer);
+        var p: P.Parser = P.Parser{.input = data};
 
         while (!p.eof()) {
             self.assembleLine(&p) catch |err| {
