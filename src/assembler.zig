@@ -232,8 +232,8 @@ pub const Assembly = struct {
             },
 
             .nascii => {
-                if (self.dc % 2 == 1) self.dc += 1;
                 const str = try p.parseStringLiteral();
+                if (self.dc % 2 == 1) self.dc += 1;
                 std.mem.writeInt(u16, self.data_memory[self.dc..][0..2], @truncate(str.len), .big);
                 std.mem.copyForwards(u8, self.data_memory[self.dc + 2..], str);
                 self.dc += str.len + 2;
@@ -244,10 +244,18 @@ pub const Assembly = struct {
                 self.dc += len;
             },
 
-            .word => {
+            .ptr => {
+                const name = try p.identifier1();
+                const symbol = self.symbols.get(name).?;
                 if (self.dc % 2 == 1) self.dc += 1;
+                self.data_memory[self.dc] = @truncate(symbol);
+                self.dc += 2;
+            },
+
+            .word => {
                 while (!p.eof()) {
                     const x = try p.parseInteger(i16);
+                    if (self.dc % 2 == 1) self.dc += 1;
                     std.mem.writeInt(u16, self.data_memory[self.dc..][0..2], @bitCast(x), .big);
                     self.dc += 2;
                     _ = p.tabulation();

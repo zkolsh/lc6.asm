@@ -22,6 +22,7 @@ pub const DataDirective = enum {
     byte,
     nascii,
     pad,
+    ptr,
     word,
 };
 
