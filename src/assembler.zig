@@ -50,7 +50,7 @@ pub const Assembly = struct {
         self.symbols.deinit();
     }
 
-    pub fn writeOut(self: *Assembly, io: std.Io, filepath: []const u8) !void {
+    pub fn writeHeader(self: *Assembly, io: std.Io, filepath: []const u8) !void {
         const file = try std.Io.Dir.cwd().createFile(io, filepath, .{});
         defer file.close(io);
 
@@ -354,7 +354,7 @@ pub const Assembly = struct {
         try p.newline();
     }
 
-    pub fn patchRelocations(self: *Assembly) void {
+    fn patchKnownRelocations(self: *Assembly) void {
         var i: usize = 0;
         while (i < self.relocations.items.len) {
             const r = self.relocations.items[i];
@@ -401,7 +401,7 @@ pub const Assembly = struct {
             };
         }
 
-        self.patchRelocations();
+        self.patchKnownRelocations();
         if (self.relocations.items.len > 0) {
             for (self.relocations.items) |r| {
                 p.pos = r.pos;
