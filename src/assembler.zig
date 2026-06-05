@@ -8,6 +8,8 @@ pub const Relocation = struct {
     name: []const u8,
     kind: isa.RelocationMode,
     pos: usize,
+    input: []const u8,
+    filename: []const u8,
 };
 
 pub const AssemblyError = error {
@@ -133,6 +135,8 @@ pub const Assembly = struct {
                     .name = try self.allocator.dupe(u8, label),
                     .kind = instr.getInfo().reloc.?,
                     .pos = p.pos,
+                    .input = p.input,
+                    .filename = p.currentFilename,
                 });
                 break :blk 0;
             }
@@ -163,6 +167,8 @@ pub const Assembly = struct {
                     .name = try self.allocator.dupe(u8, label),
                     .kind = instr.getInfo().reloc.?,
                     .pos = p.pos,
+                    .input = p.input,
+                    .filename = p.currentFilename,
                 });
                 break :blk 0;
             }
@@ -284,12 +290,7 @@ pub const Assembly = struct {
         const ppos = p.pos;
         errdefer p.pos = ppos;
 
-        const label: ?[]const u8 = p.parseLabel() catch |err| blk: {
-            if (err == P.ParseError.NoMatch) break :blk null;
-            if (err == P.ParseError.UnexpectedToken) break :blk null;
-            return err;
-        };
-
+        const label: ?[]const u8 = p.parseLabel() catch null;
         if (label) |name| {
             const stored_name = try self.allocator.dupe(u8, name);
             try self.symbols.put(stored_name, self.pc);
@@ -319,6 +320,7 @@ pub const Assembly = struct {
     pub fn assembleLine(self: *Assembly, p: *P.Parser) !void {
         _ = p.whitespace();
         if (p.eof()) return;
+        _ = p.whitespace();
         if (p.isNewline()) {
             try p.newline();
             return self.assembleLine(p);
@@ -336,22 +338,32 @@ pub const Assembly = struct {
             return err;
         };
 
+        if (p.peek() == '%') {
+            try p.parsePreprocessorDefinition();
+            return self.assembleLine(p);
+        }
+
         if (section) |name| {
             if (std.mem.eql(u8, name, "data")) self.current_section = .data;
             if (std.mem.eql(u8, name, "text")) self.current_section = .text;
-
             _ = p.tabulation();
             return;
         } else {
             p.pos = ppos;
-
             switch (self.current_section) {
                 .data => try self.assembleData(p),
                 .text => try self.assembleText(p),
             }
         }
 
-        try p.newline();
+        if (p.isNewline()) {
+            try p.newline();
+            return;
+        }
+
+        if (!p.eof() and !std.ascii.isWhitespace(p.peek().?)) {
+            return P.ParseError.UnexpectedToken;
+        }
     }
 
     fn patchKnownRelocations(self: *Assembly) void {
@@ -386,13 +398,13 @@ pub const Assembly = struct {
     }
 
     pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
-        var file = try std.Io.Dir.cwd().openFile(io, filepath, .{});
-        defer file.close(io);
+        const data = try std.Io.Dir.cwd().readFileAlloc(io, filepath, self.allocator, .unlimited);
+        errdefer self.allocator.free(data);
         
-        //FIXME: 1MB max capacity
-        var buffer: [1024 * 1024]u8 = undefined;
-        const data = try std.Io.Dir.readFile(std.Io.Dir.cwd(), io, filepath, &buffer);
-        var p: P.Parser = P.Parser{.input = data};
+        var p: P.Parser = try P.Parser.init(self.allocator, io);
+        defer p.deinit();
+
+        try p.pushFrame(data, filepath);
 
         while (!p.eof()) {
             self.assembleLine(&p) catch |err| {
@@ -405,6 +417,8 @@ pub const Assembly = struct {
         if (self.relocations.items.len > 0) {
             for (self.relocations.items) |r| {
                 p.pos = r.pos;
+                p.input = r.input;
+                p.currentFilename = r.filename;
                 self.showError(&p, filepath, AssemblyError.UnresolvedSymbol);
             }
             return AssemblyError.UnresolvedSymbol;
@@ -412,30 +426,25 @@ pub const Assembly = struct {
     }
 
     fn showError(_: *Assembly, p: *P.Parser, filepath: []const u8, err: anyerror) void {
-        var line: usize = 1;
-        var column: usize = 1;
-        var line_start: usize = 0;
-
-        for (p.input[0..p.pos], 0..) |c, i| {
-            if (c == '\n') {
-                line += 1;
-                column = 1;
-                line_start = i + 1;
-            } else {
-                column += 1;
+        var i = p.frames.items.len;
+        while (i > 0) {
+            i -= 1;
+            const frame = p.frames.items[i];
+            if (frame.input.len > 0) {
+                const loc = P.Parser.getLocationInfo(frame.input, frame.pos, frame.filename);
+                const fname = if (loc.filename.len > 0) loc.filename else filepath;
+                std.debug.print("in buffer expanded from {s}:{d}:{d}:\n", .{fname, loc.line, loc.column});
             }
         }
 
-        var line_end = p.pos;
-        while (line_end < p.input.len and p.input[line_end] != '\n' and p.input[line_end] != '\r') : (line_end += 1) {
-        }
-
-        const snippet = p.input[line_start..line_end];
-
-        std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ filepath, line, column, @errorName(err) });
+        const loc = p.getLocation();
+        const fname = if (loc.filename.len > 0) loc.filename else filepath;
+        const snippet = p.input[loc.start..loc.end];
+        
+        std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ fname, loc.line, loc.column, @errorName(err) });
         std.debug.print("{s}\n", .{snippet});
         
-        for (0..column - 1) |_| std.debug.print(" ", .{});
+        for (0..loc.column - 1) |_| std.debug.print(" ", .{});
         std.debug.print("^\n", .{});
     }
 };
@@ -444,7 +453,9 @@ test "encodeR add" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
     assembly.current_section = .text;
-    var parser = P.Parser{.input = "add $t0, $s0, $a0"};
+    var parser = try P.Parser.init(std.testing.allocator, undefined);
+    defer parser.deinit();
+    try parser.pushFrame("add $t0, $s0, $a0", "<test>");
     try assembly.assembleLine(&parser);
     try std.testing.expectEqual(@as(u20, 0x004E0), assembly.program_memory[0]);
 }
@@ -453,13 +464,17 @@ test "forward references" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
     assembly.current_section = .text;
-    var p1 = P.Parser{.input = "j future_label"};
+    var p1 = try P.Parser.init(std.testing.allocator, undefined);
+    defer p1.deinit();
+    try p1.pushFrame("j future_label", "<test>");
     try assembly.assembleLine(&p1);
     try std.testing.expectEqual(@as(usize, 1), assembly.pc);
     try std.testing.expectEqual(@as(usize, 1), assembly.relocations.items.len);
     try std.testing.expectEqualStrings("future_label", assembly.relocations.items[0].name);
     try std.testing.expectEqual(@as(usize, 0), assembly.relocations.items[0].addr);
-    var p2 = P.Parser{.input = "future_label:"};
+    var p2 = try P.Parser.init(std.testing.allocator, undefined);
+    defer p2.deinit();
+    try p2.pushFrame("future_label:", "<test>");
     try assembly.assembleLine(&p2);
     try std.testing.expectEqual(@as(usize, 1), assembly.symbols.get("future_label").?);
 }
@@ -480,7 +495,9 @@ test "small .text program" {
 
     var it = std.mem.tokenizeSequence(u8, source, "\n");
     while (it.next()) |line| {
-        var p = P.Parser{.input = line};
+        var p = try P.Parser.init(std.testing.allocator, undefined);
+        defer p.deinit();
+        try p.pushFrame(line, "<test>");
         try assembly.assembleLine(&p);
     }
 
@@ -509,10 +526,87 @@ test "small .data program" {
 
     var it = std.mem.tokenizeSequence(u8, source, "\n");
     while (it.next()) |line| {
-        var p = P.Parser{.input = line};
+        var p = try P.Parser.init(std.testing.allocator, undefined);
+        defer p.deinit();
+        try p.pushFrame(line, "<.data program>");
         assembly.assembleLine(&p) catch |err| {
             assembly.showError(&p, "<.data program>", err);
             return err;
         };
     }
+}
+
+test "%macro register clear pseudo-op" {
+    var assembly = try Assembly.init(std.testing.allocator);
+    defer assembly.deinit();
+    assembly.current_section = .text;
+
+    var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
+    defer p1.deinit();
+
+    try p1.pushFrame("%macro clear(r) { add @r, $s0, $s0 }\n.text\n  @clear($t0)\n", "test.lc6");
+    while (!p1.eof()) {
+        try assembly.assembleLine(&p1);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), assembly.pc);
+}
+
+test "%macro array element stride loader" {
+    var assembly = try Assembly.init(std.testing.allocator);
+    defer assembly.deinit();
+    assembly.current_section = .text;
+
+    var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
+    defer p1.deinit();
+
+    try p1.pushFrame("%macro fetch(dest, base) { lw @dest, @base, 0 }\n  @fetch($a0, $sp)\n", "test.lc6");
+    while (!p1.eof()) {
+        try assembly.assembleLine(&p1);
+    }
+}
+
+test "%macro conditional yield block" {
+    var assembly = try Assembly.init(std.testing.allocator);
+    defer assembly.deinit();
+    assembly.current_section = .text;
+
+    var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
+    defer p1.deinit();
+
+    try p1.pushFrame("%macro assert_die() { beq $t0, $t1, 1\n halt }\n@assert_die()\n", "test.lc6");
+    while (!p1.eof()) {
+        try assembly.assembleLine(&p1);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), assembly.pc);
+}
+
+test "complex %macro flow" {
+    var assembly = try Assembly.init(std.testing.allocator);
+    defer assembly.deinit();
+
+    const continuous_source =
+        \\.data
+        \\  value: .word 255
+        \\.text
+        \\  %macro pipeline(reg) {
+        \\    lw @reg, $s0, value
+        \\    add @reg, @reg, @reg
+        \\  }
+        \\  main:
+        \\    @pipeline($t2)
+        \\    halt
+    ;
+
+    var p = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
+    defer p.deinit();
+    try p.pushFrame(continuous_source, "test.lc6");
+
+    while (!p.eof()) {
+        try assembly.assembleLine(&p);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), assembly.pc);
+    try std.testing.expectEqual(@as(usize, 1), assembly.relocations.items.len);
 }

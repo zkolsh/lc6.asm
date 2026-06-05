@@ -61,3 +61,19 @@ pub const Section = enum {
     data,
     text,
 };
+
+pub const PreprocessorDirective = enum {
+    define,
+    embed,
+    include,
+    macro,
+};
+
+pub const PreprocessorBuiltin = enum {
+    endif,
+    file,
+    @"if",
+    ifdef,
+    ifndef,
+    line,
+};

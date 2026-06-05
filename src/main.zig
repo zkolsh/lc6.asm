@@ -8,13 +8,15 @@ const helpText: []const u8 =
     \\  -h, --help          show this message
     \\  -v, --version       show program version
     \\  -o <file>           place the output into <file>
+    \\
     ;
 
 const versionString: []const u8 = ".0";
 
 pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(init.io, &.{});
-    var args = init.minimal.args.iterate();
+    var args = try init.minimal.args.iterateAllocator(init.gpa);
+    defer args.deinit();
     const exename = args.next();
 
     var inputName: ?[]const u8 = null;
