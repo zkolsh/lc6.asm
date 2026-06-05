@@ -20,7 +20,7 @@ pub const AssemblyError = error {
 
 pub const Assembly = struct {
     data_memory: [65536]u8 = [_]u8{0} ** 65536,
-    program_memory: [65536]u20 = [_]u20{0} ** 65536,
+    program_memory: [65536]u32 = [_]u32{0} ** 65536,
     dc: usize = 0,
     pc: usize = 0,
     current_section: isa.Section = .data,
@@ -88,97 +88,6 @@ pub const Assembly = struct {
         }
         try writer.interface.writeAll("};");
         try writer.interface.flush();
-    }
-
-    fn encodeR(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const pc = self.pc;
-        errdefer self.pc = pc;
-
-        const ppos = p.pos;
-        errdefer p.pos = ppos;
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        self.program_memory[self.pc]
-            = (@as(u20, instr.getInfo().op) << 16)
-            | (@as(u20, @intFromEnum(rd)) << 12)
-            | (@as(u20, @intFromEnum(rs)) <<  8)
-            | (@as(u20, @intFromEnum(rt)) <<  4);
-        self.pc += 1;
-    }
-
-    fn encodeI(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const pc = self.pc;
-        errdefer self.pc = pc;
-
-        const ppos = p.pos;
-        errdefer p.pos = ppos;
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u8 = p.parseInteger(u8) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.pc, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = instr.getInfo().reloc.?,
-                    .pos = p.pos,
-                    .input = p.input,
-                    .filename = p.currentFilename,
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        self.program_memory[self.pc]
-            = (@as(u20, instr.getInfo().op) << 16)
-            | (@as(u20, @intFromEnum(rd)) << 12)
-            | (@as(u20, @intFromEnum(rs)) <<  8)
-            | @as(u20, imm);
-        self.pc += 1;
-    }
-
-    fn encodeS(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const pc = self.pc;
-        errdefer self.pc = pc;
-
-        const ppos = p.pos;
-        errdefer p.pos = ppos;
-
-        _ = p.tabulation();
-        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.pc, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = instr.getInfo().reloc.?,
-                    .pos = p.pos,
-                    .input = p.input,
-                    .filename = p.currentFilename,
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        self.program_memory[self.pc]
-            = (@as(u20, instr.getInfo().op) << 16)
-            | @as(u20, imm);
-        self.pc += 1;
     }
 
     fn assembleData(self: *Assembly, p: *P.Parser) !void {
@@ -283,6 +192,220 @@ pub const Assembly = struct {
         }
     }
 
+    fn rtypeRegular(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        const pc = self.pc;
+        errdefer self.pc = pc;
+
+        const ppos = p.pos;
+        errdefer p.pos = ppos;
+
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rt = try p.parseRegisterName();
+
+        self.program_memory[self.pc]
+            = (@as(u32, rtype.getFunct().code))
+            | (@as(u32, 1 << 6))
+            | (@as(u32, @intFromEnum(rs)) <<  7)
+            | (@as(u32, @intFromEnum(rt)) << 12)
+            | (@as(u32, @intFromEnum(rd)) << 17);
+        self.pc += 1;
+    }
+
+    fn rtypeAux(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        const pc = self.pc;
+        errdefer self.pc = pc;
+
+        const ppos = p.pos;
+        errdefer p.pos = ppos;
+
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rt = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u5 = p.parseInteger(u5) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.pc, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.rtype,
+                    .pos = p.pos,
+                    .input = p.input,
+                    .filename = p.currentFilename,
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        self.program_memory[self.pc]
+            = (@as(u32, rtype.getFunct().code))
+            | (@as(u32, 1 << 6))
+            | (@as(u32, @intFromEnum(rs))  <<  7)
+            | (@as(u32, @intFromEnum(rt))  << 12)
+            | (@as(u32, @intFromEnum(rd))  << 17)
+            | (@as(u32, imm) << 22);
+        self.pc += 1;
+    }
+
+    inline fn encodeR(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        switch (rtype) {
+            .sll => return self.rtypeAux(p, rtype),
+            .srl => return self.rtypeAux(p, rtype),
+            .sra => return self.rtypeAux(p, rtype),
+            .sllr => return self.rtypeRegular(p, rtype),
+            .srlr => return self.rtypeRegular(p, rtype),
+            .srar => return self.rtypeRegular(p, rtype),
+            .cfs => @panic("UNIMPLEMENTED"),
+            .cts => @panic("UNIMPLEMENTED"),
+            .@"and" => return self.rtypeRegular(p, rtype),
+            .@"or" => return self.rtypeRegular(p, rtype),
+            .xor => return self.rtypeRegular(p, rtype),
+            .nor => return self.rtypeRegular(p, rtype),
+            .slt => return self.rtypeRegular(p, rtype),
+            .sltu => return self.rtypeRegular(p, rtype),
+            .jr => @panic("UNIMPLEMENTED"),
+            .jalr => @panic("UNIMPLEMENTED"),
+            .lhx => return self.rtypeRegular(p, rtype),
+            .lhux => return self.rtypeRegular(p, rtype),
+            .lbx => return self.rtypeRegular(p, rtype),
+            .lbux => return self.rtypeRegular(p, rtype),
+            .lwx => return self.rtypeRegular(p, rtype),
+            .mul => return self.rtypeRegular(p, rtype),
+            .mulh => return self.rtypeRegular(p, rtype),
+            .mulhu => return self.rtypeRegular(p, rtype),
+            .div => return self.rtypeRegular(p, rtype),
+            .divu => return self.rtypeRegular(p, rtype),
+            .rest => return self.rtypeRegular(p, rtype),
+            .restu => return self.rtypeRegular(p, rtype),
+            .add => return self.rtypeRegular(p, rtype),
+            .sub => return self.rtypeRegular(p, rtype),
+            .trap => @panic("UNIMPLEMENTED"),
+            .rft => @panic("UNIMPLEMENTED"),
+        }
+    }
+
+    fn encodeI(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+        const pc = self.pc;
+        errdefer self.pc = pc;
+
+        const ppos = p.pos;
+        errdefer p.pos = ppos;
+
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.pc, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.tail16,
+                    .pos = p.pos,
+                    .input = p.input,
+                    .filename = p.currentFilename,
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        self.program_memory[self.pc]
+            = (@as(u32, instr.getInfo().op) << 27)
+            | (@as(u32, @intFromEnum(rd))   << 22)
+            | (@as(u32, @intFromEnum(rs))   << 17)
+            | (@as(u32, 1 << 16))
+            |  @as(u32, imm);
+
+        self.pc += 1;
+    }
+
+    fn encodeL(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+        const pc = self.pc;
+        errdefer self.pc = pc;
+
+        const ppos = p.pos;
+        errdefer p.pos = ppos;
+
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.pc, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.tail16,
+                    .pos = p.pos,
+                    .input = p.input,
+                    .filename = p.currentFilename,
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        self.program_memory[self.pc]
+            = (@as(u32, instr.getInfo().op) << 27)
+            | (@as(u32, @intFromEnum(rd))   << 22)
+            | (@as(u32, @intFromEnum(rs))   << 17)
+            |  @as(u32, imm);
+
+        self.pc += 1;
+    }
+
+    fn encodeJ(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+        const pc = self.pc;
+        errdefer self.pc = pc;
+
+        const ppos = p.pos;
+        errdefer p.pos = ppos;
+
+        _ = p.tabulation();
+        const imm: u27 = p.parseInteger(u27) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.pc, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.tail16,
+                    .pos = p.pos,
+                    .input = p.input,
+                    .filename = p.currentFilename,
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        self.program_memory[self.pc]
+            = (@as(u32, instr.getInfo().op) << 27)
+            |  @as(u32, imm);
+        self.pc += 1;
+    }
+
     fn assembleText(self: *Assembly, p: *P.Parser) !void {
         const pc = self.pc;
         errdefer self.pc = pc;
@@ -301,19 +424,37 @@ pub const Assembly = struct {
         }
 
         const mnemonic = p.alphanumeric1() catch return;
-        const instr = std.meta.stringToEnum(isa.InstructionName, mnemonic)
-            orelse return AssemblyError.InvalidInstruction;
-
-        switch (instr) {
-            .add => try self.encodeR(p, instr),
+        if (std.meta.stringToEnum(isa.RType, mnemonic)) |rtype| {
+            try self.encodeR(p, rtype);
+        } else if (std.meta.stringToEnum(isa.InstructionName, mnemonic)) |instr| switch (instr) {
+            .rtype => return AssemblyError.InvalidInstruction,
+            .j => try self.encodeJ(p, instr),
+            .jal => try self.encodeJ(p, instr),
+            .andi => try self.encodeI(p, instr),
+            .andih => try self.encodeL(p, instr),
+            .ori => try self.encodeI(p, instr),
+            .orih => try self.encodeL(p, instr),
+            .xori => try self.encodeI(p, instr),
+            .xorih => try self.encodeL(p, instr),
             .lw => try self.encodeI(p, instr),
             .sw => try self.encodeI(p, instr),
+            .sh => try self.encodeI(p, instr),
+            .sb => try self.encodeI(p, instr),
+            .lh => try self.encodeI(p, instr),
+            .lhu => try self.encodeL(p, instr),
+            .lb => try self.encodeI(p, instr),
+            .lbu => try self.encodeL(p, instr),
             .beq => try self.encodeI(p, instr),
-            .j => try self.encodeS(p, instr),
-            .halt => {
-                self.program_memory[self.pc] = 0xFFFFF;
-                self.pc += 1;
-            }
+            .bne => try self.encodeI(p, instr),
+            .blt => try self.encodeI(p, instr),
+            .bgt => try self.encodeI(p, instr),
+            .ble => try self.encodeI(p, instr),
+            .bge => try self.encodeI(p, instr),
+            .slti => try self.encodeI(p, instr),
+            .sltiu => try self.encodeL(p, instr),
+            .addi => try self.encodeI(p, instr),
+        } else {
+            return AssemblyError.InvalidInstruction;
         }
     }
 
@@ -373,7 +514,7 @@ pub const Assembly = struct {
             if (self.symbols.get(r.name)) |symbol| {
                 var instruction = self.program_memory[r.addr];
                 switch (r.kind) {
-                    .tail8a => {
+                    .rtype, .tail8a => {
                         instruction &= 0xFFF00;
                         instruction |= @as(u8, @truncate(symbol));
                     },
