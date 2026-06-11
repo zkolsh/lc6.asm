@@ -126,7 +126,12 @@ pub const Assembly = struct {
 
             .byte => {
                 while (!p.isNewline()) {
-                    const x = try p.parseInteger(i8);
+                    const x = if (p.peek() == '\'') blk: {
+                            break :blk try p.parseCharLiteral();
+                        } else blk: {
+                            break :blk try p.parseInteger(u8);
+                        };
+
                     self.data_memory[self.dc] = @bitCast(x);
                     self.dc += 1;
                     _ = p.tabulation();
@@ -136,7 +141,7 @@ pub const Assembly = struct {
                         try p.newline();
                         _ = p.tabulation();
                         const next_token = p.pos;
-                        _ = p.parseInteger(i8) catch {
+                        _ = p.parseInteger(u8) catch {
                             p.pos = end;
                             break;
                         };
@@ -146,7 +151,7 @@ pub const Assembly = struct {
                 }
             },
 
-            .nascii => {
+            .nascii => { // FIXME
                 const str = try p.parseStringLiteral();
                 if (self.dc % 2 == 1) self.dc += 1;
                 std.mem.writeInt(u16, self.data_memory[self.dc..][0..2], @truncate(str.len), .big);

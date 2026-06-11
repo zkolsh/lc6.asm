@@ -249,7 +249,18 @@ pub const Parser = struct {
 
     pub fn isNewline(self: *Parser) bool {
         const start = self.pos;
-        defer self.pos = start;
+        const start_in = self.input;
+        const start_fn = self.currentFilename;
+        const start_fs = self.frames.items.len;
+        defer {
+            self.pos = start;
+            self.input = start_in;
+            self.currentFilename = start_fn;
+            if (self.frames.items.len < start_fs) {
+                self.frames.items.len = start_fs;
+            }
+        }
+
         self.newline() catch return false;
         return true;
     }
@@ -342,10 +353,19 @@ pub const Parser = struct {
 
         while (!self.eof()) {
             const c = self.input[self.pos];
+            if (std.ascii.isWhitespace(c)) break;
+
             const digit = std.fmt.charToDigit(c, base) catch break;
+            if (digit >= base) {
+                return ParseError.NumericOverflow;
+            }
             
-            n = std.math.mul(T, n, base) catch return ParseError.NumericOverflow;
-            n = std.math.add(T, n, @intCast(digit)) catch return ParseError.NumericOverflow;
+            n = std.math.mul(T, n, base) catch {
+                return ParseError.NumericOverflow;
+            };
+            n = std.math.add(T, n, @intCast(digit)) catch {
+                return ParseError.NumericOverflow;
+            };
             
             self.pos += 1;
         }
@@ -361,6 +381,7 @@ pub const Parser = struct {
         const start = self.pos;
         errdefer self.pos = start;
 
+        _ = self.tabulation();
         var negative = false;
         if (self.peek()) |c| {
             if (c == '-') {
@@ -436,6 +457,52 @@ pub const Parser = struct {
         };
     }
 
+    fn parseEscapedCharacter(self: *Parser) ParseError!u8 {
+        const start = self.pos;
+        errdefer self.pos = start;
+
+        try self.char('\\');
+        const c = self.peek() orelse return ParseError.UnexpectedEOF;
+        self.pos += 1;
+
+        return switch (c) {
+            '\\' => '\\',
+            'n' => '\n',
+            '0' => 0,
+            'r' => '\r',
+            't' => '\t',
+            'x' => try self.parseInteger(u8),
+            else => return ParseError.InvalidCharacter,
+        };
+    }
+
+    pub fn parseCharLiteral(self: *Parser) ParseError!u8 {
+        const start = self.pos;
+        errdefer self.pos = start;
+
+        try self.char('\'');
+        const c = self.peek() orelse return ParseError.UnexpectedEOF;
+
+        if (c == '%') {
+            self.parsePreprocessorDefinition()
+                catch return ParseError.InvalidPreprocessorDirective;
+            return self.parseCharLiteral();
+        } else if (c == '@') {
+            _ = self.expandPreprocessorInvocation()
+                catch return ParseError.InvalidPreprocessorDirective;
+            return self.parseCharLiteral();
+        }
+
+        const e: u8 = if (c == '\\') try self.parseEscapedCharacter()
+            else blk: {
+                try self.char(c);
+                break :blk c;
+            };
+
+        self.char('\'') catch return ParseError.UnterminatedString;
+        return e;
+    }
+
     pub fn parseStringLiteral(self: *Parser) ParseError![]const u8 {
         const start = self.pos;
         errdefer self.pos = start;
@@ -486,9 +553,31 @@ pub const Parser = struct {
             },
 
             .embed => {
-                //TODO
-                //Make new input buffer containing dump.  Take type.
-                return ParseError.InvalidPreprocessorDirective;
+                const path = try self.parseStringLiteral();
+                const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(),
+                    self.io, path, self.allocator, .unlimited) catch |e| {
+                    return e;
+                };
+
+                defer self.allocator.free(contents);
+
+                var data = try std.ArrayList(u8).initCapacity(self.allocator, contents.len * 5);
+                errdefer data.deinit(self.allocator);
+
+                for (contents, 0..) |byte, i| {
+                    try data.appendSlice(self.allocator, "0x");
+                    try data.append(self.allocator, std.fmt.digitToChar((byte >> 4) & 0xF, .upper));
+                    try data.append(self.allocator, std.fmt.digitToChar((byte >> 0) & 0xF, .upper));
+
+                    if (i != 0 and i % 10 == 0) {
+                        try data.append(self.allocator, '\n');
+                    } else {
+                        try data.append(self.allocator, ' ');
+                    }
+                }
+
+                try self.substitutions.append(self.allocator, data);
+                try self.pushFrame(data.items, path);
             },
 
             .include => {
