@@ -864,7 +864,7 @@ test "preprocessor %define registration" {
     var parser = try Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     
-    try parser.pushFrame(input, "test.lc6");
+    try parser.pushFrame(input, "test.rtm");
     try parser.parsePreprocessorDefinition();
     
     try std.testing.expect(parser.macros.contains("VALUE"));
@@ -878,7 +878,7 @@ test "preprocessor %macro with multiple arguments" {
     var parser = try Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     
-    try parser.pushFrame(input, "test.lc6");
+    try parser.pushFrame(input, "test.rtm");
     try parser.parsePreprocessorDefinition();
     
     try std.testing.expect(parser.macros.contains("multi_arg"));
@@ -895,7 +895,7 @@ test "preprocessor %macro nested braces" {
     var parser = try Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     
-    try parser.pushFrame(input, "test.lc6");
+    try parser.pushFrame(input, "test.rtm");
     try parser.parsePreprocessorDefinition();
     
     const macro = parser.macros.get("nested").?;
@@ -907,12 +907,12 @@ test "preprocessor keyword override" {
     var parser = try Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     
-    try parser.pushFrame(input, "test.lc6");
+    try parser.pushFrame(input, "test.rtm");
     
     const invalid_input = "%macro if(reg) { halt }";
     var p2 = try Parser.init(std.testing.allocator, undefined);
     defer p2.deinit();
-    try p2.pushFrame(invalid_input, "test.lc6");
+    try p2.pushFrame(invalid_input, "test.rtm");
     
     try std.testing.expectError(ParseError.BuiltinPreprocessorOverride, p2.parsePreprocessorDefinition());
 }
@@ -922,11 +922,11 @@ test "preprocessor %macro expansion substitution" {
     var parser = try Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     
-    try parser.pushFrame(macro_def, "test.lc6");
+    try parser.pushFrame(macro_def, "test.rtm");
     try parser.parsePreprocessorDefinition();
     
     const invocation = "@load_add($t1,10)";
-    try parser.pushFrame(invocation, "test.lc6");
+    try parser.pushFrame(invocation, "test.rtm");
     
     const expanded = try parser.expandPreprocessorInvocation();
     try std.testing.expect(expanded);
@@ -939,10 +939,10 @@ test "preprocessor zero-arity %macro expansion" {
     var parser = try Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     
-    try parser.pushFrame(input, "test.lc6");
+    try parser.pushFrame(input, "test.rtm");
     try parser.parsePreprocessorDefinition();
     
-    try parser.pushFrame("@zero_reg()", "test.lc6");
+    try parser.pushFrame("@zero_reg()", "test.rtm");
     const expanded = try parser.expandPreprocessorInvocation();
     try std.testing.expect(expanded);
     try std.testing.expectEqualStrings(" $s0 ", parser.input);

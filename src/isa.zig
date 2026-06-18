@@ -28,6 +28,7 @@ pub const DataDirective = enum {
 
 pub const RelocationMode = enum {
     rtype,
+    tail27,
     tail16,
     tail8a,
     tail8r,

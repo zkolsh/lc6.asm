@@ -337,7 +337,7 @@ pub const Assembly = struct {
         self.pc += 1;
     }
 
-    fn encodeL(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+    fn encodeE(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
         const pc = self.pc;
         errdefer self.pc = pc;
 
@@ -376,7 +376,7 @@ pub const Assembly = struct {
         self.pc += 1;
     }
 
-    fn encodeJ(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+    fn encodeS(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
         const pc = self.pc;
         errdefer self.pc = pc;
 
@@ -390,7 +390,7 @@ pub const Assembly = struct {
                 try self.relocations.append(self.allocator, .{
                     .addr = self.pc, 
                     .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.tail16,
+                    .kind = isa.RelocationMode.tail27,
                     .pos = p.pos,
                     .input = p.input,
                     .filename = p.currentFilename,
@@ -428,22 +428,22 @@ pub const Assembly = struct {
             try self.encodeR(p, rtype);
         } else if (std.meta.stringToEnum(isa.InstructionName, mnemonic)) |instr| switch (instr) {
             .rtype => return AssemblyError.InvalidInstruction,
-            .j => try self.encodeJ(p, instr),
-            .jal => try self.encodeJ(p, instr),
+            .j => try self.encodeS(p, instr),
+            .jal => try self.encodeS(p, instr),
             .andi => try self.encodeI(p, instr),
-            .andih => try self.encodeL(p, instr),
+            .andih => try self.encodeE(p, instr),
             .ori => try self.encodeI(p, instr),
-            .orih => try self.encodeL(p, instr),
+            .orih => try self.encodeE(p, instr),
             .xori => try self.encodeI(p, instr),
-            .xorih => try self.encodeL(p, instr),
+            .xorih => try self.encodeE(p, instr),
             .lw => try self.encodeI(p, instr),
             .sw => try self.encodeI(p, instr),
             .sh => try self.encodeI(p, instr),
             .sb => try self.encodeI(p, instr),
             .lh => try self.encodeI(p, instr),
-            .lhu => try self.encodeL(p, instr),
+            .lhu => try self.encodeE(p, instr),
             .lb => try self.encodeI(p, instr),
-            .lbu => try self.encodeL(p, instr),
+            .lbu => try self.encodeE(p, instr),
             .beq => try self.encodeI(p, instr),
             .bne => try self.encodeI(p, instr),
             .blt => try self.encodeI(p, instr),
@@ -451,7 +451,7 @@ pub const Assembly = struct {
             .ble => try self.encodeI(p, instr),
             .bge => try self.encodeI(p, instr),
             .slti => try self.encodeI(p, instr),
-            .sltiu => try self.encodeL(p, instr),
+            .sltiu => try self.encodeE(p, instr),
             .addi => try self.encodeI(p, instr),
         } else {
             return AssemblyError.InvalidInstruction;
@@ -686,7 +686,7 @@ test "%macro register clear pseudo-op" {
     var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p1.deinit();
 
-    try p1.pushFrame("%macro clear(r) { add @r, $s0, $s0 }\n.text\n  @clear($t0)\n", "test.lc6");
+    try p1.pushFrame("%macro clear(r) { add @r, $s0, $s0 }\n.text\n  @clear($t0)\n", "test.rtm");
     while (!p1.eof()) {
         try assembly.assembleLine(&p1);
     }
@@ -702,7 +702,7 @@ test "%macro array element stride loader" {
     var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p1.deinit();
 
-    try p1.pushFrame("%macro fetch(dest, base) { lw @dest, @base, 0 }\n  @fetch($a0, $sp)\n", "test.lc6");
+    try p1.pushFrame("%macro fetch(dest, base) { lw @dest, @base, 0 }\n  @fetch($a0, $sp)\n", "test.rtm");
     while (!p1.eof()) {
         try assembly.assembleLine(&p1);
     }
@@ -716,7 +716,7 @@ test "%macro conditional yield block" {
     var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p1.deinit();
 
-    try p1.pushFrame("%macro assert_die() { beq $t0, $t1, 1\n me: j me }\n@assert_die()\n", "test.lc6");
+    try p1.pushFrame("%macro assert_die() { beq $t0, $t1, 1\n me: j me }\n@assert_die()\n", "test.rtm");
     while (!p1.eof()) {
         try assembly.assembleLine(&p1);
     }
@@ -744,7 +744,7 @@ test "complex %macro flow" {
 
     var p = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p.deinit();
-    try p.pushFrame(continuous_source, "test.lc6");
+    try p.pushFrame(continuous_source, "test.rtm");
 
     while (!p.eof()) {
         try assembly.assembleLine(&p);
