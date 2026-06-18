@@ -26,10 +26,10 @@ const Macro = struct {
     body: []u8,
     filename: []const u8,
 
-    pub fn init(filename: []const u8) !Macro {
+    pub fn init(allocator: std.mem.Allocator, filename: []const u8) !Macro {
         return .{
             .name = &[_]u8{},
-            .args = std.ArrayList([]u8).empty,
+            .args = try std.ArrayList([]u8).initCapacity(allocator, 0),
             .body = &[_]u8{},
             .filename = filename,
         };
@@ -50,10 +50,11 @@ const Frame = struct {
     input: []const u8,
     pos: usize = 0,
     filename: []const u8,
+    next: ?*Frame,
 };
 
 fn isIdentifierChar(c: u8) bool {
-    return (std.ascii.isAlphanumeric(c) or c == '_' or c == '\'');
+    return (std.ascii.isAlphanumeric(c) or c == '_' or c == '\'' or c == '.');
 }
 
 pub const Parser = struct {
@@ -61,8 +62,9 @@ pub const Parser = struct {
     pos: usize = 0,
 
     currentFilename: []const u8 = &[_]u8{},
+    frameHead: ?*Frame = null,
+    frames: std.ArrayList(*Frame),
 
-    frames: std.ArrayList(Frame),
     macros: std.StringHashMap(Macro),
     substitutions: std.ArrayList(std.ArrayList(u8)),
 
@@ -73,9 +75,9 @@ pub const Parser = struct {
         return .{
             .allocator =  allocator,
             .io = io,
-            .frames = try std.ArrayList(Frame).initCapacity(allocator, 1),
+            .frames = try std.ArrayList(*Frame).initCapacity(allocator, 1),
             .macros = std.StringHashMap(Macro).init(allocator),
-            .substitutions = try std.ArrayList(std.ArrayList(u8)).initCapacity(allocator, 0),
+            .substitutions = try std.ArrayList(std.ArrayList(u8)).initCapacity(allocator, 1),
         };
     }
 
@@ -89,9 +91,36 @@ pub const Parser = struct {
             sub.deinit(self.allocator);
         }
 
+        for (self.frames.items) |frame| {
+            self.allocator.destroy(frame);
+        }
+
+        self.frames.deinit(self.allocator);
         self.substitutions.deinit(self.allocator);
         self.macros.deinit();
-        self.frames.deinit(self.allocator);
+    }
+
+    pub const Bookmark = struct {
+        input: []const u8,
+        pos: usize,
+        currentFilename: []const u8,
+        frameHead: ?*Frame,
+    };
+
+    pub fn bookmark(self: *Parser) Bookmark {
+        return .{
+            .input = self.input,
+            .pos = self.pos,
+            .currentFilename = self.currentFilename,
+            .frameHead = self.frameHead,
+        };
+    }
+
+    pub fn restore(self: *Parser, mark: Bookmark) void {
+        self.input = mark.input;
+        self.pos = mark.pos;
+        self.currentFilename = mark.currentFilename;
+        self.frameHead = mark.frameHead;
     }
 
     pub const Location = struct {
@@ -137,22 +166,30 @@ pub const Parser = struct {
     }
 
     pub fn pushFrame(self: *Parser, frameData: []const u8, filename: []const u8) !void {
-        try self.frames.append(self.allocator, .{
+        const frame = try self.allocator.create(Frame);
+        errdefer self.allocator.destroy(frame);
+
+        frame.* = .{
             .input = self.input,
             .pos = self.pos,
             .filename = self.currentFilename,
-        });
+            .next = self.frameHead,
+        };
+
+        try self.frames.append(self.allocator, frame);
+        self.frameHead = frame;
         self.input = frameData;
         self.pos = 0;
         self.currentFilename = filename;
     }
 
     pub fn popFrame(self: *Parser) !void {
-        const top = self.frames.pop()
+        const top = self.frameHead
             orelse return ParseError.UnexpectedEOF;
         self.input = top.input;
         self.pos = top.pos;
         self.currentFilename = top.filename;
+        self.frameHead = top.next;
     }
 
     pub fn eof(self: *Parser) bool {
@@ -231,14 +268,14 @@ pub const Parser = struct {
     }
 
     pub fn newline(self: *Parser) ParseError!void {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
         _ = self.tabulation();
         if (self.eof()) return;
         if (self.peek() == '/') {
             try self.char('/');
             try self.char('/');
-            while (!self.eof()) {
+            while (self.pos < self.input.len) {
                 if (self.input[self.pos] == '\n') break;
                 self.pos += 1;
             }
@@ -248,19 +285,9 @@ pub const Parser = struct {
     }
 
     pub fn isNewline(self: *Parser) bool {
-        const start = self.pos;
-        const start_in = self.input;
-        const start_fn = self.currentFilename;
-        const start_fs = self.frames.items.len;
-        defer {
-            self.pos = start;
-            self.input = start_in;
-            self.currentFilename = start_fn;
-            if (self.frames.items.len < start_fs) {
-                self.frames.items.len = start_fs;
-            }
-        }
-
+        const mark = self.bookmark();
+        defer self.restore(mark);
+        
         self.newline() catch return false;
         return true;
     }
@@ -284,7 +311,8 @@ pub const Parser = struct {
         if (self.eof()) return ParseError.NoMatch;
 
         const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
         while (self.pos < self.input.len) {
             if (self.input[self.pos] != ' ' and self.input[self.pos] != '\t') {
                 break;
@@ -313,9 +341,9 @@ pub const Parser = struct {
     }
 
     pub fn alphabetic1(self: *Parser) ParseError![]const u8 {
-        const start = self.pos;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
         const xs = self.takeWhile(std.ascii.isAlphabetic);
-        errdefer self.pos = start;
         if (xs.len == 0) return ParseError.UnexpectedToken;
         return xs;
     }
@@ -326,9 +354,9 @@ pub const Parser = struct {
     }
 
     pub fn alphanumeric1(self: *Parser) ParseError![]const u8 {
-        const start = self.pos;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
         const xs = self.takeWhile(std.ascii.isAlphanumeric);
-        errdefer self.pos = start;
         if (xs.len == 0) return ParseError.UnexpectedToken;
         return xs;
     }
@@ -339,9 +367,9 @@ pub const Parser = struct {
     }
 
     pub fn identifier1(self: *Parser) ParseError![]const u8 {
-        const start = self.pos;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
         const xs = self.takeWhile(isIdentifierChar);
-        errdefer self.pos = start;
         if (xs.len == 0) return ParseError.UnexpectedToken;
         if (!std.ascii.isAlphabetic(xs[0])) return ParseError.NoMatch;
         return xs;
@@ -378,8 +406,8 @@ pub const Parser = struct {
     }
 
     pub fn parseInteger(self: *Parser, comptime T: type) ParseError!T {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         _ = self.tabulation();
         var negative = false;
@@ -417,8 +445,8 @@ pub const Parser = struct {
     }
 
     pub fn parseSectionLabel(self: *Parser) ParseError![]const u8 {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         try self.char('.');
         const name = try self.identifier1();
@@ -436,8 +464,8 @@ pub const Parser = struct {
     }
 
     pub fn parseRegisterName(self: *Parser) ParseError!isa.Register {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         try self.char('$');
         const reg = try self.alphanumeric1();
@@ -458,8 +486,8 @@ pub const Parser = struct {
     }
 
     fn parseEscapedCharacter(self: *Parser) ParseError!u8 {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         try self.char('\\');
         const c = self.peek() orelse return ParseError.UnexpectedEOF;
@@ -477,8 +505,8 @@ pub const Parser = struct {
     }
 
     pub fn parseCharLiteral(self: *Parser) ParseError!u8 {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         try self.char('\'');
         const c = self.peek() orelse return ParseError.UnexpectedEOF;
@@ -503,9 +531,15 @@ pub const Parser = struct {
         return e;
     }
 
+    pub fn parseByte(self: *Parser) ParseError!u8 {
+        if (self.peek() == '\'') return try self.parseCharLiteral()
+            else return try self.parseInteger(u8);
+    }
+
     pub fn parseStringLiteral(self: *Parser) ParseError![]const u8 {
         const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         try self.char('"');
         while (self.peek()) |c| {
@@ -527,8 +561,8 @@ pub const Parser = struct {
     }
 
     pub fn parsePreprocessorDefinition(self: *Parser) !void {
-        const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         if (self.pos >= self.input.len) return;
         if (self.input[self.pos] != '%') return;
@@ -544,7 +578,7 @@ pub const Parser = struct {
                 const payload = self.peekRawLine();
                 self.pos += payload.len;
 
-                var macro = try Macro.init(self.currentFilename);
+                var macro = try Macro.init(self.allocator, self.currentFilename);
                 errdefer macro.deinit(self.allocator);
                 macro.name = try self.allocator.dupe(u8, name);
                 macro.body = try self.allocator.dupe(u8, payload);
@@ -599,7 +633,7 @@ pub const Parser = struct {
                 _ = self.whitespace();
                 try self.char('(');
 
-                var macro = try Macro.init(self.currentFilename);
+                var macro = try Macro.init(self.allocator, self.currentFilename);
                 errdefer macro.deinit(self.allocator);
                 macro.name = try self.allocator.dupe(u8, macroName);
 
@@ -650,7 +684,8 @@ pub const Parser = struct {
 
     pub fn expandPreprocessorInvocation(self: *Parser) !bool {
         const start = self.pos;
-        errdefer self.pos = start;
+        const mark = self.bookmark();
+        errdefer self.restore(mark);
 
         if (self.pos >= self.input.len) {
             return false;
