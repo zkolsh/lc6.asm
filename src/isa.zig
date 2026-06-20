@@ -28,10 +28,9 @@ pub const DataDirective = enum {
 
 pub const RelocationMode = enum {
     rtype,
-    tail27,
     tail16,
-    tail8a,
-    tail8r,
+    tail27,
+    word,
 };
 
 pub const InstructionName = enum {
@@ -73,7 +72,7 @@ pub const InstructionName = enum {
             .jal   => .{.op = 0b00011},
             .andi  => .{.op = 0b00100},
             .andih => .{.op = 0b00100},
-            .ori   => .{.op = 0b00100},
+            .ori   => .{.op = 0b00101},
             .orih  => .{.op = 0b00101},
             .xori  => .{.op = 0b00100},
             .xorih => .{.op = 0b00100},

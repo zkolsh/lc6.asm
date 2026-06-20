@@ -1,5 +1,6 @@
 const std = @import("std");
 const A = @import("assembler.zig");
+const c = @import("elf_io");
 
 const helpText: []const u8 =
     \\usage: {s} [options...] <input file> -o <output file>
@@ -68,5 +69,5 @@ pub fn main(init: std.process.Init) !void {
     defer assembler.deinit();
 
     try assembler.assembleEntireFile(init.io, inputName.?);
-    try assembler.writeHeader(init.io, outputName.?);
+    try assembler.writeElf(init.io, outputName.?, c.ET_EXEC, 0);
 }

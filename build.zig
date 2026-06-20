@@ -13,6 +13,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const translate_elf = b.addTranslateC(.{
+        .root_source_file = b.path("cbits/elf_io.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const elf = translate_elf.createModule();
+    elf.link_libc = true;
+    exe.root_module.addImport("elf_io", elf);
+    exe.root_module.addCSourceFile(.{
+        .file = b.path("cbits/elf_io.c"),
+        .flags = &.{"-Wall", "-Wextra", "-std=c99"},
+    });
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
