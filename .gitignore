@@ -4,3 +4,4 @@ zig-out/
 assembly.c
 todo.md
 build.zig.zon
+build/

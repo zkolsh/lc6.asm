@@ -14,7 +14,7 @@ void vram_to_s_cmd(const uint8_t* desc_mem, const size_t size) {
 		                    | ((i + 1 < size) ? ((uint32_t)desc_mem[i + 1] <<  8) : 0)
 		                    | ((i + 2 < size) ? ((uint32_t)desc_mem[i + 2] << 16) : 0)
 		                    | ((i + 3 < size) ? ((uint32_t)desc_mem[i + 3] << 24) : 0);
-		printf("s [0x%08X] = 0x%08X\n", (uint32_t)i, word);
+		printf("s [0x%08X] 0x%08X\n", (uint32_t)i, word);
 	};
 };
 
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
 		global_entry += text_vaddr;
 	};
 
-	printf("s PC = %u\n", global_entry);
+	printf("s PC %u\n", global_entry);
 
 	free(ram);
 	for (size_t i = 0; i < views; i++) {

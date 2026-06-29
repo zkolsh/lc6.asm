@@ -7,7 +7,11 @@ pub const ParseError = error {
     InvalidCharacter,
     InvalidEnumeration,
     InvalidPreprocessorDirective,
+    MemoryError,
+    MacroNotAllowedHere,
     MacroRedefined,
+    NoEnd,
+    FileNotFound,
     NoMatch,
     NumericOverflow,
     StrayPreprocessorTerminator,
@@ -26,10 +30,10 @@ const Macro = struct {
     body: []u8,
     filename: []const u8,
 
-    pub fn init(allocator: std.mem.Allocator, filename: []const u8) !Macro {
+    pub fn init(filename: []const u8) Macro {
         return .{
             .name = &[_]u8{},
-            .args = try std.ArrayList([]u8).initCapacity(allocator, 0),
+            .args = std.ArrayList([]u8).empty,
             .body = &[_]u8{},
             .filename = filename,
         };
@@ -165,8 +169,8 @@ pub const Parser = struct {
         return getLocationInfo(self.input, self.pos, self.currentFilename);
     }
 
-    pub fn pushFrame(self: *Parser, frameData: []const u8, filename: []const u8) !void {
-        const frame = try self.allocator.create(Frame);
+    pub fn pushFrame(self: *Parser, frameData: []const u8, filename: []const u8) ParseError!void {
+        const frame = self.allocator.create(Frame) catch return ParseError.MemoryError;
         errdefer self.allocator.destroy(frame);
 
         frame.* = .{
@@ -176,14 +180,14 @@ pub const Parser = struct {
             .next = self.frameHead,
         };
 
-        try self.frames.append(self.allocator, frame);
+        self.frames.append(self.allocator, frame) catch return ParseError.MemoryError;
         self.frameHead = frame;
         self.input = frameData;
         self.pos = 0;
         self.currentFilename = filename;
     }
 
-    pub fn popFrame(self: *Parser) !void {
+    pub fn popFrame(self: *Parser) ParseError!void {
         const top = self.frameHead
             orelse return ParseError.UnexpectedEOF;
         self.input = top.input;
@@ -560,7 +564,7 @@ pub const Parser = struct {
         return ParseError.UnexpectedEOF;
     }
 
-    pub fn parsePreprocessorDefinition(self: *Parser) !void {
+    pub fn parsePreprocessorDefinition(self: *Parser) ParseError!void {
         const mark = self.bookmark();
         errdefer self.restore(mark);
 
@@ -578,53 +582,70 @@ pub const Parser = struct {
                 const payload = self.peekRawLine();
                 self.pos += payload.len;
 
-                var macro = try Macro.init(self.allocator, self.currentFilename);
+                var macro = Macro.init(self.currentFilename);
                 errdefer macro.deinit(self.allocator);
-                macro.name = try self.allocator.dupe(u8, name);
-                macro.body = try self.allocator.dupe(u8, payload);
+                macro.name = self.allocator.dupe(u8, name) catch return ParseError.MemoryError;
+                macro.body = self.allocator.dupe(u8, payload) catch return ParseError.MemoryError;
 
-                try self.macros.put(macro.name, macro);
+                self.macros.put(macro.name, macro) catch return ParseError.MemoryError;
             },
+
+            .@"else" => return ParseError.NoMatch,
 
             .embed => {
                 const path = try self.parseStringLiteral();
-                const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(),
-                    self.io, path, self.allocator, .unlimited) catch |e| {
-                    return e;
-                };
+                const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, path, self.allocator, .unlimited)
+                    catch return ParseError.FileNotFound;
 
                 defer self.allocator.free(contents);
 
-                var data = try std.ArrayList(u8).initCapacity(self.allocator, contents.len * 5);
+                var data = std.ArrayList(u8).initCapacity(self.allocator, contents.len * 5)
+                    catch return ParseError.MemoryError;
                 errdefer data.deinit(self.allocator);
 
                 for (contents, 0..) |byte, i| {
-                    try data.appendSlice(self.allocator, "0x");
-                    try data.append(self.allocator, std.fmt.digitToChar((byte >> 4) & 0xF, .upper));
-                    try data.append(self.allocator, std.fmt.digitToChar((byte >> 0) & 0xF, .upper));
+                    data.appendSlice(self.allocator, "0x") catch return ParseError.MemoryError;
+                    data.append(self.allocator, std.fmt.digitToChar((byte >> 4) & 0xF, .upper)) catch return ParseError.MemoryError;
+                    data.append(self.allocator, std.fmt.digitToChar((byte >> 0) & 0xF, .upper)) catch return ParseError.MemoryError;
 
                     if (i != 0 and i % 10 == 0) {
-                        try data.append(self.allocator, '\n');
+                        data.append(self.allocator, '\n') catch return ParseError.MemoryError;
                     } else {
-                        try data.append(self.allocator, ' ');
+                        data.append(self.allocator, ' ') catch return ParseError.MemoryError;
                     }
                 }
 
-                try self.substitutions.append(self.allocator, data);
+                self.substitutions.append(self.allocator, data) catch return ParseError.MemoryError;
                 try self.pushFrame(data.items, path);
             },
 
+            .endif => return ParseError.NoEnd,
+
+            .endmacro => return ParseError.NoEnd,
+
+            .filename => {
+                try self.pushFrame(self.currentFilename, self.currentFilename);
+            },
+
+            .ifdef, .ifndef => {},
+
             .include => {
                 const path = try self.parseStringLiteral();
-                const contents = try std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(),
-                    self.io, path, self.allocator, .unlimited);
+                const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, path, self.allocator, .unlimited)
+                    catch return ParseError.FileNotFound;
                 errdefer self.allocator.free(contents);
                 try self.pushFrame(contents, path);
             },
 
+            .line => {
+                const str = std.fmt.allocPrint(self.allocator, "{}", .{self.getLocation().line})
+                    catch return ParseError.MemoryError;
+                try self.pushFrame(str, self.currentFilename);
+            },
+
             .macro => {
                 const macroName = try self.identifier1();
-                if (std.meta.stringToEnum(isa.PreprocessorBuiltin, macroName) != null) {
+                if (std.meta.stringToEnum(isa.PreprocessorDirective, macroName) != null) {
                     return ParseError.BuiltinPreprocessorOverride;
                 }
 
@@ -633,16 +654,17 @@ pub const Parser = struct {
                 _ = self.whitespace();
                 try self.char('(');
 
-                var macro = try Macro.init(self.allocator, self.currentFilename);
+                var macro = Macro.init(self.currentFilename);
                 errdefer macro.deinit(self.allocator);
-                macro.name = try self.allocator.dupe(u8, macroName);
+                macro.name = self.allocator.dupe(u8, macroName) catch return ParseError.MemoryError;
 
                 while (!self.eof()) {
                     _ = self.whitespace();
                     if (self.peek() == ')') break;
 
                     const argName = try self.identifier1();
-                    try macro.args.append(self.allocator, try self.allocator.dupe(u8, argName));
+                    const argStr = self.allocator.dupe(u8, argName) catch return ParseError.MemoryError;
+                    macro.args.append(self.allocator, argStr) catch return ParseError.MemoryError;
 
                     _ = self.whitespace();
                     switch (self.peek() orelse return ParseError.UnexpectedEOF) {
@@ -656,43 +678,53 @@ pub const Parser = struct {
                 }
 
                 self.char(')') catch return ParseError.UnterminatedScope;
-                _ = self.whitespace();
+                _ = self.tabulation();
 
-                try self.char('{');
+                if (self.pos + 2 <= self.input.len and self.input[self.pos] == '\\' and self.input[self.pos] == '\n') {
+                    self.pos += 2;
+                }
+
                 const bodyStart = self.pos;
-                var braces: usize = 1;
-
-                while (braces >= 1 and !self.eof()) {
+                while (self.pos < self.input.len) {
                     const c = self.input[self.pos];
-                    if (c == '{') {
-                        braces += 1;
-                    } else if (c == '}') {
-                        braces -= 1;
-                        if (braces == 0) break;
-                    }
+                    if (c == '%') blk: {
+                        const word = self.identifier1() catch break :blk;
+                        const id = std.meta.stringToEnum(isa.PreprocessorDirective, word)
+                            orelse break :blk;
+                        
+                        switch (id) {
+                            .endmacro => {
+                                self.pos += 1 + word.len;
+                                break;
+                            },
 
+                            .macro => return ParseError.MacroNotAllowedHere,
+                            else => break :blk,
+                        }
+                    }
                     self.pos += 1;
                 }
 
                 if (self.eof()) return ParseError.UnexpectedEOF;
-                macro.body = try self.allocator.dupe(u8, self.input[bodyStart..self.pos]);
+                macro.body = self.allocator.dupe(u8, self.input[bodyStart..self.pos])
+                    catch return ParseError.MemoryError;
                 try self.char('}');
-                try self.macros.put(macro.name, macro);
+                self.macros.put(macro.name, macro) catch return ParseError.MemoryError;
             },
         }
     }
 
-    pub fn expandPreprocessorInvocation(self: *Parser) !bool {
+    pub fn expandPreprocessorInvocation(self: *Parser) ParseError!void {
         const start = self.pos;
         const mark = self.bookmark();
         errdefer self.restore(mark);
 
         if (self.pos >= self.input.len) {
-            return false;
+            return;
         }
 
         if (self.input[self.pos] != '@') {
-            return false;
+            return;
         }
 
         self.pos += 1;
@@ -726,7 +758,7 @@ pub const Parser = struct {
                 }
 
                 const arg = self.input[i..self.pos];
-                try argNames.append(self.allocator, arg);
+                argNames.append(self.allocator, arg) catch return ParseError.MemoryError;
                 i = self.pos + 1;
 
                 if (self.peek() == ')') break;
@@ -748,12 +780,11 @@ pub const Parser = struct {
 
         const body = try self.substituteArgs(macro, argNames.items);
         try self.pushFrame(body, macro.filename);
-
-        return true;
     }
 
-    fn substituteArgs(self: *Parser, macro: Macro, args: []const []const u8) ![]const u8 {
-        var output = try std.ArrayList(u8).initCapacity(self.allocator, 3 * macro.body.len / 4);
+    fn substituteArgs(self: *Parser, macro: Macro, args: []const []const u8) ParseError![]const u8 {
+        var output = std.ArrayList(u8).initCapacity(self.allocator, 3 * macro.body.len / 4)
+            catch return ParseError.MemoryError;
         errdefer output.deinit(self.allocator);
 
         var i: usize = 0;
@@ -762,7 +793,7 @@ pub const Parser = struct {
 
             i += 1;
             if (c != '@') {
-                try output.append(self.allocator, c);
+                output.append(self.allocator, c) catch return ParseError.MemoryError;
                 continue;
             }
 
@@ -775,12 +806,12 @@ pub const Parser = struct {
             }
 
             if (match) |j| {
-                try output.appendSlice(self.allocator, args[j]);
+                output.appendSlice(self.allocator, args[j]) catch return ParseError.MemoryError;
                 i += macro.args.items[j].len;
             }
         }
 
-        try self.substitutions.append(self.allocator, output);
+        self.substitutions.append(self.allocator, output) catch return ParseError.MemoryError;
         return output.items;
     }
 };

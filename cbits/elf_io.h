@@ -163,8 +163,11 @@ typedef uint8_t ElfRelocType;
 enum {
 	R_RTM32_NONE   = 0,
 	R_RTM32_RTYPE  = 1,
-	R_RTM32_TAIL16 = 2,
-	R_RTM32_TAIL27 = 3,
+	R_RTM32_LO16   = 2,
+	R_RTM32_HI16   = 3,
+	R_RTM32_PC16   = 4,
+	R_RTM32_TAIL27 = 5,
+	R_RTM32_WORD   = 6,
 };
 
 #define ELF32_R_SYM(i)   ((i) >> 8)

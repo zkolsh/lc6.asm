@@ -376,7 +376,10 @@ ElfStatus elf_view_patch_relocations(
 		const ElfRelocType reloc_type = ELF32_R_TYPE(rel.r_info);
 		const ElfSym sym = symtab[sym_index];
 
-		if (sym.st_shndx >= view->section_count) return ELF_INVALID_EHDR;
+		if (sym.st_shndx >= view->section_count) {
+			return ELF_INVALID_EHDR;
+		};
+
 		const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
 		const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
 
@@ -404,17 +407,39 @@ ElfStatus elf_view_patch_relocations(
 			break;
 		};
 
+		case R_RTM32_LO16: {
+			uint32_t imm16 = absolute_addr & 0xFFFF;
+			instruction &= ~0xFFFF;
+			instruction |= imm16;
+			break;
+		};
+
+		case R_RTM32_HI16: {
+			uint32_t imm16 = (absolute_addr >> 16) & 0xFFFF;
+			instruction &= ~0xFFFF;
+			instruction |= imm16;
+			break;
+		};
+
+		case R_RTM32_PC16: {
+			uint32_t patched_vaddr = (strcmp(section_name, ".text") == 0)? text_base_vaddr : data_base_vaddr;
+			uint32_t ci_vaddr = patched_vaddr + rel.r_offset;
+			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+			uint32_t imm16 = (uint32_t)(offset >> 2) & 0xFFFF;
+			instruction &= ~0xFFFF;
+			instruction |= imm16;
+			break;
+		};
+
 		case R_RTM32_TAIL27: {
-			const uint32_t imm27 = absolute_addr & 0x07FFFFFF;
+			uint32_t imm27 = (absolute_addr >> 2) & 0x07FFFFFF;
 			instruction &= ~0x07FFFFFF;
 			instruction |= imm27;
 			break;
 		};
 
-		case R_RTM32_TAIL16: {
-			const uint32_t imm16 = absolute_addr & 0xFFFF;
-			instruction &= ~0xFFFF;
-			instruction |= imm16;
+		case R_RTM32_WORD: {
+			instruction = absolute_addr;
 			break;
 		};
 

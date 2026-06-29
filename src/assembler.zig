@@ -5,6 +5,11 @@ const c = @import("elf_io");
 const P = @import("parser.zig");
 const isa =  @import("isa.zig");
 
+pub const Symbol = struct {
+    offset: usize,
+    section: isa.Section,
+};
+
 pub const Relocation = struct {
     addr: usize,
     name: []const u8,
@@ -22,16 +27,16 @@ pub const AssemblyError = error {
 pub const Assembly = struct {
     data: std.ArrayList(u8) = std.ArrayList(u8).empty,
     text: std.ArrayList(u8) = std.ArrayList(u8).empty,
-    current_section: isa.Section = .data,
+    currentSection: isa.Section = .data,
 
     allocator: std.mem.Allocator,
-    symbols: std.StringHashMap(usize),
+    symbols: std.StringHashMap(Symbol),
     relocations: std.ArrayList(Relocation),
 
     pub fn init(allocator: std.mem.Allocator) !Assembly {
         return .{
             .allocator = allocator,
-            .symbols = std.StringHashMap(usize).init(allocator),
+            .symbols = std.StringHashMap(Symbol).init(allocator),
             .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 8),
         };
     }
@@ -89,7 +94,7 @@ pub const Assembly = struct {
         try writer.interface.flush();
     }
 
-    pub fn writeElf(self: *Assembly, io: std.Io, filepath: []const u8, elfType: c.ElfType, entryPoint: u32) !void {
+    pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8 {
         var strtab = try std.ArrayList(u8).initCapacity(self.allocator, 1);
         defer strtab.deinit(self.allocator);
         try strtab.append(self.allocator, 0);
@@ -113,11 +118,11 @@ pub const Assembly = struct {
 
             try symtab.append(self.allocator, .{
                 .st_name = offset,
-                .st_value = @as(u32, @intCast(value)),
+                .st_value = @as(u32, @intCast(value.offset)),
                 .st_size = 0,
                 .st_info = 0,
                 .st_other = 0,
-                .st_shndx = 1,
+                .st_shndx = if (value.section == .text) 1 else 2,
             });
         }
 
@@ -138,13 +143,15 @@ pub const Assembly = struct {
 
             const relType = switch (rel.kind) {
                 .rtype => c.R_RTM32_RTYPE,
-                .tail16 => c.R_RTM32_TAIL16,
+                .lo16 => c.R_RTM32_LO16,
+                .hi16 => c.R_RTM32_HI16,
+                .pc16 => c.R_RTM32_PC16,
                 .tail27 => c.R_RTM32_TAIL27,
-                else => c.R_RTM32_NONE,
+                .word => c.R_RTM32_WORD,
             };
 
             try relText.append(self.allocator, .{
-                .r_offset = @as(u32, @intCast(rel.addr * 4)),
+                .r_offset = @as(u32, @intCast(rel.addr)),
                 .r_info = (@as(u32, symbolIndex) << 8) | @as(u32, @intCast(relType)),
             });
         }
@@ -186,7 +193,7 @@ pub const Assembly = struct {
             .{
                 .name = ".symtab",
                 .data = @ptrCast(symtab.items.ptr),
-                .size = @as(u32, @intCast(symtab.items.len)),
+                .size = @as(u32, @intCast(symtab.items.len * @sizeOf(c.ElfSym))),
                 .type = c.SHT_SYMTAB,
                 .flags = c.SHF_NONE,
                 .addralign = 4,
@@ -209,16 +216,22 @@ pub const Assembly = struct {
 
         const size = c.elf_writer_calculate_size(&sections, sections.len);
         const blob = try self.allocator.alloc(u8, size);
-        defer self.allocator.free(blob);
 
         const status =  c.elf_writer_serialize(blob.ptr, blob.len, elfType, entryPoint, &sections, sections.len);
         if (status != c.ELF_SUCCESS) {
+            self.allocator.free(blob);
             return AssemblyError.SerializationFailed;
         }
 
+        return blob;
+    }
+
+    pub fn writeElf(self: *Assembly, io: std.Io, filepath: []const u8, elfType: c.ElfType, entryPoint: u32) !void {
+        const blob = try self.createElfBlob(elfType, entryPoint);
+        defer self.allocator.free(blob);
+
         const file = try std.Io.Dir.cwd().createFile(io, filepath, .{});
         defer file.close(io);
-
         try file.writeStreamingAll(io, blob);
     }
 
@@ -227,7 +240,10 @@ pub const Assembly = struct {
         const label: ?[]const u8 = p.parseLabel() catch null;
         if (label) |name| {
             const storedName = try self.allocator.dupe(u8, name);
-            try self.symbols.put(storedName, self.data.items.len);
+            try self.symbols.put(storedName, .{
+                .offset = self.data.items.len,
+                .section = self.currentSection
+            });
             _ = p.tabulation();
             if (p.eof()) return;
         } else {
@@ -340,7 +356,6 @@ pub const Assembly = struct {
 
         const mangled: u32
             = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, 1 << 6))
             | (@as(u32, @intFromEnum(rs)) <<  7)
             | (@as(u32, @intFromEnum(rt)) << 12)
             | (@as(u32, @intFromEnum(rd)) << 17);
@@ -363,7 +378,7 @@ pub const Assembly = struct {
         const rt = try p.parseRegisterName();
         try p.char(',');
         _ = p.tabulation();
-        const imm: u5 = p.parseInteger(u5) catch |err| blk: {
+        const imm: u6 = p.parseInteger(u6) catch |err| blk: {
             if (err == P.ParseError.NoMatch) {
                 const label = try p.identifier1();
                 try self.relocations.append(self.allocator, .{
@@ -379,7 +394,7 @@ pub const Assembly = struct {
 
         const mangled: u32
             = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, 1 << 6))
+            // | (@as(u32, 1 << 6))
             | (@as(u32, @intFromEnum(rs))  <<  7)
             | (@as(u32, @intFromEnum(rt))  << 12)
             | (@as(u32, @intFromEnum(rd))  << 17)
@@ -443,7 +458,7 @@ pub const Assembly = struct {
                 try self.relocations.append(self.allocator, .{
                     .addr = self.text.items.len, 
                     .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.tail16,
+                    .kind = isa.RelocationMode.lo16,
                     .bookmark = p.bookmark(),
                 });
                 break :blk 0;
@@ -455,7 +470,6 @@ pub const Assembly = struct {
             = (@as(u32, instr.getInfo().op) << 27)
             | (@as(u32, @intFromEnum(rd))   << 22)
             | (@as(u32, @intFromEnum(rs))   << 17)
-            | (@as(u32, 1 << 16))
             |  @as(u32, imm);
 
         const view = std.mem.nativeToLittle(u32, mangled);
@@ -479,7 +493,43 @@ pub const Assembly = struct {
                 try self.relocations.append(self.allocator, .{
                     .addr = self.text.items.len, 
                     .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.tail16,
+                    .kind = isa.RelocationMode.hi16,
+                    .bookmark = p.bookmark(),
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        const mangled: u32
+            = (@as(u32, instr.getInfo().op) << 27)
+            | (@as(u32, @intFromEnum(rd))   << 22)
+            | (@as(u32, @intFromEnum(rs))   << 17)
+            | (@as(u32, 1 << 16))
+            |  @as(u32, imm);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
+    fn encodeBranch(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.text.items.len, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.pc16,
                     .bookmark = p.bookmark(),
                 });
                 break :blk 0;
@@ -524,14 +574,18 @@ pub const Assembly = struct {
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
+
     fn assembleText(self: *Assembly, p: *P.Parser) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
 
         const label: ?[]const u8 = p.parseLabel() catch null;
         if (label) |name| {
-            const stored_name = try self.allocator.dupe(u8, name);
-            try self.symbols.put(stored_name, self.text.items.len);
+            const storedName = try self.allocator.dupe(u8, name);
+            try self.symbols.put(storedName, .{
+                .offset = if (self.currentSection == .text) self.text.items.len else self.data.items.len,
+                .section = self.currentSection
+            });
             _ = p.tabulation();
             if (p.isNewline()) return;
         } else {
@@ -559,12 +613,12 @@ pub const Assembly = struct {
             .lhu => try self.encodeE(p, instr),
             .lb => try self.encodeI(p, instr),
             .lbu => try self.encodeE(p, instr),
-            .beq => try self.encodeI(p, instr),
-            .bne => try self.encodeI(p, instr),
-            .blt => try self.encodeI(p, instr),
-            .bgt => try self.encodeI(p, instr),
-            .ble => try self.encodeI(p, instr),
-            .bge => try self.encodeI(p, instr),
+            .beq => try self.encodeBranch(p, instr),
+            .bne => try self.encodeBranch(p, instr),
+            .blt => try self.encodeBranch(p, instr),
+            .bgt => try self.encodeBranch(p, instr),
+            .ble => try self.encodeBranch(p, instr),
+            .bge => try self.encodeBranch(p, instr),
             .slti => try self.encodeI(p, instr),
             .sltiu => try self.encodeE(p, instr),
             .addi => try self.encodeI(p, instr),
@@ -597,13 +651,13 @@ pub const Assembly = struct {
         }
 
         if (section) |name| {
-            if (std.mem.eql(u8, name, "data")) self.current_section = .data;
-            if (std.mem.eql(u8, name, "text")) self.current_section = .text;
+            if (std.mem.eql(u8, name, "data")) self.currentSection = .data;
+            if (std.mem.eql(u8, name, "text")) self.currentSection = .text;
             _ = p.tabulation();
             return;
         } else {
             p.restore(mark);
-            switch (self.current_section) {
+            switch (self.currentSection) {
                 .data => try self.assembleData(p),
                 .text => try self.assembleText(p),
             }
@@ -619,43 +673,32 @@ pub const Assembly = struct {
         }
     }
 
-    fn patchKnownRelocations(_: *Assembly) void {
-        @panic("UNIMPLEMENTED");
-        // var i: usize = 0;
-        // while (i < self.relocations.items.len) {
-        //     const r = self.relocations.items[i];
-        //     if (self.symbols.get(r.name)) |symbol| {
-        //         var instruction = self.text.items[r.addr];
-        //         switch (r.kind) {
-        //             .rtype, .tail8a => {
-        //                 instruction &= 0xFFF00;
-        //                 instruction |= @as(u8, @truncate(symbol));
-        //             },
-        //             .tail8r => {
-        //                 const pc = r.addr + 1;
-        //                 const delta = @as(i32, @intCast(symbol)) - @as(i32, @intCast(pc));
-        //                 instruction &= 0xFFF00;
-        //                 instruction |= @as(u8, @bitCast(@as(i8, @intCast(delta))));
-        //             },
-        //             .tail16 => {
-        //                 instruction &= 0xF0000;
-        //                 instruction |= @as(u16, @truncate(symbol));
-        //             },
-        //             .tail27 => {
-        //                 instruction &= 0xF8000000;
-        //                 instruction |= @as(u27, @truncate(symbol));
-        //             },
-        //             .word => {
-        //                 instruction |= @as(u32, @intCast(symbol));
-        //             }
-        //         }
-        //         self.program_memory[r.addr] = instruction;
-        //         self.allocator.free(r.name);
-        //         _ = self.relocations.swapRemove(i);
-        //     } else {
-        //         i += 1;
-        //     }
-        // }
+    fn patchKnownRelocations(self: *Assembly) void {
+        var i: usize = 0;
+        while (i < self.relocations.items.len) : (i += 1) {
+            const r = self.relocations.items[i];
+            if (r.kind != isa.RelocationMode.pc16) continue;
+
+            if (self.symbols.get(r.name)) |symbol| {
+                if (symbol.section != isa.Section.text) continue;
+
+                const pc = r.addr;
+                const target = symbol.offset;
+
+                const delta = @as(i32, @intCast(target)) - @as(i32, @intCast(pc + 4));
+                const imm = @as(i16, @truncate(delta >> 2));
+
+                var view: u32 = undefined;
+                std.mem.copyForwards(u8, std.mem.asBytes(&view), self.text.items[pc .. pc + 4]);
+                
+                view &= 0xFFFF0000;
+                view |= @as(u16, @bitCast(imm));
+                
+                std.mem.copyForwards(u8, self.text.items[pc .. pc + 4], std.mem.asBytes(&view));
+                self.allocator.free(r.name);
+                _ = self.relocations.swapRemove(i);
+            }
+        }
     }
 
     pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
@@ -676,8 +719,8 @@ pub const Assembly = struct {
             };
         }
 
-        // self.patchKnownRelocations();
-        //
+        self.patchKnownRelocations();
+
         // if (self.relocations.items.len > 0) {
         //     for (self.relocations.items) |r| {
         //         p.restore(r.bookmark);
@@ -714,7 +757,7 @@ pub const Assembly = struct {
 test "encodeR add" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
-    assembly.current_section = .text;
+    assembly.currentSection = .text;
     var parser = try P.Parser.init(std.testing.allocator, undefined);
     defer parser.deinit();
     try parser.pushFrame("add $t0, $s0, $a0", "<test>");
@@ -726,7 +769,7 @@ test "encodeR add" {
 test "forward references" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
-    assembly.current_section = .text;
+    assembly.currentSection = .text;
     var p1 = try P.Parser.init(std.testing.allocator, undefined);
     defer p1.deinit();
     try p1.pushFrame("j future_label", "<test>");
@@ -802,7 +845,7 @@ test "small .data program" {
 test "%macro register clear pseudo-op" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
-    assembly.current_section = .text;
+    assembly.currentSection = .text;
 
     var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p1.deinit();
@@ -818,7 +861,7 @@ test "%macro register clear pseudo-op" {
 test "%macro array element stride loader" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
-    assembly.current_section = .text;
+    assembly.currentSection = .text;
 
     var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p1.deinit();
@@ -832,7 +875,7 @@ test "%macro array element stride loader" {
 test "%macro conditional yield block" {
     var assembly = try Assembly.init(std.testing.allocator);
     defer assembly.deinit();
-    assembly.current_section = .text;
+    assembly.currentSection = .text;
 
     var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
     defer p1.deinit();

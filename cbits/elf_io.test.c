@@ -8,7 +8,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
-void console_hexdump(const uint8_t* desc_mem, const size_t size) {
+void vram_to_s_cmd(const uint8_t* desc_mem, const size_t size) {
 	printf("Hex View  00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F\n");
 
 	for (size_t i = 0; i < size; i += 16) {
@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
 		elf_view_patch_relocations(&elves[i], ram, layout.total_memory_needed, ".data", text_vaddr, data_vaddr);
 	};
 
-	console_hexdump(ram, layout.total_memory_needed);
+	vram_to_s_cmd(ram, layout.total_memory_needed);
 
 	const uint32_t text_end = text_vaddr + layout.text_size;
 	const uint32_t data_end = data_vaddr + layout.data_size;

@@ -1,20 +1,35 @@
 pub const Register = enum {
+    zero,
+    at,
+    k0,
+    a0,
+    a1,
+    a2,
+    a3,
+    v0,
+    v1,
     t0,
     t1,
     t2,
     t3,
+    t4,
+    t5,
+    t6,
+    t7,
+    t8,
+    t9,
     s0,
     s1,
     s2,
     s3,
     s4,
     s5,
-    ra,
+    s6,
+    s7,
+    fp,
     gp,
     sp,
-    fp,
-    a0,
-    a1,
+    ra,
 };
 
 pub const DataDirective = enum {
@@ -28,9 +43,11 @@ pub const DataDirective = enum {
 
 pub const RelocationMode = enum {
     rtype,
-    tail16,
+    lo16, // I-type
+    hi16, // E-type
+    pc16, // Relative branches
     tail27,
-    word,
+    word, // .ptr
 };
 
 pub const InstructionName = enum {
@@ -74,8 +91,8 @@ pub const InstructionName = enum {
             .andih => .{.op = 0b00100},
             .ori   => .{.op = 0b00101},
             .orih  => .{.op = 0b00101},
-            .xori  => .{.op = 0b00100},
-            .xorih => .{.op = 0b00100},
+            .xori  => .{.op = 0b00110},
+            .xorih => .{.op = 0b00110},
             .lw    => .{.op = 0b01000},
             .sw    => .{.op = 0b01001},
             .sh    => .{.op = 0b01010},
@@ -180,16 +197,14 @@ pub const Section = enum {
 
 pub const PreprocessorDirective = enum {
     define,
+    @"else",
     embed,
-    include,
-    macro,
-};
-
-pub const PreprocessorBuiltin = enum {
     endif,
-    file,
-    @"if",
+    endmacro,
+    filename,
     ifdef,
     ifndef,
+    include,
     line,
+    macro,
 };
