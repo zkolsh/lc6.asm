@@ -472,10 +472,15 @@ pub const Parser = struct {
         errdefer self.restore(mark);
 
         try self.char('$');
-        const reg = try self.alphanumeric1();
-        return std.meta.stringToEnum(isa.Register, reg) orelse {
-            return ParseError.InvalidEnumeration;
-        };
+        if (self.parseInteger(u5)) |index| {
+            return @enumFromInt(index);
+        } else |err| {
+            if (err != ParseError.NoMatch) return err;
+            const reg = try self.alphanumeric1();
+            return std.meta.stringToEnum(isa.Register, reg) orelse {
+                return ParseError.InvalidEnumeration;
+            };
+        }
     }
 
     pub fn parseDataDirective(self: *Parser) ParseError!isa.DataDirective {

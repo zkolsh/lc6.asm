@@ -341,7 +341,7 @@ pub const Assembly = struct {
         }
     }
 
-    fn rtypeRegular(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+    fn encodeR3(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
 
@@ -364,15 +364,12 @@ pub const Assembly = struct {
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
-    fn rtypeAux(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+    fn encodeRShift(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
 
         _ = p.tabulation();
         const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
         try p.char(',');
         _ = p.tabulation();
         const rt = try p.parseRegisterName();
@@ -394,8 +391,6 @@ pub const Assembly = struct {
 
         const mangled: u32
             = (@as(u32, rtype.getFunct().code))
-            // | (@as(u32, 1 << 6))
-            | (@as(u32, @intFromEnum(rs))  <<  7)
             | (@as(u32, @intFromEnum(rt))  << 12)
             | (@as(u32, @intFromEnum(rd))  << 17)
             | (@as(u32, imm) << 22);
@@ -404,44 +399,7 @@ pub const Assembly = struct {
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
-    inline fn encodeR(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        switch (rtype) {
-            .sll => return self.rtypeAux(p, rtype),
-            .srl => return self.rtypeAux(p, rtype),
-            .sra => return self.rtypeAux(p, rtype),
-            .sllr => return self.rtypeRegular(p, rtype),
-            .srlr => return self.rtypeRegular(p, rtype),
-            .srar => return self.rtypeRegular(p, rtype),
-            .cfs => @panic("UNIMPLEMENTED"),
-            .cts => @panic("UNIMPLEMENTED"),
-            .@"and" => return self.rtypeRegular(p, rtype),
-            .@"or" => return self.rtypeRegular(p, rtype),
-            .xor => return self.rtypeRegular(p, rtype),
-            .nor => return self.rtypeRegular(p, rtype),
-            .slt => return self.rtypeRegular(p, rtype),
-            .sltu => return self.rtypeRegular(p, rtype),
-            .jr => @panic("UNIMPLEMENTED"),
-            .jalr => @panic("UNIMPLEMENTED"),
-            .lhx => return self.rtypeRegular(p, rtype),
-            .lhux => return self.rtypeRegular(p, rtype),
-            .lbx => return self.rtypeRegular(p, rtype),
-            .lbux => return self.rtypeRegular(p, rtype),
-            .lwx => return self.rtypeRegular(p, rtype),
-            .mul => return self.rtypeRegular(p, rtype),
-            .mulh => return self.rtypeRegular(p, rtype),
-            .mulhu => return self.rtypeRegular(p, rtype),
-            .div => return self.rtypeRegular(p, rtype),
-            .divu => return self.rtypeRegular(p, rtype),
-            .rest => return self.rtypeRegular(p, rtype),
-            .restu => return self.rtypeRegular(p, rtype),
-            .add => return self.rtypeRegular(p, rtype),
-            .sub => return self.rtypeRegular(p, rtype),
-            .trap => @panic("UNIMPLEMENTED"),
-            .rft => @panic("UNIMPLEMENTED"),
-        }
-    }
-
-    fn encodeI(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+    fn encodeRShiftV(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
 
@@ -449,7 +407,171 @@ pub const Assembly = struct {
         const rd = try p.parseRegisterName();
         try p.char(',');
         _ = p.tabulation();
+        const rt = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
         const rs = try p.parseRegisterName();
+
+        const mangled: u32
+            = (@as(u32, rtype.getFunct().code))
+            | (@as(u32, @intFromEnum(rs)) <<  7)
+            | (@as(u32, @intFromEnum(rt)) << 12)
+            | (@as(u32, @intFromEnum(rd)) << 17);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
+    fn encodeRMemX(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rt = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+
+        const mangled: u32
+            = (@as(u32, rtype.getFunct().code))
+            | (@as(u32, @intFromEnum(rs)) <<  7)
+            | (@as(u32, @intFromEnum(rt)) << 12)
+            | (@as(u32, @intFromEnum(rd)) << 17);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
+    fn encodeRJ(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+
+        const mangled: u32
+            = (@as(u32, rtype.getFunct().code))
+            | (@as(u32, @intFromEnum(rs)) <<  7);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
+    inline fn encodeR(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        switch (rtype) {
+            .sll => return self.encodeRShift(p, rtype),
+            .srl => return self.encodeRShift(p, rtype),
+            .sra => {
+                const mark = p.bookmark();
+                errdefer p.restore(mark);
+
+                _ = p.tabulation();
+                const rd = try p.parseRegisterName();
+                try p.char(',');
+                _ = p.tabulation();
+                const rs = try p.parseRegisterName();
+                try p.char(',');
+                _ = p.tabulation();
+                const imm: u6 = p.parseInteger(u6) catch |err| blk: {
+                    if (err == P.ParseError.NoMatch) {
+                        const label = try p.identifier1();
+                        try self.relocations.append(self.allocator, .{
+                            .addr = self.text.items.len, 
+                            .name = try self.allocator.dupe(u8, label),
+                            .kind = isa.RelocationMode.rtype,
+                            .bookmark = p.bookmark(),
+                        });
+                        break :blk 0;
+                    }
+                    return err;
+                };
+
+                const mangled: u32
+                    = (@as(u32, rtype.getFunct().code))
+                    | (@as(u32, @intFromEnum(rs))  <<  7)
+                    | (@as(u32, @intFromEnum(rd))  << 17)
+                    | (@as(u32, imm) << 22);
+
+                const view = std.mem.nativeToLittle(u32, mangled);
+                try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+            },
+            .sllr => return self.encodeRShiftV(p, rtype),
+            .srlr => return self.encodeRShiftV(p, rtype),
+            .srar => return self.encodeRShiftV(p, rtype),
+            .cfs => @panic("UNIMPLEMENTED"),
+            .cts => @panic("UNIMPLEMENTED"),
+            .@"and" => return self.encodeR3(p, rtype),
+            .@"or" => return self.encodeR3(p, rtype),
+            .xor => return self.encodeR3(p, rtype),
+            .nor => return self.encodeR3(p, rtype),
+            .slt => return self.encodeR3(p, rtype),
+            .sltu => return self.encodeR3(p, rtype),
+            .jr => return self.encodeRJ(p, rtype),
+            .jalr => return self.encodeRJ(p, rtype),
+            .lhx => return self.encodeRMemX(p, rtype),
+            .lhux => return self.encodeRMemX(p, rtype),
+            .lbx => return self.encodeRMemX(p, rtype),
+            .lbux => return self.encodeRMemX(p, rtype),
+            .lwx => return self.encodeRMemX(p, rtype),
+            .mul => return self.encodeR3(p, rtype),
+            .mulh => return self.encodeR3(p, rtype),
+            .mulhu => return self.encodeR3(p, rtype),
+            .div => return self.encodeR3(p, rtype),
+            .divu => return self.encodeR3(p, rtype),
+            .rest => return self.encodeR3(p, rtype),
+            .restu => return self.encodeR3(p, rtype),
+            .add => return self.encodeR3(p, rtype),
+            .sub => return self.encodeR3(p, rtype),
+            .trap => @panic("UNIMPLEMENTED"),
+            .rft => @panic("UNIMPLEMENTED"),
+        }
+    }
+
+    fn encodeIALU(self: *Assembly, p: *P.Parser, instr: isa.InstructionName, comptime high: bool) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rt = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.text.items.len, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = if (high) isa.RelocationMode.hi16 else isa.RelocationMode.lo16,
+                    .bookmark = p.bookmark(),
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        const mangled: u32
+            = (@as(u32, instr.getInfo().op) << 27)
+            | (@as(u32, @intFromEnum(rs))   << 22)
+            | (@as(u32, @intFromEnum(rt))   << 17)
+            | (if (high) @as(u32, 1 << 16) else @as(u32, 0))
+            |  @as(u32, imm);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
+    fn encodeIMem(self: *Assembly, p: *P.Parser, instr: isa.InstructionName, comptime high: bool) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rt = try p.parseRegisterName();
         try p.char(',');
         _ = p.tabulation();
         const imm: u16 = p.parseInteger(u16) catch |err| blk: {
@@ -466,61 +588,33 @@ pub const Assembly = struct {
             return err;
         };
 
+        _ = p.tabulation();
+        try p.char('(');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        _ = p.tabulation();
+        try p.char(')');
+
         const mangled: u32
             = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rd))   << 22)
-            | (@as(u32, @intFromEnum(rs))   << 17)
+            | (@as(u32, @intFromEnum(rs))   << 22)
+            | (@as(u32, @intFromEnum(rt))   << 17)
+            | (if (high) @as(u32, 1 << 16) else @as(u32, 0))
             |  @as(u32, imm);
 
         const view = std.mem.nativeToLittle(u32, mangled);
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
-    fn encodeE(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+    fn encodeB(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
 
         _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
         const rs = try p.parseRegisterName();
         try p.char(',');
         _ = p.tabulation();
-        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.hi16,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rd))   << 22)
-            | (@as(u32, @intFromEnum(rs))   << 17)
-            | (@as(u32, 1 << 16))
-            |  @as(u32, imm);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeBranch(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
+        const rt = try p.parseRegisterName();
         try p.char(',');
         _ = p.tabulation();
         const imm: u16 = p.parseInteger(u16) catch |err| blk: {
@@ -539,8 +633,8 @@ pub const Assembly = struct {
 
         const mangled: u32
             = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rd))   << 22)
-            | (@as(u32, @intFromEnum(rs))   << 17)
+            | (@as(u32, @intFromEnum(rs))   << 22)
+            | (@as(u32, @intFromEnum(rt))   << 17)
             |  @as(u32, imm);
 
         const view = std.mem.nativeToLittle(u32, mangled);
@@ -574,7 +668,6 @@ pub const Assembly = struct {
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
-
     fn assembleText(self: *Assembly, p: *P.Parser) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
@@ -599,29 +692,29 @@ pub const Assembly = struct {
             .rtype => return AssemblyError.InvalidInstruction,
             .j => try self.encodeS(p, instr),
             .jal => try self.encodeS(p, instr),
-            .andi => try self.encodeI(p, instr),
-            .andih => try self.encodeE(p, instr),
-            .ori => try self.encodeI(p, instr),
-            .orih => try self.encodeE(p, instr),
-            .xori => try self.encodeI(p, instr),
-            .xorih => try self.encodeE(p, instr),
-            .lw => try self.encodeI(p, instr),
-            .sw => try self.encodeI(p, instr),
-            .sh => try self.encodeI(p, instr),
-            .sb => try self.encodeI(p, instr),
-            .lh => try self.encodeI(p, instr),
-            .lhu => try self.encodeE(p, instr),
-            .lb => try self.encodeI(p, instr),
-            .lbu => try self.encodeE(p, instr),
-            .beq => try self.encodeBranch(p, instr),
-            .bne => try self.encodeBranch(p, instr),
-            .blt => try self.encodeBranch(p, instr),
-            .bgt => try self.encodeBranch(p, instr),
-            .ble => try self.encodeBranch(p, instr),
-            .bge => try self.encodeBranch(p, instr),
-            .slti => try self.encodeI(p, instr),
-            .sltiu => try self.encodeE(p, instr),
-            .addi => try self.encodeI(p, instr),
+            .andi => try self.encodeIALU(p, instr, false),
+            .andih => try self.encodeIALU(p, instr, true),
+            .ori => try self.encodeIALU(p, instr, false),
+            .orih => try self.encodeIALU(p, instr, true),
+            .xori => try self.encodeIALU(p, instr, false),
+            .xorih => try self.encodeIALU(p, instr, true),
+            .lw => try self.encodeIMem(p, instr, false),
+            .sw => try self.encodeIMem(p, instr, false),
+            .sh => try self.encodeIMem(p, instr, false),
+            .sb => try self.encodeIMem(p, instr, false),
+            .lh => try self.encodeIMem(p, instr, false),
+            .lhu => try self.encodeIMem(p, instr, true),
+            .lb => try self.encodeIMem(p, instr, false),
+            .lbu => try self.encodeIMem(p, instr, true),
+            .beq => try self.encodeB(p, instr),
+            .bne => try self.encodeB(p, instr),
+            .blt => try self.encodeB(p, instr),
+            .bgt => try self.encodeB(p, instr),
+            .ble => try self.encodeB(p, instr),
+            .bge => try self.encodeB(p, instr),
+            .slti => try self.encodeIALU(p, instr, false),
+            .sltiu => try self.encodeIALU(p, instr, true),
+            .addi => try self.encodeIALU(p, instr, false),
         } else {
             return AssemblyError.InvalidInstruction;
         }
