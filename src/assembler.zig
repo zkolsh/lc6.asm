@@ -235,109 +235,166 @@ pub const Assembly = struct {
         try file.writeStreamingAll(io, blob);
     }
 
+    fn alignData(self: *Assembly, alignment: usize) !void {
+        const remainder = self.data.items.len % alignment;
+        if (remainder != 0) {
+            try self.data.appendNTimes(self.allocator, 0, alignment - remainder);
+        }
+    }
+
+    fn encodeAsciiz(self: *Assembly, p: *P.Parser) !void {
+        var count: usize = 0;
+
+        while (!p.eof()) {
+            _ = p.tabulation();
+            const mark = p.bookmark();
+
+            const str = p.parseStringLiteral() catch |err| {
+                p.restore(mark);
+                if (err == P.ParseError.NoMatch and count > 0) break;
+                return err;
+            };
+
+            count += 1;
+            try self.data.appendSlice(self.allocator, str);
+        }
+
+        try self.data.append(self.allocator, 0);
+    }
+
+    fn encodeNascii(self: *Assembly, p: *P.Parser) !void {
+        var concat = std.ArrayList(u8).empty;
+        defer concat.deinit(self.allocator);
+
+        var count: usize = 0;
+        while (!p.eof()) {
+            _ = p.tabulation();
+            const mark = p.bookmark();
+
+            const str = p.parseStringLiteral() catch |err| {
+                p.restore(mark);
+                if (err == P.ParseError.NoMatch and count > 0) break;
+                return err;
+            };
+
+            count += 1;
+            try concat.appendSlice(self.allocator, str);
+        }
+
+        const len = std.mem.nativeToLittle(u32, @as(u32, @intCast(concat.items.len)));
+        try self.data.appendSlice(self.allocator, std.mem.asBytes(&len));
+        try self.data.appendSlice(self.allocator, concat.items);
+    }
+
+    fn encodePadGetAlignment(_: *Assembly, p: *P.Parser) !usize {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        try p.char('(');
+        const alignment = try p.parseInteger(usize);
+        try p.char(')');
+
+        return alignment;
+    }
+
+    fn encodePad(self: *Assembly, p: *P.Parser) !void {
+        const length = try p.parseInteger(usize);
+        try self.alignData(self.encodePadGetAlignment(p) catch 1);
+        try self.data.appendNTimes(self.allocator, 0, length);
+    }
+
+    fn encodeByte(self: *Assembly, p: *P.Parser) !void {
+        while (!p.eof()) {
+            _ = p.tabulation();
+            const mark = p.bookmark();
+
+            while (p.isNewline()) {
+                p.newline() catch {};
+                _ = p.tabulation();
+            }
+
+            const value = p.parseByte() catch {
+                p.restore(mark);
+                break;
+            };
+
+            try self.data.append(self.allocator, value);
+        }
+    }
+
+    fn encodeWord(self: *Assembly, p: *P.Parser) !void {
+        while (!p.eof()) {
+            _ = p.tabulation();
+            const mark = p.bookmark();
+
+            while (p.isNewline()) {
+                p.newline() catch {};
+                _ = p.tabulation();
+            }
+
+            const value = p.parseInteger(i32) catch {
+                p.restore(mark);
+                break;
+            };
+
+            const view = std.mem.nativeToLittle(i32, value);
+            try self.data.appendSlice(self.allocator, std.mem.asBytes(&view));
+        }
+    }
+
+    fn encodePtr(self: *Assembly, p: *P.Parser) !void {
+        _ = p.tabulation();
+        const name = try p.identifier1();
+
+        try self.relocations.append(self.allocator, .{
+            .addr = self.data.items.len,
+            .name = try self.allocator.dupe(u8, name),
+            .kind = .word,
+            .bookmark = p.bookmark(),
+        });
+        
+        try self.data.appendNTimes(self.allocator, 0, 4);
+    }
+
     fn assembleData(self: *Assembly, p: *P.Parser) !void {
-        var mark = p.bookmark();
+        const mark = p.bookmark();
         const label: ?[]const u8 = p.parseLabel() catch null;
+
+        const directive = p.parseDataDirective() catch |err| {
+            if (err == P.ParseError.NoMatch) if (label) |name| {
+                const storedName = try self.allocator.dupe(u8, name);
+                try self.symbols.put(storedName, .{
+                    .offset = self.data.items.len,
+                    .section = self.currentSection
+                });
+
+                return;
+            };
+
+            p.restore(mark);
+            return err;
+        };
+
+        switch (directive) {
+            .nascii, .ptr, .word => try self.alignData(4),
+            .asciiz, .byte, .pad => {},
+        }
+
         if (label) |name| {
             const storedName = try self.allocator.dupe(u8, name);
             try self.symbols.put(storedName, .{
                 .offset = self.data.items.len,
                 .section = self.currentSection
             });
-            _ = p.tabulation();
-            if (p.eof()) return;
-        } else {
-            p.restore(mark);
         }
 
-        const directive = p.parseDataDirective() catch return;
-        _ = p.tabulation();
-
-        mark = p.bookmark();
-        errdefer p.restore(mark);
-
         switch (directive) {
-            .asciiz => {
-                const str = try p.parseStringLiteral();
-                try self.data.appendSlice(self.allocator, str);
-                try self.data.append(self.allocator, 0);
-            },
-
-            .byte => {
-                while (!p.eof()) {
-                    try self.data.append(self.allocator, try p.parseByte());
-                    _ = p.tabulation();
-
-                    if (p.isNewline()) {
-                        const here = p.bookmark();
-                        try p.newline();
-                        _ = p.tabulation();
-                        
-                        const nextMark = p.bookmark();
-                        _ = p.parseByte() catch {
-                            p.restore(here);
-                            break;
-                        };
-
-                        p.restore(nextMark);
-                    }
-                }
-            },
-
-            .nascii => {
-                if (self.data.items.len % 4 != 0) {
-                    try self.data.appendNTimes(self.allocator, 0, 4 - (self.data.items.len % 4));
-                }
-
-                const str = try p.parseStringLiteral();
-                const len = std.mem.nativeToLittle(u32, @as(u32, @intCast(str.len)));
-                try self.data.appendSlice(self.allocator, std.mem.asBytes(&len));
-                try self.data.appendSlice(self.allocator, str);
-            },
-
-            .pad => {
-                const len = try p.parseInteger(usize);
-                try self.data.appendNTimes(self.allocator, 0, len);
-            },
-
-            .ptr => {
-                if (self.data.items.len % 4 != 0) {
-                    try self.data.appendNTimes(self.allocator, 0, 4 - (self.data.items.len % 4));
-                }
-
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.data.items.len,
-                    .name = try self.allocator.dupe(u8, try p.identifier1()),
-                    .kind = .word,
-                    .bookmark = p.bookmark(),
-                });
-            },
-
-            .word => {
-                if (self.data.items.len % 4 != 0) {
-                    try self.data.appendNTimes(self.allocator, 0, 4 - (self.data.items.len % 4));
-                }
-
-                while (!p.eof()) {
-                    const len = std.mem.nativeToLittle(i32, try p.parseInteger(i32));
-                    try self.data.appendSlice(self.allocator, std.mem.asBytes(&len));
-                    _ = p.tabulation();
-
-                    if (p.isNewline()) {
-                        const here = p.bookmark();
-                        try p.newline();
-                        _ = p.tabulation();
-                        
-                        const nextMark = p.bookmark();
-                        _ = p.parseInteger(i32) catch {
-                            p.restore(here);
-                            break;
-                        };
-
-                        p.restore(nextMark);
-                    }
-                }
-            },
+            .asciiz => try self.encodeAsciiz(p),
+            .byte => try self.encodeByte(p),
+            .nascii => try self.encodeNascii(p),
+            .pad => try self.encodePad(p),
+            .ptr => try self.encodePtr(p),
+            .word => try self.encodeWord(p),
         }
     }
 
