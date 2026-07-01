@@ -14,7 +14,7 @@ const helpText: []const u8 =
     \\
     ;
 
-const versionString: []const u8 = ".1";
+const versionString: []const u8 = "0.2";
 
 pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(init.io, &.{});

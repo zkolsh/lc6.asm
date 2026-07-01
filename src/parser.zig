@@ -10,7 +10,6 @@ pub const ParseError = error {
     MemoryError,
     MacroNotAllowedHere,
     MacroRedefined,
-    NoEnd,
     FileNotFound,
     NoMatch,
     NumericOverflow,
@@ -595,7 +594,7 @@ pub const Parser = struct {
                 self.macros.put(macro.name, macro) catch return ParseError.MemoryError;
             },
 
-            .@"else" => return ParseError.NoMatch,
+            .@"else" => return ParseError.StrayPreprocessorTerminator,
 
             .embed => {
                 const path = try self.parseStringLiteral();
@@ -624,15 +623,17 @@ pub const Parser = struct {
                 try self.pushFrame(data.items, path);
             },
 
-            .endif => return ParseError.NoEnd,
+            .endif => return ParseError.StrayPreprocessorTerminator,
 
-            .endmacro => return ParseError.NoEnd,
+            .endmacro => return ParseError.StrayPreprocessorTerminator,
 
             .filename => {
                 try self.pushFrame(self.currentFilename, self.currentFilename);
             },
 
-            .ifdef, .ifndef => {},
+            .ifdef, .ifndef => {
+                
+            },
 
             .include => {
                 const path = try self.parseStringLiteral();

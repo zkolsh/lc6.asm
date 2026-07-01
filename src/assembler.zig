@@ -456,6 +456,41 @@ pub const Assembly = struct {
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
+    fn encodeRSRA(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rd = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const rs = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u6 = p.parseInteger(u6) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.text.items.len, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.rtype,
+                    .bookmark = p.bookmark(),
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        const mangled: u32
+            = (@as(u32, rtype.getFunct().code))
+            | (@as(u32, @intFromEnum(rs))  <<  7)
+            | (@as(u32, @intFromEnum(rd))  << 17)
+            | (@as(u32, imm) << 22);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
     fn encodeRShiftV(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
@@ -521,40 +556,7 @@ pub const Assembly = struct {
         switch (rtype) {
             .sll => return self.encodeRShift(p, rtype),
             .srl => return self.encodeRShift(p, rtype),
-            .sra => {
-                const mark = p.bookmark();
-                errdefer p.restore(mark);
-
-                _ = p.tabulation();
-                const rd = try p.parseRegisterName();
-                try p.char(',');
-                _ = p.tabulation();
-                const rs = try p.parseRegisterName();
-                try p.char(',');
-                _ = p.tabulation();
-                const imm: u6 = p.parseInteger(u6) catch |err| blk: {
-                    if (err == P.ParseError.NoMatch) {
-                        const label = try p.identifier1();
-                        try self.relocations.append(self.allocator, .{
-                            .addr = self.text.items.len, 
-                            .name = try self.allocator.dupe(u8, label),
-                            .kind = isa.RelocationMode.rtype,
-                            .bookmark = p.bookmark(),
-                        });
-                        break :blk 0;
-                    }
-                    return err;
-                };
-
-                const mangled: u32
-                    = (@as(u32, rtype.getFunct().code))
-                    | (@as(u32, @intFromEnum(rs))  <<  7)
-                    | (@as(u32, @intFromEnum(rd))  << 17)
-                    | (@as(u32, imm) << 22);
-
-                const view = std.mem.nativeToLittle(u32, mangled);
-                try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-            },
+            .sra => return self.encodeRSRA(p, rtype),
             .sllr => return self.encodeRShiftV(p, rtype),
             .srlr => return self.encodeRShiftV(p, rtype),
             .srar => return self.encodeRShiftV(p, rtype),
@@ -663,6 +665,37 @@ pub const Assembly = struct {
         try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
     }
 
+    fn encodeILui(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
+        const mark = p.bookmark();
+        errdefer p.restore(mark);
+
+        _ = p.tabulation();
+        const rt = try p.parseRegisterName();
+        try p.char(',');
+        _ = p.tabulation();
+        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
+            if (err == P.ParseError.NoMatch) {
+                const label = try p.identifier1();
+                try self.relocations.append(self.allocator, .{
+                    .addr = self.text.items.len, 
+                    .name = try self.allocator.dupe(u8, label),
+                    .kind = isa.RelocationMode.lo16,
+                    .bookmark = p.bookmark(),
+                });
+                break :blk 0;
+            }
+            return err;
+        };
+
+        const mangled: u32
+            = (@as(u32, instr.getInfo().op) << 27)
+            | (@as(u32, @intFromEnum(rt))   << 17)
+            |  @as(u32, imm);
+
+        const view = std.mem.nativeToLittle(u32, mangled);
+        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
+    }
+
     fn encodeB(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
         const mark = p.bookmark();
         errdefer p.restore(mark);
@@ -747,6 +780,7 @@ pub const Assembly = struct {
             try self.encodeR(p, rtype);
         } else if (std.meta.stringToEnum(isa.InstructionName, mnemonic)) |instr| switch (instr) {
             .rtype => return AssemblyError.InvalidInstruction,
+            .addi => try self.encodeIALU(p, instr, false),
             .j => try self.encodeS(p, instr),
             .jal => try self.encodeS(p, instr),
             .andi => try self.encodeIALU(p, instr, false),
@@ -755,6 +789,7 @@ pub const Assembly = struct {
             .orih => try self.encodeIALU(p, instr, true),
             .xori => try self.encodeIALU(p, instr, false),
             .xorih => try self.encodeIALU(p, instr, true),
+            .lui => try self.encodeILui(p, instr),
             .lw => try self.encodeIMem(p, instr, false),
             .sw => try self.encodeIMem(p, instr, false),
             .sh => try self.encodeIMem(p, instr, false),
@@ -771,7 +806,6 @@ pub const Assembly = struct {
             .bge => try self.encodeB(p, instr),
             .slti => try self.encodeIALU(p, instr, false),
             .sltiu => try self.encodeIALU(p, instr, true),
-            .addi => try self.encodeIALU(p, instr, false),
         } else {
             return AssemblyError.InvalidInstruction;
         }

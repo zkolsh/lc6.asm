@@ -2,6 +2,7 @@ pub const Register = enum {
     zero,
     at,
     k0,
+    k1,
     a0,
     a1,
     a2,
@@ -52,6 +53,7 @@ pub const RelocationMode = enum {
 
 pub const InstructionName = enum {
     rtype,
+    addi,
     j,
     jal,
     andi,
@@ -60,6 +62,7 @@ pub const InstructionName = enum {
     orih,
     xori,
     xorih,
+    lui,
     lw,
     sw,
     sh,
@@ -76,7 +79,6 @@ pub const InstructionName = enum {
     bge,
     slti,
     sltiu,
-    addi,
 
     pub const Info = struct {
         op: u5,
@@ -85,6 +87,7 @@ pub const InstructionName = enum {
     pub fn getInfo(self: InstructionName) Info {
         return switch (self) {
             .rtype => .{.op = 0b00000},
+            .addi  => .{.op = 0b00001},
             .j     => .{.op = 0b00010},
             .jal   => .{.op = 0b00011},
             .andi  => .{.op = 0b00100},
@@ -93,6 +96,7 @@ pub const InstructionName = enum {
             .orih  => .{.op = 0b00101},
             .xori  => .{.op = 0b00110},
             .xorih => .{.op = 0b00110},
+            .lui   => .{.op = 0b00111},
             .lw    => .{.op = 0b01000},
             .sw    => .{.op = 0b01001},
             .sh    => .{.op = 0b01010},
@@ -109,7 +113,6 @@ pub const InstructionName = enum {
             .bge   => .{.op = 0b10101},
             .slti  => .{.op = 0b10110},
             .sltiu => .{.op = 0b10111},
-            .addi  => .{.op = 0b11000},
         };
     }
 };
