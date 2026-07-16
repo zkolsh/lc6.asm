@@ -13,6 +13,7 @@ pub const ParseError = error {
     FileNotFound,
     NoMatch,
     NumericOverflow,
+    StrayElse,
     StrayPreprocessorTerminator,
     UnexpectedEOF,
     UnexpectedToken,
@@ -631,8 +632,70 @@ pub const Parser = struct {
                 try self.pushFrame(self.currentFilename, self.currentFilename);
             },
 
-            .ifdef, .ifndef => {
-                
+            .ifdef, .ifndef => |yn| {
+                const name = try self.identifier1();
+                const enabled = self.macros.contains(std.mem.trim(u8, name, " \t\r\n")) == (yn == .ifdef);
+                var bodyStart = self.pos;
+                var bodyEnd = self.pos;
+
+                var elses = std.BitStack.init(self.allocator);
+                defer elses.deinit();
+
+                elses.push(1) catch return ParseError.MemoryError;
+
+                while (self.pos < self.input.len) : (self.pos += 1) {
+                    const delimPos = self.pos;
+                    if (self.input[delimPos] != '%') continue;
+                    self.pos += 1;
+
+                    const word = self.identifier1() catch continue;
+                    const id = std.meta.stringToEnum(isa.PreprocessorDirective, word)
+                        orelse continue;
+                   
+                    switch (id) {
+                        .ifdef, .ifndef => {
+                            elses.push(1) catch return ParseError.MemoryError;
+                        },
+
+                        .@"else" => {
+                            if (elses.peek() == 0) {
+                                return ParseError.StrayPreprocessorTerminator;
+                            }
+
+                            if (elses.bit_len == 1) {
+                                if (enabled) {
+                                    bodyEnd = delimPos;
+                                } else {
+                                    bodyStart = self.pos;
+                                }
+                            }
+
+                            _ = elses.pop();
+                            elses.push(0) catch return ParseError.MemoryError;
+                        },
+
+                        .endif => {
+                            if (elses.bit_len == 1 and enabled == (elses.peek() == 1)) {
+                                bodyEnd = delimPos;
+                            }
+                            
+                            _ = elses.pop(); 
+                        },
+
+                        else => {},
+                    }
+
+                    if (elses.bit_len == 0) {
+                        break;
+                    }
+                }
+
+                const body = self.input[bodyStart..bodyEnd];
+                const remaining = self.input[self.pos..];
+                self.input = self.input[0..mark.pos];
+                self.pos = mark.pos;
+                try self.pushFrame(remaining, self.currentFilename);
+                try self.pushFrame(body, self.currentFilename);
             },
 
             .include => {
