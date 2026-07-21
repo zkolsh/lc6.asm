@@ -24,38 +24,6 @@ pub const ParseError = error {
     UnterminatedString,
 };
 
-const Macro = struct {
-    name: []u8,
-    args: std.ArrayList([]u8),
-    body: []u8,
-    filename: []const u8,
-
-    pub fn init(filename: []const u8) Macro {
-        return .{
-            .name = &[_]u8{},
-            .args = std.ArrayList([]u8).empty,
-            .body = &[_]u8{},
-            .filename = filename,
-        };
-    }
-
-    pub fn deinit(self: *Macro, allocator: std.mem.Allocator) void {
-        for (self.args.items) |x| {
-            allocator.free(x);
-        }
-
-        self.args.deinit(allocator);
-        allocator.free(self.body);
-        allocator.free(self.name);
-    }
-};
-
-const Frame = struct {
-    input: []const u8,
-    pos: usize = 0,
-    filename: []const u8,
-    next: ?*Frame,
-};
 
 fn isIdentifierChar(c: u8) bool {
     return (std.ascii.isAlphanumeric(c) or c == '_' or c == '\'' or c == '.');
@@ -102,98 +70,6 @@ pub const Parser = struct {
         self.frames.deinit(self.allocator);
         self.substitutions.deinit(self.allocator);
         self.macros.deinit();
-    }
-
-    pub const Bookmark = struct {
-        input: []const u8,
-        pos: usize,
-        currentFilename: []const u8,
-        frameHead: ?*Frame,
-    };
-
-    pub fn bookmark(self: *Parser) Bookmark {
-        return .{
-            .input = self.input,
-            .pos = self.pos,
-            .currentFilename = self.currentFilename,
-            .frameHead = self.frameHead,
-        };
-    }
-
-    pub fn restore(self: *Parser, mark: Bookmark) void {
-        self.input = mark.input;
-        self.pos = mark.pos;
-        self.currentFilename = mark.currentFilename;
-        self.frameHead = mark.frameHead;
-    }
-
-    pub const Location = struct {
-        filename: []const u8,
-        line: usize,
-        column: usize,
-        start: usize,
-        end: usize,
-    };
-
-    pub fn getLocationInfo(input: []const u8, pos_: usize, filename: []const u8) Location {
-        const pos = @min(pos_, input.len);
-
-        var line: usize = 1;
-        var column: usize = 1;
-        var start: usize = 0;
-
-        for (input[0..pos], 0..) |c, i| {
-            if (c == '\n') {
-                line += 1;
-                column = 1;
-                start = i + 1;
-            } else {
-                column += 1;
-            }
-        }
-
-        var end = pos;
-        while (end < input.len and input[end] != '\n' and input[end] != '\r')
-            : (end += 1) {}
-
-        return .{
-            .filename = filename,
-            .line = line,
-            .column = column,
-            .start = start,
-            .end = end,
-        };
-    }
-
-    pub fn getLocation(self: *const Parser) Location {
-        return getLocationInfo(self.input, self.pos, self.currentFilename);
-    }
-
-    pub fn pushFrame(self: *Parser, frameData: []const u8, filename: []const u8) ParseError!void {
-        const frame = self.allocator.create(Frame) catch return ParseError.MemoryError;
-        errdefer self.allocator.destroy(frame);
-
-        frame.* = .{
-            .input = self.input,
-            .pos = self.pos,
-            .filename = self.currentFilename,
-            .next = self.frameHead,
-        };
-
-        self.frames.append(self.allocator, frame) catch return ParseError.MemoryError;
-        self.frameHead = frame;
-        self.input = frameData;
-        self.pos = 0;
-        self.currentFilename = filename;
-    }
-
-    pub fn popFrame(self: *Parser) ParseError!void {
-        const top = self.frameHead
-            orelse return ParseError.UnexpectedEOF;
-        self.input = top.input;
-        self.pos = top.pos;
-        self.currentFilename = top.filename;
-        self.frameHead = top.next;
     }
 
     pub fn eof(self: *Parser) bool {
