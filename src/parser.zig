@@ -1,269 +1,163 @@
 const std = @import("std");
 const isa = @import("isa.zig");
+const lex = @import("tokenizer.zig");
+
+const Tokenizer = lex.Tokenizer;
 
 pub const ParseError = error {
-    ArityMismatch,
-    BuiltinPreprocessorOverride,
-    InvalidCharacter,
     InvalidEnumeration,
-    InvalidPreprocessorDirective,
-    MemoryError,
-    MacroNotAllowedHere,
-    MacroRedefined,
-    FileNotFound,
     NoMatch,
     NumericOverflow,
-    StrayElse,
-    StrayPreprocessorTerminator,
-    UnexpectedEOF,
     UnexpectedToken,
-    UnexpectedWhitespace,
-    UnknownMacro,
-    UnterminatedPreprocessorDirective,
-    UnterminatedScope,
-    UnterminatedString,
-};
+} || lex.LexerError;
 
-
-fn isIdentifierChar(c: u8) bool {
-    return (std.ascii.isAlphanumeric(c) or c == '_' or c == '\'' or c == '.');
+pub fn Immediate(comptime T: type) type {
+    return union(enum) {
+        static: T,
+        dynamic: []const u8,
+    };
 }
 
+pub const RType = struct {
+    funct: isa.RType,
+    rs: isa.Register,
+    rt: isa.Register,
+    rd: isa.Register,
+    aux: Immediate(u6),
+};
+
+pub const IType = struct {
+    opcode: isa.InstructionName,
+    rs: isa.Register,
+    rt: isa.Register,
+    imm: Immediate(i17),
+};
+
+pub const LType = struct {
+    opcode: isa.InstructionName,
+    rs: isa.Register,
+    rt: isa.Register,
+    imm: Immediate(i16),
+};
+
+pub const JType = struct {
+    opcode: isa.InstructionName,
+    imm: Immediate(i27),
+};
+
+const Instruction = union(enum) {
+    rtype: RType,
+    itype: IType,
+    ltype: LType,
+    jtype: JType,
+};
+
+const Padding = struct {
+    size: usize,
+    alignment: usize,
+};
+
+const Directive = union(enum) {
+    section: []const u8,
+    bytes: []const u8,
+    shorts: []const u16,
+    words: []const u32,
+    asciiz: []const u8,
+    nascii: []const u8,
+    padding: Padding,
+    ptr: []const u8,
+};
+
+pub const Statement = struct {
+    label: []const u8,
+    value: union(enum) {
+        section: []const u8,
+        bytes: []const u8,
+        shorts: []const u16,
+        words: []const u32,
+        asciiz: []const u8,
+        nascii: []const u8,
+        padding: Padding,
+        ptr: []const u8,
+        rtype: RType,
+        itype: IType,
+        ltype: LType,
+        jtype: JType,
+    }
+};
+
 pub const Parser = struct {
-    input: []const u8 = &[_]u8{},
-    pos: usize = 0,
+    lexer: Tokenizer,
+    arena: std.heap.ArenaAllocator,
 
-    currentFilename: []const u8 = &[_]u8{},
-    frameHead: ?*Frame = null,
-    frames: std.ArrayList(*Frame),
+    const Token = lex.Tokenizer.Token;
 
-    macros: std.StringHashMap(Macro),
-    substitutions: std.ArrayList(std.ArrayList(u8)),
-
-    io: std.Io,
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator, io: std.Io) !Parser {
+    pub fn init(io: std.Io, allocator: std.mem.Allocator) !Parser {
         return .{
-            .allocator =  allocator,
-            .io = io,
-            .frames = try std.ArrayList(*Frame).initCapacity(allocator, 1),
-            .macros = std.StringHashMap(Macro).init(allocator),
-            .substitutions = try std.ArrayList(std.ArrayList(u8)).initCapacity(allocator, 1),
+            .lexer = try Tokenizer.init(io, allocator),
+            .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *Parser) void {
-        var it = self.macros.iterator();
-        while (it.next()) |x| {
-            x.value_ptr.deinit(self.allocator);
-        }
-
-        for (self.substitutions.items) |*sub| {
-            sub.deinit(self.allocator);
-        }
-
-        for (self.frames.items) |frame| {
-            self.allocator.destroy(frame);
-        }
-
-        self.frames.deinit(self.allocator);
-        self.substitutions.deinit(self.allocator);
-        self.macros.deinit();
+        self.arena.deinit();
+        self.lexer.deinit();
     }
 
-    pub fn eof(self: *Parser) bool {
-        while (true) {
-            while (self.pos >= self.input.len) {
-                self.popFrame() catch return true;
-            }
-
-            switch (self.input[self.pos]) {
-                '%' => {
-                    _ = self.parsePreprocessorDefinition() catch return false;
-                    continue;
-                },
-
-                '@' => {
-                    _ = self.expandPreprocessorInvocation() catch return false;
-                    continue;
-                },
-
-                else => {},
-            }
-
-            break;
+    pub inline fn expect(self: *Parser, kind: Token.Kind) ParseError![]const u8 {
+        const token = try self.lexer.next();
+        if (token.kind == kind) {
+            return token.data;
+        } else {
+            return ParseError.UnexpectedToken;
         }
-
-        return self.pos >= self.input.len;
     }
 
-    pub inline fn peekRawLine(self: *Parser) []const u8 {
-        if (self.pos >= self.input.len) {
-            return &.{};
+    pub inline fn expectWord(self: *Parser, kind: Token.Kind) ParseError![]const u8 {
+        const token = try self.lexer.nextWord();
+        if (token.kind == kind) {
+            return token.data;
+        } else {
+            return ParseError.UnexpectedToken;
         }
-
-        var pos = self.pos;
-
-        while (pos < self.input.len) {
-            const c0 = self.input[pos];
-            if (c0 == '\n') break;
-            pos += 1;
-
-            if (c0 != '\r') continue;
-            if (pos + 1 >= self.input.len) break;
-            const c1 = self.input[pos];
-            if (c1 == '\n') break;
-        }
-
-        return self.input[self.pos..@min(pos + 1, self.input.len)];
     }
 
-    pub inline fn peek(self: *Parser) ?u8 {
-        if (self.eof()) return null;
-        return self.input[self.pos];
-    }
-
-    pub inline fn char(self: *Parser, expected: u8) ParseError!void {
-        if (self.eof()) return ParseError.UnexpectedEOF;
-        if (self.input[self.pos] != expected) return ParseError.NoMatch;
-        self.pos += 1;
-    }
-
-    pub fn takeWhile(self: *Parser, comptime pred: fn (u8) bool) []const u8 {
-        if (self.pos >= self.input.len) {
-            return &.{};
-        }
-
-        const start = self.pos;
-
-        while (self.pos < self.input.len) {
-            if (!pred(self.input[self.pos])) {
-                break;
-            }
-
-            self.pos += 1;
-        }
-        return self.input[start..self.pos];
-    }
-
-    pub fn newline(self: *Parser) ParseError!void {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-        _ = self.tabulation();
-        if (self.eof()) return;
-        if (self.peek() == '/') {
-            try self.char('/');
-            try self.char('/');
-            while (self.pos < self.input.len) {
-                if (self.input[self.pos] == '\n') break;
-                self.pos += 1;
+    pub inline fn expectOneOf(self: *Parser, comptime kinds: anytype) ParseError!Token {
+        const token = try self.lexer.next();
+        inline for (kinds) |kind| {
+            if (token.kind == kind) {
+                return token;
             }
         }
-        self.char('\r') catch {};
-        try self.char('\n');
+
+        return ParseError.NoMatch;
     }
 
-    pub fn isNewline(self: *Parser) bool {
-        const mark = self.bookmark();
-        defer self.restore(mark);
-        
-        self.newline() catch return false;
-        return true;
+    pub fn statementEnd(self: *Parser) ParseError!bool {
+        try self.lexer.skipWhitespace();
+        const mark = self.lexer.bookmark();
+        const token = try self.lexer.next();
+        if (token.kind == .newline or token.kind == .semicolon) {
+            return true;
+        } else {
+            self.lexer.restore(mark);
+            return false;
+        }
     }
 
-    pub fn tabulation(self: *Parser) u32 {
-        if (self.eof()) return 0;
+    pub inline fn commaSep(self: *Parser) ParseError!void {
+        _ = try self.expectWord(.comma);
+        try self.lexer.skipWhitespace();
+    }
 
-        const start = self.pos;
-        while (self.pos < self.input.len) {
-            if (self.input[self.pos] != ' ' and self.input[self.pos] != '\t') {
-                break;
-            }
-
-            self.pos += 1;
+    fn parseRawInteger(_: *Parser, comptime T: type, comptime base: u8, string: []const u8) ParseError!T {
+        if (string.len == 0) {
+            return ParseError.NoMatch;
         }
 
-        return @truncate(self.pos - start);
-    }
-
-    pub fn tabulation1(self: *Parser) ParseError!u32 {
-        if (self.eof()) return ParseError.NoMatch;
-
-        const start = self.pos;
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-        while (self.pos < self.input.len) {
-            if (self.input[self.pos] != ' ' and self.input[self.pos] != '\t') {
-                break;
-            }
-
-            self.pos += 1;
-        }
-
-        if (self.pos - start == 0) return ParseError.NoMatch;
-        return @truncate(self.pos - start);
-    }
-
-    pub fn whitespace(self: *Parser) u32 {
-        return @truncate(self.takeWhile(std.ascii.isWhitespace).len);
-    }
-
-    pub fn whitespace1(self: *Parser) ParseError!u32 {
-        const ws = self.whitespace();
-        if (ws == 0) return ParseError.NoMatch;
-        return ws;
-    }
-
-    pub fn alphabetic(self: *Parser) []const u8 {
-        const xs = self.takeWhile(std.ascii.isAlphabetic);
-        return xs;
-    }
-
-    pub fn alphabetic1(self: *Parser) ParseError![]const u8 {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-        const xs = self.takeWhile(std.ascii.isAlphabetic);
-        if (xs.len == 0) return ParseError.UnexpectedToken;
-        return xs;
-    }
-
-    pub fn alphanumeric(self: *Parser) []const u8 {
-        const xs = self.takeWhile(std.ascii.isAlphanumeric);
-        return xs;
-    }
-
-    pub fn alphanumeric1(self: *Parser) ParseError![]const u8 {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-        const xs = self.takeWhile(std.ascii.isAlphanumeric);
-        if (xs.len == 0) return ParseError.UnexpectedToken;
-        return xs;
-    }
-
-    pub fn identifier(self: *Parser) []const u8 {
-        const xs = self.takeWhile(isIdentifierChar);
-        return xs;
-    }
-
-    pub fn identifier1(self: *Parser) ParseError![]const u8 {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-        const xs = self.takeWhile(isIdentifierChar);
-        if (xs.len == 0) return ParseError.UnexpectedToken;
-        if (!std.ascii.isAlphabetic(xs[0])) return ParseError.NoMatch;
-        return xs;
-    }
-
-    fn parseRawInteger(self: *Parser, comptime T: type, comptime base: u8) ParseError!T {
-        const start = self.pos;
         var n: T = 0;
-
-        while (!self.eof()) {
-            const c = self.input[self.pos];
-            if (std.ascii.isWhitespace(c)) break;
-
-            const digit = std.fmt.charToDigit(c, base) catch break;
+        for (string) |char| {
+            const digit = std.fmt.charToDigit(char, base) catch return ParseError.InvalidCharacter;
             if (digit >= base) {
                 return ParseError.NumericOverflow;
             }
@@ -271,50 +165,34 @@ pub const Parser = struct {
             n = std.math.mul(T, n, base) catch {
                 return ParseError.NumericOverflow;
             };
+
             n = std.math.add(T, n, @intCast(digit)) catch {
                 return ParseError.NumericOverflow;
             };
-            
-            self.pos += 1;
-        }
-
-        if (self.pos == start) {
-            return ParseError.NoMatch;
         }
 
         return n;
     }
 
     pub fn parseInteger(self: *Parser, comptime T: type) ParseError!T {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
 
-        _ = self.tabulation();
+        const signToken: Token = self.lexer.next() catch .{.kind = .string, .data = ""};
         var negative = false;
-        if (self.peek()) |c| {
-            if (c == '-') {
-                negative = true;
-                self.pos += 1;
-            } else if (c == '+') {
-                self.pos += 1;
-            }
+        switch (signToken.kind) {
+            .plus => negative = false,
+            .minus => negative = true,
+            else => self.lexer.restore(mark),
         }
 
-        const x: T = blk: {
-            if (self.peek() == '0' and self.pos + 2 < self.input.len) {
-                self.pos += 1;
-                if (self.peek() == 'x') {
-                    self.pos += 1;
-                    break :blk try self.parseRawInteger(T, 16);
-                } else if (self.peek() == 'b') {
-                    self.pos += 1;
-                    break :blk try self.parseRawInteger(T, 2);
-                } else {
-                    self.pos -= 1;
-                }
-            }
-
-            break :blk try self.parseRawInteger(T, 10);
+        const number = try self.expect(.number);
+        const base = if (number.len <= 3 or number[0] != '0') 0 else number[1];
+        const x: T = blk: switch (base) {
+            'b', 'B' => break :blk try self.parseRawInteger(T,  2, number[2..]),
+            'o', 'O' => break :blk try self.parseRawInteger(T,  8, number[2..]),
+            'x', 'X' => break :blk try self.parseRawInteger(T, 16, number[2..]),
+            else => break :blk try self.parseRawInteger(T, 10, number),
         };
 
         if (negative) {
@@ -324,602 +202,678 @@ pub const Parser = struct {
         }
     }
 
-    pub fn parseSectionLabel(self: *Parser) ParseError![]const u8 {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
+    pub fn parseImmediate(self: *Parser, comptime T: type) ParseError!Immediate(T) {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
 
-        try self.char('.');
-        const name = try self.identifier1();
-        try self.newline();
-        return name;
-    }
-
-    pub fn parseLabel(self: *Parser) ParseError![]const u8 {
-        const start = self.pos;
-        errdefer self.pos = start;
-
-        const name = try self.identifier1();
-        try self.char(':');
-        return name;
+        const token = try self.expectOneOf(.{.number, .identifier});
+        switch (token.kind) {
+            .number => {
+                self.lexer.restore(mark);
+                return .{.static = try self.parseInteger(T)};
+            },
+            .identifier => return .{.dynamic = token.data},
+            else => unreachable,
+        }
     }
 
     pub fn parseRegisterName(self: *Parser) ParseError!isa.Register {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
 
-        try self.char('$');
-        if (self.parseInteger(u5)) |index| {
-            return @enumFromInt(index);
-        } else |err| {
-            if (err != ParseError.NoMatch) return err;
-            const reg = try self.alphanumeric1();
-            return std.meta.stringToEnum(isa.Register, reg) orelse {
-                return ParseError.InvalidEnumeration;
+        _ = try self.expect(.dollar);
+        const name = try self.expectOneOf(.{.number, .identifier});
+        switch (name.kind) {
+            .number => return @enumFromInt(self.parseRawInteger(u5, 10, name.data)
+                catch return ParseError.InvalidEnumeration),
+            .identifier => return std.meta.stringToEnum(isa.Register, name.data)
+                orelse return ParseError.InvalidEnumeration,
+            else => unreachable,
+        }
+    }
+
+    pub fn parseLabel(self: *Parser) ParseError![]const u8 {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const name = try self.expect(.identifier);
+        _ = try self.expect(.colon);
+
+        return name;
+    }
+
+    pub fn parseStatement(self: *Parser) ParseError!Statement {
+        const start = self.lexer.bookmark();
+        errdefer self.lexer.restore(start);
+        
+        var statement: Statement = undefined;
+        try self.lexer.skipWhitespace();
+        statement.label = self.parseLabel() catch &[_]u8{};
+
+        try self.lexer.skipWhitespace();
+        const token = try self.lexer.nextWord();
+        switch (token.kind) {
+            .identifier => {
+                const instr = try self.parseInstruction(token);
+                switch (instr) {
+                    .rtype => |x| statement.value = .{.rtype = x},
+                    .itype => |x| statement.value = .{.itype = x},
+                    .ltype => |x| statement.value = .{.ltype = x},
+                    .jtype => |x| statement.value = .{.jtype = x},
+                }
+            },
+
+            .dot => {
+                const dir = try self.parseDirective();
+                switch (dir) {
+                    .section => |x| statement.value = .{.section = x},
+                    .bytes   => |x| statement.value = .{.bytes = x},
+                    .shorts  => |x| statement.value = .{.shorts = x},
+                    .words   => |x| statement.value = .{.words = x},
+                    .asciiz  => |x| statement.value = .{.asciiz = x},
+                    .nascii  => |x| statement.value = .{.nascii = x},
+                    .padding => |x| statement.value = .{.padding = x},
+                    .ptr     => |x| statement.value = .{.ptr = x},
+                }
+            },
+
+            else => return ParseError.NoMatch,
+        }
+
+        if (try self.statementEnd()) {
+            return statement;
+        } else {
+            return ParseError.UnexpectedToken;
+        }
+    }
+
+    fn parseInstruction(self: *Parser, token: Token) ParseError!Instruction {
+        if (token.kind != .identifier) return ParseError.NoMatch;
+        try self.lexer.skipWhitespace();
+        
+        const regular = std.meta.stringToEnum(isa.InstructionName, token.data);
+        if (regular) |mnemo| switch (mnemo) {
+            .rtype => return ParseError.NoMatch,
+            .addi  => return .{.itype = try self.parseI(mnemo)},
+            .j     => return .{.jtype = try self.parseJ(mnemo)},
+            .jal   => return .{.jtype = try self.parseJ(mnemo)},
+            .andi  => return .{.ltype = try self.parseLALU(mnemo)},
+            .andih => return .{.ltype = try self.parseLALU(mnemo)},
+            .ori   => return .{.ltype = try self.parseLALU(mnemo)},
+            .orih  => return .{.ltype = try self.parseLALU(mnemo)},
+            .xori  => return .{.ltype = try self.parseLALU(mnemo)},
+            .xorih => return .{.ltype = try self.parseLALU(mnemo)},
+            .lui   => return .{.ltype = try self.parseLUI(mnemo)},
+            .lw    => return .{.ltype = try self.parseLMem(mnemo)},
+            .sw    => return .{.ltype = try self.parseLMem(mnemo)},
+            .sh    => return .{.ltype = try self.parseLMem(mnemo)},
+            .sb    => return .{.ltype = try self.parseLMem(mnemo)},
+            .lh    => return .{.ltype = try self.parseLMem(mnemo)},
+            .lhu   => return .{.ltype = try self.parseLMem(mnemo)},
+            .lb    => return .{.ltype = try self.parseLMem(mnemo)},
+            .lbu   => return .{.ltype = try self.parseLMem(mnemo)},
+            .beq   => return .{.itype = try self.parseI(mnemo)},
+            .bne   => return .{.itype = try self.parseI(mnemo)},
+            .blt   => return .{.itype = try self.parseI(mnemo)},
+            .bgt   => return .{.itype = try self.parseI(mnemo)},
+            .ble   => return .{.itype = try self.parseI(mnemo)},
+            .bge   => return .{.itype = try self.parseI(mnemo)},
+            .slti  => return .{.itype = try self.parseI(mnemo)},
+            .sltiu => return .{.itype = try self.parseI(mnemo)},
+        };
+
+        const rtype = std.meta.stringToEnum(isa.RType, token.data);
+        if (rtype) |mnemo| switch (mnemo) {
+            .sll    => return .{.rtype = try self.parseRShift(mnemo)},
+            .srl    => return .{.rtype = try self.parseRShift(mnemo)},
+            .sra    => return .{.rtype = try self.parseSRA(mnemo)},
+            .sllr   => return .{.rtype = try self.parseRShiftV(mnemo)},
+            .srlr   => return .{.rtype = try self.parseRShiftV(mnemo)},
+            .srar   => return .{.rtype = try self.parseRShiftV(mnemo)},
+            .cfs    => return .{.rtype = try self.parseRAux(mnemo)},
+            .cts    => return .{.rtype = try self.parseRAux(mnemo)},
+            .@"and" => return .{.rtype = try self.parseR3(mnemo)},
+            .@"or"  => return .{.rtype = try self.parseR3(mnemo)},
+            .xor    => return .{.rtype = try self.parseR3(mnemo)},
+            .nor    => return .{.rtype = try self.parseR3(mnemo)},
+            .slt    => return .{.rtype = try self.parseR3(mnemo)},
+            .sltu   => return .{.rtype = try self.parseR3(mnemo)},
+            .jr     => return .{.rtype = try self.parseRJ(mnemo)},
+            .jalr   => return .{.rtype = try self.parseRJ(mnemo)},
+            .lhx    => return .{.rtype = try self.parseRMemX(mnemo)},
+            .lhux   => return .{.rtype = try self.parseRMemX(mnemo)},
+            .lbx    => return .{.rtype = try self.parseRMemX(mnemo)},
+            .lbux   => return .{.rtype = try self.parseRMemX(mnemo)},
+            .lwx    => return .{.rtype = try self.parseRMemX(mnemo)},
+            .mul    => return .{.rtype = try self.parseR3(mnemo)},
+            .mulh   => return .{.rtype = try self.parseR3(mnemo)},
+            .mulhu  => return .{.rtype = try self.parseR3(mnemo)},
+            .div    => return .{.rtype = try self.parseR3(mnemo)},
+            .divu   => return .{.rtype = try self.parseR3(mnemo)},
+            .rest   => return .{.rtype = try self.parseR3(mnemo)},
+            .restu  => return .{.rtype = try self.parseR3(mnemo)},
+            .add    => return .{.rtype = try self.parseR3(mnemo)},
+            .sub    => return .{.rtype = try self.parseR3(mnemo)},
+            .trap   => return .{.rtype = try self.parseTRAP(mnemo)},
+            .rft    => return .{.rtype = .{
+                .funct = .rft,
+                .rs = .zero,
+                .rt = .zero,
+                .rd = .zero,
+                .aux = .{.static = 0},
+            }},
+        };
+
+        return ParseError.NoMatch;
+    }
+
+    fn parseJ(self: *Parser, mnemo: isa.InstructionName) ParseError!JType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const imm = try self.parseImmediate(i27);
+        return .{
+            .opcode = mnemo,
+            .imm = imm,
+        };
+    }
+
+    fn parseI(self: *Parser, mnemo: isa.InstructionName) ParseError!IType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(i17);
+        return .{
+            .opcode = mnemo,
+            .rt = rt,
+            .rs = rs,
+            .imm = imm,
+        };
+    }
+
+    fn parseLALU(self: *Parser, mnemo: isa.InstructionName) ParseError!LType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(i16);
+        return .{
+            .opcode = mnemo,
+            .rt = rt,
+            .rs = rs,
+            .imm = imm,
+        };
+    }
+
+    fn parseLMem(self: *Parser, mnemo: isa.InstructionName) ParseError!LType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(i16);
+
+        _ = try self.expectWord(.lparen);
+        try self.lexer.skipWhitespace();
+        const rs = try self.parseRegisterName();
+        _ = try self.expectWord(.rparen);
+
+        return .{
+            .opcode = mnemo,
+            .rt = rt,
+            .rs = rs,
+            .imm = imm,
+        };
+    }
+
+    fn parseLUI(self: *Parser, mnemo: isa.InstructionName) ParseError!LType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(i16);
+        return .{
+            .opcode = mnemo,
+            .rt = rt,
+            .rs = rt,
+            .imm = imm,
+        };
+    }
+
+    fn parseRShift(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+        
+        const rd = try self.parseRegisterName();
+        try self.commaSep();
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(u6);
+
+        return .{
+            .funct = mnemo,
+            .rs = .zero,
+            .rd = rd,
+            .rt = rt,
+            .aux = imm,
+        };
+    }
+
+    fn parseSRA(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rd = try self.parseRegisterName();
+        try self.commaSep();
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(u6);
+
+        return .{
+            .funct = mnemo,
+            .rs = rs,
+            .rd = rd,
+            .rt = .zero,
+            .aux = imm,
+        };
+    }
+
+    fn parseRShiftV(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rd = try self.parseRegisterName();
+        try self.commaSep();
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const rs = try self.parseRegisterName();
+
+        return .{
+            .funct = mnemo,
+            .rs = rs,
+            .rd = rd,
+            .rt = rt,
+            .aux = .{.static = 0},
+        };
+    }
+
+    fn parseRAux(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+        _ = mnemo; @panic("UNIMPLEMENTED");
+    }
+
+    fn parseR3(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rd = try self.parseRegisterName();
+        try self.commaSep();
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const rt = try self.parseRegisterName();
+
+        return .{
+            .funct = mnemo,
+            .rs = rs,
+            .rd = rd,
+            .rt = rt,
+            .aux = .{.static = 0},
+        };
+    }
+
+    fn parseRJ(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+        
+        const rs = try self.parseRegisterName();
+
+        return .{
+            .funct = mnemo,
+            .rs = rs,
+            .rd = .zero,
+            .rt = .zero,
+            .aux = .{.static = 0},
+        };
+    }
+
+    fn parseRMemX(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rt = try self.parseRegisterName();
+        try self.commaSep();
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const rd = try self.parseRegisterName();
+
+        return .{
+            .funct = mnemo,
+            .rs = rs,
+            .rd = rd,
+            .rt = rt,
+            .aux = .{.static = 0},
+        };
+    }
+
+    fn parseTRAP(self: *Parser, mnemo: isa.RType) ParseError!RType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+        _ = mnemo; @panic("UNIMPLEMENTED");
+    }
+
+    fn parseDirective(self: *Parser) ParseError!Directive {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const token = try self.expect(.identifier);
+        const directive = std.meta.stringToEnum(isa.DataDirective, token)
+            orelse return ParseError.NoMatch;
+
+        switch (directive) {
+            .asciiz  => return .{.asciiz = try self.parseString()},
+            .byte    => return .{.bytes = try self.parseIntegerList(u8)},
+            .nascii  => return .{.asciiz = try self.parseString()},
+            .pad     => return .{.padding = try self.parsePadding()},
+            .ptr     => return .{.ptr = try self.parseSymbolLabel()},
+            .section => return .{.section = try self.parseSectionLabel()},
+            .short   => return .{.shorts = try self.parseIntegerList(u16)},
+            .word    => return .{.words = try self.parseIntegerList(u32)},
+        }
+    }
+
+    fn parseString(self: *Parser) ParseError![]const u8 {
+        var string = std.ArrayList(u8).empty;
+        errdefer string.deinit(self.arena.allocator());
+
+        var mark = self.lexer.bookmark();
+        while (self.lexer.frameHead != null) {
+            const segment = self.expect(.string) catch {
+                self.lexer.restore(mark);
+                break;
             };
+
+            mark = self.lexer.bookmark();
+            try string.appendSlice(self.arena.allocator(), segment);
+        }
+
+        if (string.items.len == 0) {
+            return ParseError.NoMatch;
+        } else {
+            return string.items;
         }
     }
 
-    pub fn parseDataDirective(self: *Parser) ParseError!isa.DataDirective {
-        const start = self.pos;
-        errdefer self.pos = start;
+    fn parseIntegerList(self: *Parser, comptime T: type) ParseError![]const T {
+        var numbers = std.ArrayList(T).empty;
+        errdefer numbers.deinit(self.arena.allocator());
 
-        try self.char('.');
-        const dir = try self.identifier1();
-        return std.meta.stringToEnum(isa.DataDirective, dir) orelse {
-            return ParseError.InvalidEnumeration;
+        var mark = self.lexer.bookmark();
+        while (self.lexer.frameHead != null) {
+            mark = self.lexer.bookmark();
+            try numbers.append(self.arena.allocator(), try self.parseInteger(T));
+        }
+
+        if (numbers.items.len == 0) {
+            return ParseError.NoMatch;
+        } else {
+            return numbers.items;
+        }
+    }
+
+    fn parsePaddingAlignment(self: *Parser) ParseError!usize {
+        _ = try self.expectWord(.lparen);
+        const a = try self.parseInteger(usize);
+        _ = try self.expect(.rparen);
+        return a;
+    }
+
+    fn parsePadding(self: *Parser) ParseError!Padding {
+        const numbers = try self.parseIntegerList(usize);
+
+        var padding: usize = 0;
+        for (numbers) |x| {
+            padding += x;
+        }
+
+        const alignment = self.parsePaddingAlignment() catch 1;
+        return .{
+            .size = padding,
+            .alignment = alignment,
         };
     }
 
-    fn parseEscapedCharacter(self: *Parser) ParseError!u8 {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-
-        try self.char('\\');
-        const c = self.peek() orelse return ParseError.UnexpectedEOF;
-        self.pos += 1;
-
-        return switch (c) {
-            '\\' => '\\',
-            'n' => '\n',
-            '0' => 0,
-            'r' => '\r',
-            't' => '\t',
-            'x' => try self.parseInteger(u8),
-            else => return ParseError.InvalidCharacter,
-        };
+    fn parseSymbolLabel(self: *Parser) ParseError![]const u8 {
+        return try self.expect(.identifier);
     }
 
-    pub fn parseCharLiteral(self: *Parser) ParseError!u8 {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-
-        try self.char('\'');
-        const c = self.peek() orelse return ParseError.UnexpectedEOF;
-
-        if (c == '%') {
-            self.parsePreprocessorDefinition()
-                catch return ParseError.InvalidPreprocessorDirective;
-            return self.parseCharLiteral();
-        } else if (c == '@') {
-            _ = self.expandPreprocessorInvocation()
-                catch return ParseError.InvalidPreprocessorDirective;
-            return self.parseCharLiteral();
-        }
-
-        const e: u8 = if (c == '\\') try self.parseEscapedCharacter()
-            else blk: {
-                try self.char(c);
-                break :blk c;
-            };
-
-        self.char('\'') catch return ParseError.UnterminatedString;
-        return e;
-    }
-
-    pub fn parseByte(self: *Parser) ParseError!u8 {
-        if (self.peek() == '\'') return try self.parseCharLiteral()
-            else return try self.parseInteger(u8);
-    }
-
-    pub fn parseStringLiteral(self: *Parser) ParseError![]const u8 {
-        const start = self.pos;
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-
-        try self.char('"');
-        while (self.peek()) |c| {
-            self.pos += 1;
-
-            if (c == '\\') {
-                self.newline() catch {};
-                continue;
-            } else if (c == '\n') {
-                return ParseError.UnterminatedString;
-            }
-
-            if (c == '"') {
-                return self.input[start + 1..self.pos - 1];
-            }
-        }
-
-        return ParseError.UnexpectedEOF;
-    }
-
-    pub fn parsePreprocessorDefinition(self: *Parser) ParseError!void {
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-
-        if (self.pos >= self.input.len) return;
-        if (self.input[self.pos] != '%') return;
-        self.pos += 1;
-
-        const directive = std.meta.stringToEnum(isa.PreprocessorDirective, try self.identifier1())
-            orelse return ParseError.InvalidPreprocessorDirective;
-        _ = try self.whitespace1();
-
-        switch(directive) {
-            .define => {
-                const name = try self.identifier1();
-                const payload = self.peekRawLine();
-                self.pos += payload.len;
-
-                var macro = Macro.init(self.currentFilename);
-                errdefer macro.deinit(self.allocator);
-                macro.name = self.allocator.dupe(u8, name) catch return ParseError.MemoryError;
-                macro.body = self.allocator.dupe(u8, payload) catch return ParseError.MemoryError;
-
-                self.macros.put(macro.name, macro) catch return ParseError.MemoryError;
-            },
-
-            .@"else" => return ParseError.StrayPreprocessorTerminator,
-
-            .embed => {
-                const path = try self.parseStringLiteral();
-                const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, path, self.allocator, .unlimited)
-                    catch return ParseError.FileNotFound;
-
-                defer self.allocator.free(contents);
-
-                var data = std.ArrayList(u8).initCapacity(self.allocator, contents.len * 5)
-                    catch return ParseError.MemoryError;
-                errdefer data.deinit(self.allocator);
-
-                for (contents, 0..) |byte, i| {
-                    data.appendSlice(self.allocator, "0x") catch return ParseError.MemoryError;
-                    data.append(self.allocator, std.fmt.digitToChar((byte >> 4) & 0xF, .upper)) catch return ParseError.MemoryError;
-                    data.append(self.allocator, std.fmt.digitToChar((byte >> 0) & 0xF, .upper)) catch return ParseError.MemoryError;
-
-                    if (i != 0 and i % 10 == 0) {
-                        data.append(self.allocator, '\n') catch return ParseError.MemoryError;
-                    } else {
-                        data.append(self.allocator, ' ') catch return ParseError.MemoryError;
-                    }
-                }
-
-                self.substitutions.append(self.allocator, data) catch return ParseError.MemoryError;
-                try self.pushFrame(data.items, path);
-            },
-
-            .endif => return ParseError.StrayPreprocessorTerminator,
-
-            .endmacro => return ParseError.StrayPreprocessorTerminator,
-
-            .filename => {
-                try self.pushFrame(self.currentFilename, self.currentFilename);
-            },
-
-            .ifdef, .ifndef => |yn| {
-                const name = try self.identifier1();
-                const enabled = self.macros.contains(std.mem.trim(u8, name, " \t\r\n")) == (yn == .ifdef);
-                var bodyStart = self.pos;
-                var bodyEnd = self.pos;
-
-                var elses = std.BitStack.init(self.allocator);
-                defer elses.deinit();
-
-                elses.push(1) catch return ParseError.MemoryError;
-
-                while (self.pos < self.input.len) : (self.pos += 1) {
-                    const delimPos = self.pos;
-                    if (self.input[delimPos] != '%') continue;
-                    self.pos += 1;
-
-                    const word = self.identifier1() catch continue;
-                    const id = std.meta.stringToEnum(isa.PreprocessorDirective, word)
-                        orelse continue;
-                   
-                    switch (id) {
-                        .ifdef, .ifndef => {
-                            elses.push(1) catch return ParseError.MemoryError;
-                        },
-
-                        .@"else" => {
-                            if (elses.peek() == 0) {
-                                return ParseError.StrayPreprocessorTerminator;
-                            }
-
-                            if (elses.bit_len == 1) {
-                                if (enabled) {
-                                    bodyEnd = delimPos;
-                                } else {
-                                    bodyStart = self.pos;
-                                }
-                            }
-
-                            _ = elses.pop();
-                            elses.push(0) catch return ParseError.MemoryError;
-                        },
-
-                        .endif => {
-                            if (elses.bit_len == 1 and enabled == (elses.peek() == 1)) {
-                                bodyEnd = delimPos;
-                            }
-                            
-                            _ = elses.pop(); 
-                        },
-
-                        else => {},
-                    }
-
-                    if (elses.bit_len == 0) {
-                        break;
-                    }
-                }
-
-                const body = self.input[bodyStart..bodyEnd];
-                const remaining = self.input[self.pos..];
-                self.input = self.input[0..mark.pos];
-                self.pos = mark.pos;
-                try self.pushFrame(remaining, self.currentFilename);
-                try self.pushFrame(body, self.currentFilename);
-            },
-
-            .include => {
-                const path = try self.parseStringLiteral();
-                const contents = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), self.io, path, self.allocator, .unlimited)
-                    catch return ParseError.FileNotFound;
-                errdefer self.allocator.free(contents);
-                try self.pushFrame(contents, path);
-            },
-
-            .line => {
-                const str = std.fmt.allocPrint(self.allocator, "{}", .{self.getLocation().line})
-                    catch return ParseError.MemoryError;
-                try self.pushFrame(str, self.currentFilename);
-            },
-
-            .macro => {
-                const macroName = try self.identifier1();
-                if (std.meta.stringToEnum(isa.PreprocessorDirective, macroName) != null) {
-                    return ParseError.BuiltinPreprocessorOverride;
-                }
-
-                if (self.macros.contains(macroName)) return ParseError.MacroRedefined;
-
-                _ = self.whitespace();
-                try self.char('(');
-
-                var macro = Macro.init(self.currentFilename);
-                errdefer macro.deinit(self.allocator);
-                macro.name = self.allocator.dupe(u8, macroName) catch return ParseError.MemoryError;
-
-                while (!self.eof()) {
-                    _ = self.whitespace();
-                    if (self.peek() == ')') break;
-
-                    const argName = try self.identifier1();
-                    const argStr = self.allocator.dupe(u8, argName) catch return ParseError.MemoryError;
-                    macro.args.append(self.allocator, argStr) catch return ParseError.MemoryError;
-
-                    _ = self.whitespace();
-                    switch (self.peek() orelse return ParseError.UnexpectedEOF) {
-                        ',' => {
-                            self.pos += 1;
-                            continue;
-                        },
-                        ')' => break,
-                        else => return ParseError.UnexpectedToken,
-                    }
-                }
-
-                self.char(')') catch return ParseError.UnterminatedScope;
-                _ = self.tabulation();
-
-                if (self.pos + 2 <= self.input.len and self.input[self.pos] == '\\' and self.input[self.pos] == '\n') {
-                    self.pos += 2;
-                }
-
-                const bodyStart = self.pos;
-                while (self.pos < self.input.len) {
-                    const c = self.input[self.pos];
-                    if (c == '%') blk: {
-                        const word = self.identifier1() catch break :blk;
-                        const id = std.meta.stringToEnum(isa.PreprocessorDirective, word)
-                            orelse break :blk;
-                        
-                        switch (id) {
-                            .endmacro => {
-                                self.pos += 1 + word.len;
-                                break;
-                            },
-
-                            .macro => return ParseError.MacroNotAllowedHere,
-                            else => break :blk,
-                        }
-                    }
-                    self.pos += 1;
-                }
-
-                if (self.eof()) return ParseError.UnexpectedEOF;
-                macro.body = self.allocator.dupe(u8, self.input[bodyStart..self.pos])
-                    catch return ParseError.MemoryError;
-                try self.char('}');
-                self.macros.put(macro.name, macro) catch return ParseError.MemoryError;
-            },
-        }
-    }
-
-    pub fn expandPreprocessorInvocation(self: *Parser) ParseError!void {
-        const start = self.pos;
-        const mark = self.bookmark();
-        errdefer self.restore(mark);
-
-        if (self.pos >= self.input.len) {
-            return;
-        }
-
-        if (self.input[self.pos] != '@') {
-            return;
-        }
-
-        self.pos += 1;
-
-        const parens = blk: {
-            if (self.peek() == '(') {
-                self.pos += 1;
-                break :blk true;
-            } else {
-                break :blk false;
-            }
-        };
-
-        const name = try self.identifier1();
-        if (parens) self.char(')') catch return ParseError.UnterminatedScope;
-
-        var argNames = std.ArrayList([]const u8).empty;
-        defer argNames.deinit(self.allocator);
-        if (self.peek() == '(') getArgs: {
-            try self.char('(');
-            if (self.peek() == ')') {
-                try self.char(')');
-                break :getArgs;
-            }
-
-            var i = self.pos;
-            while (self.pos < self.input.len) {
-                if (self.peek() != ')' and self.peek() != ',') {
-                    self.pos += 1;
-                    continue;
-                }
-
-                const arg = self.input[i..self.pos];
-                argNames.append(self.allocator, arg) catch return ParseError.MemoryError;
-                i = self.pos + 1;
-
-                if (self.peek() == ')') break;
-                try self.char(',');
-            }
-
-            try self.char(')');
-        }
-
-        const macro = self.macros.get(name) orelse return ParseError.UnknownMacro;
-        if (macro.args.items.len != argNames.items.len) {
-            return ParseError.ArityMismatch;
-        }
-
-        const remaining = self.input[self.pos..];
-        self.input = self.input[0..start];
-        self.pos = start;
-        try self.pushFrame(remaining, self.currentFilename);
-
-        const body = try self.substituteArgs(macro, argNames.items);
-        try self.pushFrame(body, macro.filename);
-    }
-
-    fn substituteArgs(self: *Parser, macro: Macro, args: []const []const u8) ParseError![]const u8 {
-        var output = std.ArrayList(u8).initCapacity(self.allocator, 3 * macro.body.len / 4)
-            catch return ParseError.MemoryError;
-        errdefer output.deinit(self.allocator);
-
-        var i: usize = 0;
-        while (i < macro.body.len) {
-            const c = macro.body[i];
-
-            i += 1;
-            if (c != '@') {
-                output.append(self.allocator, c) catch return ParseError.MemoryError;
-                continue;
-            }
-
-            var match: ?usize = null;
-            for (macro.args.items, 0..) |arg, j| {
-                if (std.mem.eql(u8, arg, macro.body[i..i + arg.len])) {
-                    match = j;
-                    break;
-                }
-            }
-
-            if (match) |j| {
-                output.appendSlice(self.allocator, args[j]) catch return ParseError.MemoryError;
-                i += macro.args.items[j].len;
-            }
-        }
-
-        self.substitutions.append(self.allocator, output) catch return ParseError.MemoryError;
-        return output.items;
+    fn parseSectionLabel(self: *Parser) ParseError![]const u8 {
+        const token = try self.expectOneOf(.{.identifier, .string}); // maybe do validation here later
+        return token.data;
     }
 };
 
-test "binary" {
-    const input = "0b0001001110101";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    parser.input = input;
-    defer parser.deinit();
-    const res: u32 = try Parser.parseInteger(&parser, u32);
-    try std.testing.expectEqual(0b0001001110101, res);
+fn makeParser(src: []const u8) !Parser {
+    var parser = try Parser.init(std.testing.io, std.testing.allocator);
+    try parser.lexer.pushFrame(src, "<makeParser>");
+    return parser;
 }
 
-test "hex" {
-    const input = "0xCAFEbabe";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    const res: u32 = try Parser.parseInteger(&parser, u32);
-    try std.testing.expectEqual(0xCAFEbabe, res);
+test "parseInteger decimal" {
+    var p = try makeParser("123");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(i32, 123), try p.parseInteger(i32));
 }
 
-test "decimal" {
-    const input = "-17623";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    const res: i32 = try Parser.parseInteger(&parser, i32);
-    try std.testing.expectEqual(-17623, res);
+test "parseInteger negative" {
+    var p = try makeParser("-42");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(i32, -42), try p.parseInteger(i32));
 }
 
-test "integer" {
-    const input = "0xdeadbeef";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    const res: u32 = try Parser.parseInteger(&parser, u32);
-    try std.testing.expectEqual(0xdeadbeef, res);
+test "parseInteger hexadecimal" {
+    var p = try makeParser("0xFF");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(u16, 255), try p.parseInteger(u16));
 }
 
-test "register" {
-    const input = "$t0";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    const res = try Parser.parseRegisterName(&parser);
-    try std.testing.expectEqual(isa.Register.t0, res);
+test "parseInteger binary" {
+    var p = try makeParser("0b101101");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(u8, 45), try p.parseInteger(u8));
 }
 
-test "string literal" {
-    const input = "\"wawa\"";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    const res = try Parser.parseStringLiteral(&parser);
-    try std.testing.expectEqualStrings("wawa", res);
+test "parseInteger octal" {
+    var p = try makeParser("0o77");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(u8, 63), try p.parseInteger(u8));
 }
 
-test "integer backtracking" {
-    const input = "0 q"; 
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    const res = try parser.parseInteger(u32);
-    try std.testing.expectEqual(@as(u32, 0), res);
-    try std.testing.expectEqual(@as(u8, ' '), parser.peek().?);
+test "parseInteger overflow" {
+    var p = try makeParser("300");
+    defer p.deinit();
+
+    try std.testing.expectError(
+        ParseError.NumericOverflow,
+        p.parseInteger(u8),
+    );
 }
 
-test "whitespace" {
-    const input = "   \t  $t0";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    parser.input = input;
-    _ = parser.whitespace();
-    const reg = try parser.parseRegisterName();
-    try std.testing.expectEqual(isa.Register.t0, reg);
+test "parseImmediate constant" {
+    var p = try makeParser("42");
+    defer p.deinit();
+
+    const imm = try p.parseImmediate(i16);
+
+    switch (imm) {
+        .static => |v| try std.testing.expectEqual(@as(i16, 42), v),
+        else => try std.testing.expect(false),
+    }
 }
 
-test "preprocessor %define registration" {
-    const input = "%define VALUE 0x42\n";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    
-    try parser.pushFrame(input, "test.rtm");
-    try parser.parsePreprocessorDefinition();
-    
-    try std.testing.expect(parser.macros.contains("VALUE"));
-    const macro = parser.macros.get("VALUE").?;
-    try std.testing.expectEqualStrings(" 0x42\n", macro.body);
-    try std.testing.expectEqual(@as(usize, 0), macro.args.items.len);
+test "parseImmediate symbol" {
+    var p = try makeParser("loop");
+    defer p.deinit();
+
+    const imm = try p.parseImmediate(i16);
+
+    switch (imm) {
+        .dynamic => |name|
+            try std.testing.expectEqualStrings("loop", name),
+        else => try std.testing.expect(false),
+    }
 }
 
-test "preprocessor %macro with multiple arguments" {
-    const input = "%macro multi_arg(a, b, c) { add @a, @b, @c }";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    
-    try parser.pushFrame(input, "test.rtm");
-    try parser.parsePreprocessorDefinition();
-    
-    try std.testing.expect(parser.macros.contains("multi_arg"));
-    const macro = parser.macros.get("multi_arg").?;
-    try std.testing.expectEqual(@as(usize, 3), macro.args.items.len);
-    try std.testing.expectEqualStrings("a", macro.args.items[0]);
-    try std.testing.expectEqualStrings("b", macro.args.items[1]);
-    try std.testing.expectEqualStrings("c", macro.args.items[2]);
-    try std.testing.expectEqualStrings(" add @a, @b, @c ", macro.body);
+test "parseRegisterName numeric" {
+    var p = try makeParser("$10");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(isa.Register, .t0), try p.parseRegisterName());
 }
 
-test "preprocessor %macro nested braces" {
-    const input = "%macro nested() { { internal_block } text }";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    
-    try parser.pushFrame(input, "test.rtm");
-    try parser.parsePreprocessorDefinition();
-    
-    const macro = parser.macros.get("nested").?;
-    try std.testing.expectEqualStrings(" { internal_block } text ", macro.body);
+test "parseRegisterName symbolic" {
+    var p = try makeParser("$sp");
+    defer p.deinit();
+
+    try std.testing.expectEqual(@as(isa.Register, .sp), try p.parseRegisterName());
 }
 
-test "preprocessor keyword override" {
-    const input = "%macro ifda(reg) { add $t0, $t0, @reg }";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    
-    try parser.pushFrame(input, "test.rtm");
-    
-    const invalid_input = "%macro if(reg) { halt }";
-    var p2 = try Parser.init(std.testing.allocator, undefined);
-    defer p2.deinit();
-    try p2.pushFrame(invalid_input, "test.rtm");
-    
-    try std.testing.expectError(ParseError.BuiltinPreprocessorOverride, p2.parsePreprocessorDefinition());
+test "parseRegisterName invalid" {
+    var p = try makeParser("$foobar");
+    defer p.deinit();
+
+    try std.testing.expectError(
+        ParseError.InvalidEnumeration,
+        p.parseRegisterName(),
+    );
 }
 
-test "preprocessor %macro expansion substitution" {
-    const macro_def = "%macro load_add(reg, src) { lw @reg, $s0, @src\n add @reg, @reg, @reg }";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    
-    try parser.pushFrame(macro_def, "test.rtm");
-    try parser.parsePreprocessorDefinition();
-    
-    const invocation = "@load_add($t1,10)";
-    try parser.pushFrame(invocation, "test.rtm");
-    
-    const expanded = try parser.expandPreprocessorInvocation();
-    try std.testing.expect(expanded);
-    
-    try std.testing.expectEqualStrings(" lw $t1, $s0, 10\n add $t1, $t1, $t1 ", parser.input);
+test "parseLabel" {
+    var p = try makeParser("main:");
+    defer p.deinit();
+
+    const label = try p.parseLabel();
+
+    try std.testing.expectEqualStrings("main", label);
 }
 
-test "preprocessor zero-arity %macro expansion" {
-    const input = "%macro zero_reg() { $s0 }";
-    var parser = try Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    
-    try parser.pushFrame(input, "test.rtm");
-    try parser.parsePreprocessorDefinition();
-    
-    try parser.pushFrame("@zero_reg()", "test.rtm");
-    const expanded = try parser.expandPreprocessorInvocation();
-    try std.testing.expect(expanded);
-    try std.testing.expectEqualStrings(" $s0 ", parser.input);
+test "parseStatement add" {
+    var p = try makeParser(
+        "add $t0, $t1, $t2\n",
+    );
+    defer p.deinit();
+
+    const stmt = try p.parseStatement();
+    const imm: Immediate(u6) = .{.static = 0};
+
+    switch (stmt.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RType.add, r.funct);
+            try std.testing.expectEqual(isa.Register.t0, r.rd);
+            try std.testing.expectEqual(isa.Register.t1, r.rs);
+            try std.testing.expectEqual(isa.Register.t2, r.rt);
+            try std.testing.expectEqual(imm, r.aux);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parseStatement addi" {
+    var p = try makeParser(
+        "addi $t0, $t1, 123\n",
+    );
+    defer p.deinit();
+
+    const stmt = try p.parseStatement();
+
+    switch (stmt.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.InstructionName.addi, i.opcode);
+            try std.testing.expectEqual(isa.Register.t0, i.rt);
+            try std.testing.expectEqual(isa.Register.t1, i.rs);
+
+            switch (i.imm) {
+                .static => |v|
+                    try std.testing.expectEqual(@as(i17, 123), v),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parseStatement jump label" {
+    var p = try makeParser(
+        "j loop\n",
+    );
+    defer p.deinit();
+
+    const stmt = try p.parseStatement();
+
+    switch (stmt.value) {
+        .jtype => |j| {
+            try std.testing.expectEqual(isa.InstructionName.j, j.opcode);
+
+            switch (j.imm) {
+                .dynamic => |name|
+                    try std.testing.expectEqualStrings("loop", name),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parseStatement lw" {
+    var p = try makeParser(
+        "lw $t0, 16($sp)\n",
+    );
+    defer p.deinit();
+
+    const stmt = try p.parseStatement();
+
+    switch (stmt.value) {
+        .ltype => |l| {
+            try std.testing.expectEqual(isa.InstructionName.lw, l.opcode);
+            try std.testing.expectEqual(isa.Register.t0, l.rt);
+            try std.testing.expectEqual(isa.Register.sp, l.rs);
+
+            switch (l.imm) {
+                .static => |v|
+                    try std.testing.expectEqual(@as(i16, 16), v),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parseStatement with label" {
+    var p = try makeParser(
+        "loop: add $t0, $t1, $t2\n",
+    );
+    defer p.deinit();
+
+    const stmt = try p.parseStatement();
+
+    try std.testing.expectEqualStrings("loop", stmt.label);
+
+    switch (stmt.value) {
+        .rtype => |r|
+            try std.testing.expectEqual(isa.RType.add, r.funct),
+        else => try std.testing.expect(false),
+    }
 }

@@ -92,6 +92,7 @@ pub const Tokenizer = struct {
             number,
             plus,
             rparen,
+            semicolon,
             string,
             tilde,
             whitespace,
@@ -297,6 +298,18 @@ pub const Tokenizer = struct {
         std.debug.print("^\n", .{});
     }
 
+    pub fn skipWhitespace(self: *Tokenizer) LexerError!void {
+        while (self.frameHead != null) {
+            const mark = self.bookmark();
+            const token = try self.next();
+            if (token.kind == .whitespace) continue;
+            self.restore(mark);
+            return;
+        }
+
+        return LexerError.UnexpectedEOF;
+    }
+
     pub fn nextWord(self: *Tokenizer) LexerError!Token {
         while (self.frameHead != null) {
             const token = try self.next();
@@ -336,6 +349,7 @@ pub const Tokenizer = struct {
                 },
 
                 'a'...'z', 'A'...'Z' => {
+                    head.pos += 1;
                     continue :state .identifier;
                 },
 
@@ -366,6 +380,11 @@ pub const Tokenizer = struct {
                 ':' => {
                     head.pos += 1;
                     return .{.kind = .colon, .data = head.input[tokenStart..head.pos]};
+                },
+
+                ';' => {
+                    head.pos += 1;
+                    return .{.kind = .semicolon, .data = head.input[tokenStart..head.pos]};
                 },
 
                 '$' => {
@@ -830,7 +849,7 @@ pub const Tokenizer = struct {
                         while (head.pos < head.input.len) {
                             _ = self.next() catch |err| switch (err) {
                                 LexerError.StrayEndif => {
-                                    if (assigned) {
+                                    if (!assigned) {
                                         if (correctScope) {
                                             tokenEnd = head.pos - "%endif".len;
                                             assigned = true;
@@ -844,8 +863,8 @@ pub const Tokenizer = struct {
                                     if (!assigned) {
                                         if (correctScope) {
                                             tokenEnd = head.pos - "%else".len;
-                                            assigned = true;
                                             correctScope = false;
+                                            assigned = true;
                                         } else {
                                             tokenStart = head.pos;
                                             correctScope = true;

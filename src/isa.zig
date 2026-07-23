@@ -33,19 +33,35 @@ pub const Register = enum {
     ra,
 };
 
+pub const PreprocessorDirective = enum {
+    define,
+    @"else",
+    embed,
+    endif,
+    endmacro,
+    filename,
+    ifdef,
+    ifndef,
+    include,
+    line,
+    macro,
+};
+
 pub const DataDirective = enum {
     asciiz,
     byte,
     nascii,
     pad,
     ptr,
+    section,
+    short,
     word,
 };
 
 pub const RelocationMode = enum {
     rtype,
-    lo16, // I-type
-    hi16, // E-type
+    lo16,
+    hi16,
     pc16, // Relative branches
     tail27,
     word, // .ptr
@@ -82,37 +98,39 @@ pub const InstructionName = enum {
 
     pub const Info = struct {
         op: u5,
+        high: bool,
+        reltype: RelocationMode,
     };
 
     pub fn getInfo(self: InstructionName) Info {
         return switch (self) {
-            .rtype => .{.op = 0b00000},
-            .addi  => .{.op = 0b00001},
-            .j     => .{.op = 0b00010},
-            .jal   => .{.op = 0b00011},
-            .andi  => .{.op = 0b00100},
-            .andih => .{.op = 0b00100},
-            .ori   => .{.op = 0b00101},
-            .orih  => .{.op = 0b00101},
-            .xori  => .{.op = 0b00110},
-            .xorih => .{.op = 0b00110},
-            .lui   => .{.op = 0b00111},
-            .lw    => .{.op = 0b01000},
-            .sw    => .{.op = 0b01001},
-            .sh    => .{.op = 0b01010},
-            .sb    => .{.op = 0b01011},
-            .lh    => .{.op = 0b01100},
-            .lhu   => .{.op = 0b01101},
-            .lb    => .{.op = 0b01110},
-            .lbu   => .{.op = 0b01111},
-            .beq   => .{.op = 0b10000},
-            .bne   => .{.op = 0b10001},
-            .blt   => .{.op = 0b10010},
-            .bgt   => .{.op = 0b10011},
-            .ble   => .{.op = 0b10100},
-            .bge   => .{.op = 0b10101},
-            .slti  => .{.op = 0b10110},
-            .sltiu => .{.op = 0b10111},
+            .rtype => .{.op = 0b00000, .high = false, .reltype = .rtype},
+            .addi  => .{.op = 0b00001, .high = false, .reltype = .lo16},
+            .j     => .{.op = 0b00010, .high = false, .reltype = .lo16},
+            .jal   => .{.op = 0b00011, .high = false, .reltype = .lo16},
+            .andi  => .{.op = 0b00100, .high = false, .reltype = .lo16},
+            .andih => .{.op = 0b00100, .high = true,  .reltype = .hi16},
+            .ori   => .{.op = 0b00101, .high = false, .reltype = .lo16},
+            .orih  => .{.op = 0b00101, .high = true,  .reltype = .hi16},
+            .xori  => .{.op = 0b00110, .high = false, .reltype = .lo16},
+            .xorih => .{.op = 0b00110, .high = true,  .reltype = .hi16},
+            .lui   => .{.op = 0b00111, .high = false, .reltype = .lo16},
+            .lw    => .{.op = 0b01000, .high = false, .reltype = .lo16},
+            .sw    => .{.op = 0b01001, .high = false, .reltype = .lo16},
+            .sh    => .{.op = 0b01010, .high = false, .reltype = .lo16},
+            .sb    => .{.op = 0b01011, .high = false, .reltype = .lo16},
+            .lh    => .{.op = 0b01100, .high = false, .reltype = .lo16},
+            .lhu   => .{.op = 0b01101, .high = true,  .reltype = .hi16},
+            .lb    => .{.op = 0b01110, .high = false, .reltype = .lo16},
+            .lbu   => .{.op = 0b01111, .high = true,  .reltype = .hi16},
+            .beq   => .{.op = 0b10000, .high = false, .reltype = .pc16},
+            .bne   => .{.op = 0b10001, .high = false, .reltype = .pc16},
+            .blt   => .{.op = 0b10010, .high = false, .reltype = .pc16},
+            .bgt   => .{.op = 0b10011, .high = false, .reltype = .pc16},
+            .ble   => .{.op = 0b10100, .high = false, .reltype = .pc16},
+            .bge   => .{.op = 0b10101, .high = false, .reltype = .pc16},
+            .slti  => .{.op = 0b10110, .high = false, .reltype = .lo16},
+            .sltiu => .{.op = 0b10111, .high = true,  .reltype = .hi16},
         };
     }
 };
@@ -191,23 +209,4 @@ pub const RType = enum {
             .rft    => .{.code = 0b100001},
         };
     }
-};
-
-pub const Section = enum {
-    data,
-    text,
-};
-
-pub const PreprocessorDirective = enum {
-    define,
-    @"else",
-    embed,
-    endif,
-    endmacro,
-    filename,
-    ifdef,
-    ifndef,
-    include,
-    line,
-    macro,
 };
