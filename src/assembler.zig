@@ -1,97 +1,403 @@
-const std =  @import("std");
-
 const c = @import("elf_io");
-
-const P = @import("parser.zig");
+const std =  @import("std");
+const parsing = @import("parser.zig");
+const lexing = @import("tokenizer.zig");
 const isa =  @import("isa.zig");
+
+const Statement = parsing.Statement;
+const Parser = parsing.Parser;
+const Tokenizer = lexing.Tokenizer;
 
 pub const Symbol = struct {
     offset: usize,
-    section: isa.Section,
+    segment: []const u8,
 };
 
 pub const Relocation = struct {
     addr: usize,
     name: []const u8,
     kind: isa.RelocationMode,
-    bookmark: P.Parser.Bookmark,
+    bookmark: Tokenizer.Bookmark,
 };
 
 pub const AssemblyError = error {
     InvalidInstruction,
+    InvalidAlignment,
+    InvalidLabel,
+    LabelNotAllowedHere,
+    SymbolRedefined,
     NoData,
     SerializationFailed,
     UnresolvedSymbol,
-};
+} || parsing.ParseError;
 
+const Segment = std.ArrayList(u8);
 pub const Assembly = struct {
-    data: std.ArrayList(u8) = std.ArrayList(u8).empty,
-    text: std.ArrayList(u8) = std.ArrayList(u8).empty,
-    currentSection: isa.Section = .data,
-
     allocator: std.mem.Allocator,
+    strings: std.heap.ArenaAllocator,
+
+    segments: std.StringHashMap(Segment),
+    currentSegment: *Segment,
+    currentSegmentName: []const u8,
+
     symbols: std.StringHashMap(Symbol),
     relocations: std.ArrayList(Relocation),
 
     pub fn init(allocator: std.mem.Allocator) !Assembly {
+        var segments = std.StringHashMap(Segment).init(allocator);
+        try segments.put("text", std.ArrayList(u8).empty);
+        try segments.put("data", std.ArrayList(u8).empty);
+
         return .{
             .allocator = allocator,
+            .strings = std.heap.ArenaAllocator.init(allocator),
+            .segments = segments,
+            .currentSegment = segments.getPtr("text").?,
+            .currentSegmentName = "text",
             .symbols = std.StringHashMap(Symbol).init(allocator),
-            .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 8),
+            .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 32),
         };
     }
 
     pub fn deinit(self: *Assembly) void {
-        for (self.relocations.items) |r| {
-            self.allocator.free(r.name);
-        }
-
         self.relocations.deinit(self.allocator);
 
-        var it = self.symbols.iterator();
-        while (it.next()) |e| {
-            self.allocator.free(e.key_ptr.*);
+        var segment = self.segments.iterator();
+        while (segment.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
         }
 
+        self.segments.deinit();
         self.symbols.deinit();
+        self.strings.deinit();
     }
 
-    pub fn writeHeader(self: *Assembly, io: std.Io, filepath: []const u8) !void {
-        const file = try std.Io.Dir.cwd().createFile(io, filepath, .{});
-        defer file.close(io);
+    pub fn encodeStatement(self: *Assembly, stmt: Statement, bookmark: Tokenizer.Bookmark) AssemblyError!void {
+        switch (stmt.value) {
+            .section => |name| {
+                if (stmt.label.len != 0) {
+                    return AssemblyError.LabelNotAllowedHere;
+                }
 
-        var buffer: [4096]u8 = undefined;
-        var writer = file.writer(io, &buffer);
+                self.currentSegment = try self.getOrPutSegment(name);
+                self.currentSegmentName = name;
+                return;
+            },
 
-        try writer.interface.print("#include <stdint.h>\n", .{});
-        try writer.interface.print("\n", .{});
+            else => {},
+        }
 
-        try writer.interface.print("uint32_t program_memory[{d}] = {{\n", .{self.text.items.len});
+        var labelLoc = self.getOffset();
+        switch (stmt.value) {
+            .section => unreachable,
+
+            .bytes => |bytes| {
+                try self.currentSegment.appendSlice(self.allocator, bytes);
+            },
+
+            .shorts => |shorts| {
+                try self.alignSegment(self.currentSegment, 2);
+                labelLoc = self.getOffset();
+
+                for (shorts) |x| {
+                    const le = std.mem.nativeToLittle(u16, x);
+                    try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&le));
+                }
+            },
+
+            .words => |words| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                for (words) |x| {
+                    const le = std.mem.nativeToLittle(u32, x);
+                    try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&le));
+                }
+            },
+
+            .asciiz => |str| {
+                try self.currentSegment.appendSlice(self.allocator, str);
+                try self.currentSegment.append(self.allocator, 0);
+            },
+
+            .nascii => |str| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                const len = std.mem.nativeToLittle(u32, @intCast(str.len));
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&len));
+                try self.currentSegment.appendSlice(self.allocator, str);
+            },
+
+            .padding => |padding| {
+                try self.alignSegment(self.currentSegment, padding.alignment);
+                labelLoc = self.getOffset();
+
+                try self.currentSegment.appendNTimes(self.allocator, 0, padding.size);
+            },
+
+            .ptr => |label| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                try self.relocations.append(self.allocator, .{
+                    .addr = labelLoc,
+                    .name = label,
+                    .kind = .word,
+                    .bookmark = bookmark,
+                });
+
+                try self.currentSegment.appendNTimes(self.allocator, 0, 4);
+            },
+
+            .rtype => |r| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                const imm = switch (r.aux) {
+                    .static => |x| x,
+                    .dynamic => |label| blk: {
+                        try self.relocations.append(self.allocator, .{
+                            .addr = labelLoc,
+                            .name = label,
+                            .kind = .rtype,
+                            .bookmark = bookmark,
+                        });
+
+                        break :blk 0;
+                    },
+                };
+
+                const mangled: u32
+                    = (@as(u32, r.funct.getFunct().code))
+                    | (@as(u32, imm) <<  7)
+                    | (@as(u32, @intFromEnum(r.rd)) << 12)
+                    | (@as(u32, @intFromEnum(r.rt)) << 17)
+                    | (@as(u32, @intFromEnum(r.rs)) << 22);
+
+                const view = std.mem.nativeToLittle(u32, mangled);
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+            },
+
+            .itype => |i| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                const info = i.opcode.getInfo();
+                const imm = switch (i.imm) {
+                    .static => |x| x,
+                    .dynamic => |label| blk: {
+                        try self.relocations.append(self.allocator, .{
+                            .addr = labelLoc,
+                            .name = label,
+                            .kind = info.reltype,
+                            .bookmark = bookmark,
+                        });
+
+                        break :blk 0;
+                    },
+                };
+
+                const mangled: u32
+                    = (@as(u32, info.op) << 27)
+                    | (@as(u32, @intFromEnum(i.rs))   << 22)
+                    | (@as(u32, @intFromEnum(i.rt))   << 17)
+                    |  @as(u32, @intCast(imm));
+
+                const view = std.mem.nativeToLittle(u32, mangled);
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+            },
+
+            .ltype => |l| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                const info = l.opcode.getInfo();
+                const imm = switch (l.imm) {
+                    .static => |x| x,
+                    .dynamic => |label| blk: {
+                        try self.relocations.append(self.allocator, .{
+                            .addr = labelLoc,
+                            .name = label,
+                            .kind = info.reltype,
+                            .bookmark = bookmark,
+                        });
+
+                        break :blk 0;
+                    },
+                };
+
+                const mangled: u32
+                    = (@as(u32, info.op) << 27)
+                    | (@as(u32, @intFromEnum(l.rs))   << 22)
+                    | (@as(u32, @intFromEnum(l.rt))   << 17)
+                    | (if (info.high) @as(u32, 1 << 16) else @as(u32, 0))
+                    |  @as(u32, @intCast(imm));
+
+                const view = std.mem.nativeToLittle(u32, mangled);
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+            },
+
+            .jtype => |j| {
+                try self.alignSegment(self.currentSegment, 4);
+                labelLoc = self.getOffset();
+
+                const info = j.opcode.getInfo();
+                const imm = switch (j.imm) {
+                    .static => |x| x,
+                    .dynamic => |label| blk: {
+                        try self.relocations.append(self.allocator, .{
+                            .addr = labelLoc,
+                            .name = label,
+                            .kind = info.reltype,
+                            .bookmark = bookmark,
+                        });
+
+                        break :blk 0;
+                    },
+                };
+
+                const mangled: u32
+                    = (@as(u32, info.op) << 27)
+                    |  @as(u32, @intCast(imm));
+
+                const view = std.mem.nativeToLittle(u32, mangled);
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+            },
+        }
+
+        if (stmt.label.len != 0) {
+            try self.defineLabel(stmt.label, labelLoc);
+        }
+    }
+
+    fn getOrPutSegment(self: *Assembly, name: []const u8) AssemblyError!*Segment {
+        const gpr = try self.segments.getOrPut(name);
+        if (gpr.found_existing) {
+            return gpr.value_ptr;
+        } else {
+            gpr.key_ptr.* = try self.strings.allocator().dupe(u8, name);
+            gpr.value_ptr.* = .empty;
+            return gpr.value_ptr;
+        }
+    }
+
+    fn getOffset(self: *Assembly) usize {
+        return self.currentSegment.items.len;
+    }
+
+    fn alignSegment(self: *Assembly, segment: *Segment, alignment: usize) !void {
+        if (alignment == 0) {
+            return AssemblyError.InvalidAlignment;
+        }
+
+        const remainder = segment.items.len % alignment;
+        if (remainder != 0) {
+            try segment.appendNTimes(self.allocator, 0, alignment - remainder);
+        }
+    }
+
+    fn defineLabel(self: *Assembly, name: []const u8, offset: usize) AssemblyError!void {
+        if (name.len == 0) {
+            return AssemblyError.InvalidLabel;
+        }
+
+        const gpr = try self.symbols.getOrPut(name);
+        if (gpr.found_existing) {
+            return AssemblyError.SymbolRedefined;
+        } else {
+            gpr.key_ptr.* = try self.strings.allocator().dupe(u8, name);
+            gpr.value_ptr.* = .{
+                .offset = offset,
+                .segment = self.currentSegmentName,
+            };
+        }
+    }
+
+    pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name: []const u8) !void {
+        var parser = try Parser.init(io, self.allocator);
+        defer parser.deinit();
+
+        try parser.lexer.pushFrame(frame, name);
+        const capacity = frame.len / 4;
+
+        if (self.segments.getPtr("data")) |data| {
+            try data.ensureTotalCapacity(self.allocator, capacity);
+        }
+
+        if (self.segments.getPtr("text")) |text| {
+            try text.ensureTotalCapacity(self.allocator, capacity);
+        }
+
+        while (parser.lexer.frameHead != null) {
+            const mark = parser.lexer.bookmark();
+            
+            const statement = parser.parseStatement() catch |err| {
+                parser.lexer.showErrorHere(err);
+                try parser.skipToStatementEnd();
+                continue;
+            };
+
+            try self.encodeStatement(statement, mark);
+        }
+    }
+
+    pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
+        var parser = try Parser.init(io, self.allocator);
+        defer parser.deinit();
+
+        try parser.lexer.openFile(filepath);
+        if (parser.lexer.frameHead) |head| {
+            const capacity = head.input.len / 4;
+
+            if (self.segments.getPtr("data")) |data| {
+                try data.ensureTotalCapacity(self.allocator, capacity);
+            }
+
+            if (self.segments.getPtr("text")) |text| {
+                try text.ensureTotalCapacity(self.allocator, capacity);
+            }
+        }
+
+        while (parser.lexer.frameHead != null) {
+            const mark = parser.lexer.bookmark();
+            
+            const statement = parser.parseStatement() catch |err| {
+                parser.lexer.showErrorHere(err);
+                try parser.skipToStatementEnd();
+                continue;
+            };
+
+            try self.encodeStatement(statement, mark);
+        }
+    }
+
+    pub fn patchStaticRelocations(self: *Assembly) void {
         var i: usize = 0;
-        while (i < self.text.items.len) : (i += 8) {
-            try writer.interface.print("\t", .{});
-            var j: usize = 0;
-            while (j < 8 and i + j < self.text.items.len) : (j += 1) {
-                try writer.interface.print("0x{X}, ", .{self.text.items[i + j]});
-            }
-            try writer.interface.writeAll("\n");
-        }
-        try writer.interface.writeAll("};\n");
-        try writer.interface.flush();
+        while (i < self.relocations.items.len) : (i += 1) {
+            const r = self.relocations.items[i];
+            if (r.kind != isa.RelocationMode.pc16) continue;
 
-        i = 0;
-        try writer.interface.print("\n", .{});
-        try writer.interface.print("uint8_t data_memory[{d}] = {{\n", .{self.data.items.len});
-        while (i < self.data.items.len) : (i += 8) {
-            try writer.interface.writeAll("\t");
-            var j: usize = 0;
-            while (j < 8 and i + j < self.data.items.len) : (j += 1) {
-                try writer.interface.print("0x{X}, ", .{self.data.items[i + j]});
+            if (self.symbols.get(r.name)) |symbol| {
+                if (symbol.section != isa.Section.text) continue;
+
+                const pc = r.addr;
+                const target = symbol.offset;
+
+                const delta = @as(i32, @intCast(target)) - @as(i32, @intCast(pc + 4));
+                const imm = @as(i16, @truncate(delta >> 2));
+
+                var view: u32 = undefined;
+                std.mem.copyForwards(u8, std.mem.asBytes(&view), self.text.items[pc .. pc + 4]);
+                
+                view &= 0xFFFF0000;
+                view |= @as(u16, @bitCast(imm));
+                
+                std.mem.copyForwards(u8, self.text.items[pc .. pc + 4], std.mem.asBytes(&view));
+                self.allocator.free(r.name);
+                _ = self.relocations.swapRemove(i);
             }
-            try writer.interface.writeAll("\n");
         }
-        try writer.interface.writeAll("};");
-        try writer.interface.flush();
     }
 
     pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8 {
@@ -234,871 +540,116 @@ pub const Assembly = struct {
         defer file.close(io);
         try file.writeStreamingAll(io, blob);
     }
-
-    fn alignData(self: *Assembly, alignment: usize) !void {
-        const remainder = self.data.items.len % alignment;
-        if (remainder != 0) {
-            try self.data.appendNTimes(self.allocator, 0, alignment - remainder);
-        }
-    }
-
-    fn encodeAsciiz(self: *Assembly, p: *P.Parser) !void {
-        var count: usize = 0;
-
-        while (!p.eof()) {
-            _ = p.tabulation();
-            const mark = p.bookmark();
-
-            const str = p.parseStringLiteral() catch |err| {
-                p.restore(mark);
-                if (err == P.ParseError.NoMatch and count > 0) break;
-                return err;
-            };
-
-            count += 1;
-            try self.data.appendSlice(self.allocator, str);
-        }
-
-        try self.data.append(self.allocator, 0);
-    }
-
-    fn encodeNascii(self: *Assembly, p: *P.Parser) !void {
-        var concat = std.ArrayList(u8).empty;
-        defer concat.deinit(self.allocator);
-
-        var count: usize = 0;
-        while (!p.eof()) {
-            _ = p.tabulation();
-            const mark = p.bookmark();
-
-            const str = p.parseStringLiteral() catch |err| {
-                p.restore(mark);
-                if (err == P.ParseError.NoMatch and count > 0) break;
-                return err;
-            };
-
-            count += 1;
-            try concat.appendSlice(self.allocator, str);
-        }
-
-        const len = std.mem.nativeToLittle(u32, @as(u32, @intCast(concat.items.len)));
-        try self.data.appendSlice(self.allocator, std.mem.asBytes(&len));
-        try self.data.appendSlice(self.allocator, concat.items);
-    }
-
-    fn encodePadGetAlignment(_: *Assembly, p: *P.Parser) !usize {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        try p.char('(');
-        const alignment = try p.parseInteger(usize);
-        try p.char(')');
-
-        return alignment;
-    }
-
-    fn encodePad(self: *Assembly, p: *P.Parser) !void {
-        const length = try p.parseInteger(usize);
-        try self.alignData(self.encodePadGetAlignment(p) catch 1);
-        try self.data.appendNTimes(self.allocator, 0, length);
-    }
-
-    fn encodeByte(self: *Assembly, p: *P.Parser) !void {
-        while (!p.eof()) {
-            _ = p.tabulation();
-            const mark = p.bookmark();
-
-            while (p.isNewline()) {
-                p.newline() catch {};
-                _ = p.tabulation();
-            }
-
-            const value = p.parseByte() catch {
-                p.restore(mark);
-                break;
-            };
-
-            try self.data.append(self.allocator, value);
-        }
-    }
-
-    fn encodeWord(self: *Assembly, p: *P.Parser) !void {
-        while (!p.eof()) {
-            _ = p.tabulation();
-            const mark = p.bookmark();
-
-            while (p.isNewline()) {
-                p.newline() catch {};
-                _ = p.tabulation();
-            }
-
-            const value = p.parseInteger(i32) catch {
-                p.restore(mark);
-                break;
-            };
-
-            const view = std.mem.nativeToLittle(i32, value);
-            try self.data.appendSlice(self.allocator, std.mem.asBytes(&view));
-        }
-    }
-
-    fn encodePtr(self: *Assembly, p: *P.Parser) !void {
-        _ = p.tabulation();
-        const name = try p.identifier1();
-
-        try self.relocations.append(self.allocator, .{
-            .addr = self.data.items.len,
-            .name = try self.allocator.dupe(u8, name),
-            .kind = .word,
-            .bookmark = p.bookmark(),
-        });
-        
-        try self.data.appendNTimes(self.allocator, 0, 4);
-    }
-
-    fn assembleData(self: *Assembly, p: *P.Parser) !void {
-        const mark = p.bookmark();
-        const label: ?[]const u8 = p.parseLabel() catch null;
-
-        const directive = p.parseDataDirective() catch |err| {
-            if (err == P.ParseError.NoMatch) if (label) |name| {
-                const storedName = try self.allocator.dupe(u8, name);
-                try self.symbols.put(storedName, .{
-                    .offset = self.data.items.len,
-                    .section = self.currentSection
-                });
-
-                return;
-            };
-
-            p.restore(mark);
-            return err;
-        };
-
-        switch (directive) {
-            .nascii, .ptr, .word => try self.alignData(4),
-            .asciiz, .byte, .pad => {},
-        }
-
-        if (label) |name| {
-            const storedName = try self.allocator.dupe(u8, name);
-            try self.symbols.put(storedName, .{
-                .offset = self.data.items.len,
-                .section = self.currentSection
-            });
-        }
-
-        switch (directive) {
-            .asciiz => try self.encodeAsciiz(p),
-            .byte => try self.encodeByte(p),
-            .nascii => try self.encodeNascii(p),
-            .pad => try self.encodePad(p),
-            .ptr => try self.encodePtr(p),
-            .word => try self.encodeWord(p),
-        }
-    }
-
-    fn encodeR3(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-
-        const mangled: u32
-            = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, @intFromEnum(rs)) <<  7)
-            | (@as(u32, @intFromEnum(rt)) << 12)
-            | (@as(u32, @intFromEnum(rd)) << 17);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeRShift(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u6 = p.parseInteger(u6) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.rtype,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, @intFromEnum(rt))  << 12)
-            | (@as(u32, @intFromEnum(rd))  << 17)
-            | (@as(u32, imm) << 22);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeRSRA(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u6 = p.parseInteger(u6) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.rtype,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, @intFromEnum(rs))  <<  7)
-            | (@as(u32, @intFromEnum(rd))  << 17)
-            | (@as(u32, imm) << 22);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeRShiftV(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-
-        const mangled: u32
-            = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, @intFromEnum(rs)) <<  7)
-            | (@as(u32, @intFromEnum(rt)) << 12)
-            | (@as(u32, @intFromEnum(rd)) << 17);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeRMemX(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rd = try p.parseRegisterName();
-
-        const mangled: u32
-            = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, @intFromEnum(rs)) <<  7)
-            | (@as(u32, @intFromEnum(rt)) << 12)
-            | (@as(u32, @intFromEnum(rd)) << 17);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeRJ(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-
-        const mangled: u32
-            = (@as(u32, rtype.getFunct().code))
-            | (@as(u32, @intFromEnum(rs)) <<  7);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    inline fn encodeR(self: *Assembly, p: *P.Parser, rtype: isa.RType) !void {
-        switch (rtype) {
-            .sll => return self.encodeRShift(p, rtype),
-            .srl => return self.encodeRShift(p, rtype),
-            .sra => return self.encodeRSRA(p, rtype),
-            .sllr => return self.encodeRShiftV(p, rtype),
-            .srlr => return self.encodeRShiftV(p, rtype),
-            .srar => return self.encodeRShiftV(p, rtype),
-            .cfs => @panic("UNIMPLEMENTED"),
-            .cts => @panic("UNIMPLEMENTED"),
-            .@"and" => return self.encodeR3(p, rtype),
-            .@"or" => return self.encodeR3(p, rtype),
-            .xor => return self.encodeR3(p, rtype),
-            .nor => return self.encodeR3(p, rtype),
-            .slt => return self.encodeR3(p, rtype),
-            .sltu => return self.encodeR3(p, rtype),
-            .jr => return self.encodeRJ(p, rtype),
-            .jalr => return self.encodeRJ(p, rtype),
-            .lhx => return self.encodeRMemX(p, rtype),
-            .lhux => return self.encodeRMemX(p, rtype),
-            .lbx => return self.encodeRMemX(p, rtype),
-            .lbux => return self.encodeRMemX(p, rtype),
-            .lwx => return self.encodeRMemX(p, rtype),
-            .mul => return self.encodeR3(p, rtype),
-            .mulh => return self.encodeR3(p, rtype),
-            .mulhu => return self.encodeR3(p, rtype),
-            .div => return self.encodeR3(p, rtype),
-            .divu => return self.encodeR3(p, rtype),
-            .rest => return self.encodeR3(p, rtype),
-            .restu => return self.encodeR3(p, rtype),
-            .add => return self.encodeR3(p, rtype),
-            .sub => return self.encodeR3(p, rtype),
-            .trap => @panic("UNIMPLEMENTED"),
-            .rft => @panic("UNIMPLEMENTED"),
-        }
-    }
-
-    fn encodeIALU(self: *Assembly, p: *P.Parser, instr: isa.InstructionName, comptime high: bool) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = if (high) isa.RelocationMode.hi16 else isa.RelocationMode.lo16,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rs))   << 22)
-            | (@as(u32, @intFromEnum(rt))   << 17)
-            | (if (high) @as(u32, 1 << 16) else @as(u32, 0))
-            |  @as(u32, imm);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeIMem(self: *Assembly, p: *P.Parser, instr: isa.InstructionName, comptime high: bool) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.lo16,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        _ = p.tabulation();
-        try p.char('(');
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        _ = p.tabulation();
-        try p.char(')');
-
-        const mangled: u32
-            = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rs))   << 22)
-            | (@as(u32, @intFromEnum(rt))   << 17)
-            | (if (high) @as(u32, 1 << 16) else @as(u32, 0))
-            |  @as(u32, imm);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeILui(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.lo16,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rt))   << 17)
-            |  @as(u32, imm);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeB(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const rs = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const rt = try p.parseRegisterName();
-        try p.char(',');
-        _ = p.tabulation();
-        const imm: u16 = p.parseInteger(u16) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.pc16,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, instr.getInfo().op) << 27)
-            | (@as(u32, @intFromEnum(rs))   << 22)
-            | (@as(u32, @intFromEnum(rt))   << 17)
-            |  @as(u32, imm);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn encodeS(self: *Assembly, p: *P.Parser, instr: isa.InstructionName) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        _ = p.tabulation();
-        const imm: u27 = p.parseInteger(u27) catch |err| blk: {
-            if (err == P.ParseError.NoMatch) {
-                const label = try p.identifier1();
-                try self.relocations.append(self.allocator, .{
-                    .addr = self.text.items.len, 
-                    .name = try self.allocator.dupe(u8, label),
-                    .kind = isa.RelocationMode.tail27,
-                    .bookmark = p.bookmark(),
-                });
-                break :blk 0;
-            }
-            return err;
-        };
-
-        const mangled: u32
-            = (@as(u32, instr.getInfo().op) << 27)
-            |  @as(u32, imm);
-
-        const view = std.mem.nativeToLittle(u32, mangled);
-        try self.text.appendSlice(self.allocator, std.mem.asBytes(&view));
-    }
-
-    fn assembleText(self: *Assembly, p: *P.Parser) !void {
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        const label: ?[]const u8 = p.parseLabel() catch null;
-        if (label) |name| {
-            const storedName = try self.allocator.dupe(u8, name);
-            try self.symbols.put(storedName, .{
-                .offset = if (self.currentSection == .text) self.text.items.len else self.data.items.len,
-                .section = self.currentSection
-            });
-            _ = p.tabulation();
-            if (p.isNewline()) return;
-        } else {
-            p.restore(mark);
-        }
-
-        const mnemonic = p.alphanumeric1() catch return;
-        if (std.meta.stringToEnum(isa.RType, mnemonic)) |rtype| {
-            try self.encodeR(p, rtype);
-        } else if (std.meta.stringToEnum(isa.InstructionName, mnemonic)) |instr| switch (instr) {
-            .rtype => return AssemblyError.InvalidInstruction,
-            .addi => try self.encodeIALU(p, instr, false),
-            .j => try self.encodeS(p, instr),
-            .jal => try self.encodeS(p, instr),
-            .andi => try self.encodeIALU(p, instr, false),
-            .andih => try self.encodeIALU(p, instr, true),
-            .ori => try self.encodeIALU(p, instr, false),
-            .orih => try self.encodeIALU(p, instr, true),
-            .xori => try self.encodeIALU(p, instr, false),
-            .xorih => try self.encodeIALU(p, instr, true),
-            .lui => try self.encodeILui(p, instr),
-            .lw => try self.encodeIMem(p, instr, false),
-            .sw => try self.encodeIMem(p, instr, false),
-            .sh => try self.encodeIMem(p, instr, false),
-            .sb => try self.encodeIMem(p, instr, false),
-            .lh => try self.encodeIMem(p, instr, false),
-            .lhu => try self.encodeIMem(p, instr, true),
-            .lb => try self.encodeIMem(p, instr, false),
-            .lbu => try self.encodeIMem(p, instr, true),
-            .beq => try self.encodeB(p, instr),
-            .bne => try self.encodeB(p, instr),
-            .blt => try self.encodeB(p, instr),
-            .bgt => try self.encodeB(p, instr),
-            .ble => try self.encodeB(p, instr),
-            .bge => try self.encodeB(p, instr),
-            .slti => try self.encodeIALU(p, instr, false),
-            .sltiu => try self.encodeIALU(p, instr, true),
-        } else {
-            return AssemblyError.InvalidInstruction;
-        }
-    }
-
-    pub fn assembleLine(self: *Assembly, p: *P.Parser) !void {
-        _ = p.whitespace();
-        if (p.eof()) return;
-        _ = p.whitespace();
-        if (p.isNewline()) {
-            try p.newline();
-            return self.assembleLine(p);
-        }
-
-        const mark = p.bookmark();
-        errdefer p.restore(mark);
-
-        const section: ?[]const u8 = p.parseSectionLabel() catch |err| blk: {
-            if (err == P.ParseError.NoMatch) break :blk null;
-            if (err == P.ParseError.UnexpectedToken) break :blk null;
-            return err;
-        };
-
-        if (p.peek() == '%') {
-            try p.parsePreprocessorDefinition();
-            return self.assembleLine(p);
-        }
-
-        if (section) |name| {
-            if (std.mem.eql(u8, name, "data")) self.currentSection = .data;
-            if (std.mem.eql(u8, name, "text")) self.currentSection = .text;
-            _ = p.tabulation();
-            return;
-        } else {
-            p.restore(mark);
-            switch (self.currentSection) {
-                .data => try self.assembleData(p),
-                .text => try self.assembleText(p),
-            }
-        }
-
-        if (p.isNewline()) {
-            try p.newline();
-            return;
-        }
-
-        if (!p.eof() and !std.ascii.isWhitespace(p.peek().?)) {
-            return P.ParseError.UnexpectedToken;
-        }
-    }
-
-    fn patchKnownRelocations(self: *Assembly) void {
-        var i: usize = 0;
-        while (i < self.relocations.items.len) : (i += 1) {
-            const r = self.relocations.items[i];
-            if (r.kind != isa.RelocationMode.pc16) continue;
-
-            if (self.symbols.get(r.name)) |symbol| {
-                if (symbol.section != isa.Section.text) continue;
-
-                const pc = r.addr;
-                const target = symbol.offset;
-
-                const delta = @as(i32, @intCast(target)) - @as(i32, @intCast(pc + 4));
-                const imm = @as(i16, @truncate(delta >> 2));
-
-                var view: u32 = undefined;
-                std.mem.copyForwards(u8, std.mem.asBytes(&view), self.text.items[pc .. pc + 4]);
-                
-                view &= 0xFFFF0000;
-                view |= @as(u16, @bitCast(imm));
-                
-                std.mem.copyForwards(u8, self.text.items[pc .. pc + 4], std.mem.asBytes(&view));
-                self.allocator.free(r.name);
-                _ = self.relocations.swapRemove(i);
-            }
-        }
-    }
-
-    pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
-        const data = try std.Io.Dir.cwd().readFileAlloc(io, filepath, self.allocator, .unlimited);
-        errdefer self.allocator.free(data);
-        
-        var p: P.Parser = try P.Parser.init(self.allocator, io);
-        defer p.deinit();
-
-        try p.pushFrame(data, filepath);
-        try self.data.ensureTotalCapacity(self.allocator, data.len / 8);
-        try self.text.ensureTotalCapacity(self.allocator, data.len / 8);
-
-        while (!p.eof()) {
-            self.assembleLine(&p) catch |err| {
-                self.showError(&p, filepath, err);
-                return err;
-            };
-        }
-
-        self.patchKnownRelocations();
-
-        // if (self.relocations.items.len > 0) {
-        //     for (self.relocations.items) |r| {
-        //         p.restore(r.bookmark);
-        //         self.showError(&p, filepath, AssemblyError.UnresolvedSymbol);
-        //     }
-        //     return AssemblyError.UnresolvedSymbol;
-        // }
-    }
-
-    fn showError(_: *Assembly, p: *P.Parser, filepath: []const u8, err: anyerror) void {
-        var i = p.frames.items.len;
-        while (i > 0) {
-            i -= 1;
-            const frame = p.frames.items[i];
-            if (frame.input.len > 0) {
-                const loc = P.Parser.getLocationInfo(frame.input, frame.pos, frame.filename);
-                const fname = if (loc.filename.len > 0) loc.filename else filepath;
-                std.debug.print("in buffer expanded from {s}:{d}:{d}:\n", .{fname, loc.line, loc.column});
-            }
-        }
-
-        const loc = p.getLocation();
-        const fname = if (loc.filename.len > 0) loc.filename else filepath;
-        const snippet = p.input[loc.start..loc.end];
-        
-        std.debug.print("{s}:{d}:{d}: error: {s}\n", .{ fname, loc.line, loc.column, @errorName(err) });
-        std.debug.print("{s}\n", .{snippet});
-        
-        for (0..loc.column - 1) |_| std.debug.print(" ", .{});
-        std.debug.print("^\n", .{});
-    }
 };
 
-test "encodeR add" {
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-    assembly.currentSection = .text;
-    var parser = try P.Parser.init(std.testing.allocator, undefined);
-    defer parser.deinit();
-    try parser.pushFrame("add $t0, $s0, $a0", "<test>");
-    try assembly.assembleLine(&parser);
-    // FIXME: obsolete
-    // try std.testing.expectEqual(@as(u20, 0x004E0), assembly.program_memory[0]);
+test "assembly initializes default segments" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try std.testing.expect(as.segments.contains("text"));
+    try std.testing.expect(as.segments.contains("data"));
+
+    try std.testing.expectEqualStrings("text", as.currentSegmentName);
+    try std.testing.expectEqual(@as(usize, 0), as.currentSegment.items.len);
 }
 
-test "forward references" {
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-    assembly.currentSection = .text;
-    var p1 = try P.Parser.init(std.testing.allocator, undefined);
-    defer p1.deinit();
-    try p1.pushFrame("j future_label", "<test>");
-    try assembly.assembleLine(&p1);
-    try std.testing.expectEqual(@as(usize, 1), assembly.text.items.len);
-    try std.testing.expectEqual(@as(usize, 1), assembly.relocations.items.len);
-    try std.testing.expectEqualStrings("future_label", assembly.relocations.items[0].name);
-    try std.testing.expectEqual(@as(usize, 0), assembly.relocations.items[0].addr);
-    var p2 = try P.Parser.init(std.testing.allocator, undefined);
-    defer p2.deinit();
-    try p2.pushFrame("future_label:", "<test>");
-    try assembly.assembleLine(&p2);
-    try std.testing.expectEqual(@as(usize, 1), assembly.symbols.get("future_label").?);
+test "arbitrary sections" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section alpha
+        \\.byte 1
+        \\.section beta
+        \\.byte 2
+        \\.section alpha
+        \\.byte 3
+    , "<test>");
+
+    try std.testing.expect(as.segments.contains("alpha"));
+    try std.testing.expect(as.segments.contains("beta"));
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 3 }, as.segments.get("alpha").?.items);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2 }, as.segments.get("beta").?.items);
 }
 
-test "small .text program" {
-    const source = 
-        \\.text
+test "labels record correct segment and offset" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section alpha
+        \\first:
+        \\.byte 1
+        \\.byte 2
+        \\.section beta
+        \\second:
+        \\.word 0x12345678
+    , "<test>");
+
+    const first = as.symbols.get("first").?;
+    try std.testing.expectEqual(@as(usize, 0), first.offset);
+    try std.testing.expectEqualStrings("alpha", first.segment);
+
+    const second = as.symbols.get("second").?;
+    try std.testing.expectEqual(@as(usize, 0), second.offset);
+    try std.testing.expectEqualStrings("beta", second.segment);
+}
+
+test "relocation generation" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section text
+        \\lw $a0, msg($zero)
+        \\.section data
+        \\msg:
+        \\.word 42
+    , "<test>");
+
+    try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
+
+    const r = as.relocations.items[0];
+    try std.testing.expectEqual(isa.RelocationMode.lo16, r.kind);
+    try std.testing.expectEqualStrings("msg", r.name);
+    try std.testing.expectEqual(@as(usize, 0), r.addr);
+}
+
+test "sample program" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section data
+        \\msg: .nascii "To try (goodbye) (bye, bye, bye, bye, bye, bye, bye, bye)"
+        \\
+        \\.section text
         \\start:
-        \\  add $t0, $t1, $t2
-        \\  beq $t0, $s0, start
-        \\  j end
-        \\end:
-        \\  add $s1, $s1, $s1
-    ;
+        \\xor $zero, $zero, $zero
+        \\lw $a0, msg($zero)
+        \\orih $t0, $zero, 0xFFFF
+        \\ori $t0, $t0, 0xFF00
+        \\xor $a1, $a1, $a1
+        \\loop:
+        \\bge $a1, $a0, bye
+        \\addi $t1, $a1, 4
+        \\lb $t2, msg($t1)
+        \\sb $t2, 0($t0)
+        \\addi $a1, $a1, 1
+        \\j loop
+        \\bye:
+        \\j bye
+    , "<test>");
 
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
+    try std.testing.expect(as.symbols.contains("msg"));
+    try std.testing.expect(as.symbols.contains("start"));
+    try std.testing.expect(as.symbols.contains("loop"));
+    try std.testing.expect(as.symbols.contains("bye"));
 
-    var it = std.mem.tokenizeSequence(u8, source, "\n");
-    while (it.next()) |line| {
-        var p = try P.Parser.init(std.testing.allocator, undefined);
-        defer p.deinit();
-        try p.pushFrame(line, "<test>");
-        try assembly.assembleLine(&p);
-    }
+    try std.testing.expect(as.segments.get("text").?.items.len > 0);
+    try std.testing.expect(as.segments.get("data").?.items.len > 4);
 
-    try std.testing.expectEqual(@as(usize, 0), assembly.symbols.get("start").?);
-    try std.testing.expectEqual(@as(usize, 3), assembly.symbols.get("end").?);
-}
-
-test "small .data program" {
-    const source = 
-        \\.data
-        \\  x0: .byte 0
-        \\  x1: .byte 1
-        \\  xs: .byte 0 1 2 3 4 5 6 7 8 9 10
-        \\  x2: .byte 2
-        \\  w0: .word 6553
-        \\  .word 99 100 101
-        \\  .pad 4
-        \\  wawa: .asciiz "wawawawawawawawawawawawawawawawawawawawawawawawawa"
-        \\  .pad 4
-        \\  wawo: .nascii "WAAAAAAAAAAAA"
-        \\  x3: .byte 13
-    ;
-
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-
-    var it = std.mem.tokenizeSequence(u8, source, "\n");
-    while (it.next()) |line| {
-        var p = try P.Parser.init(std.testing.allocator, undefined);
-        defer p.deinit();
-        try p.pushFrame(line, "<.data program>");
-        assembly.assembleLine(&p) catch |err| {
-            assembly.showError(&p, "<.data program>", err);
-            return err;
-        };
-    }
-}
-
-test "%macro register clear pseudo-op" {
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-    assembly.currentSection = .text;
-
-    var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
-    defer p1.deinit();
-
-    try p1.pushFrame("%macro clear(r) { add @r, $s0, $s0 }\n.text\n  @clear($t0)\n", "test.rtm");
-    while (!p1.eof()) {
-        try assembly.assembleLine(&p1);
-    }
-
-    try std.testing.expectEqual(@as(usize, 1), assembly.text.items.len);
-}
-
-test "%macro array element stride loader" {
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-    assembly.currentSection = .text;
-
-    var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
-    defer p1.deinit();
-
-    try p1.pushFrame("%macro fetch(dest, base) { lw @dest, @base, 0 }\n  @fetch($a0, $sp)\n", "test.rtm");
-    while (!p1.eof()) {
-        try assembly.assembleLine(&p1);
-    }
-}
-
-test "%macro conditional yield block" {
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-    assembly.currentSection = .text;
-
-    var p1 = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
-    defer p1.deinit();
-
-    try p1.pushFrame("%macro assert_die() { beq $t0, $t1, 1\n me: j me }\n@assert_die()\n", "test.rtm");
-    while (!p1.eof()) {
-        try assembly.assembleLine(&p1);
-    }
-
-    try std.testing.expectEqual(@as(usize, 2), assembly.text.items.len);
-}
-
-test "complex %macro flow" {
-    var assembly = try Assembly.init(std.testing.allocator);
-    defer assembly.deinit();
-
-    const continuous_source =
-        \\.data
-        \\  value: .word 255
-        \\.text
-        \\  %macro pipeline(reg) {
-        \\    lw @reg, $s0, value
-        \\    add @reg, @reg, @reg
-        \\  }
-        \\  main:
-        \\    @pipeline($t2)
-        \\  die:
-        \\    j die
-    ;
-
-    var p = P.Parser.init(std.testing.allocator, undefined) catch unreachable;
-    defer p.deinit();
-    try p.pushFrame(continuous_source, "test.rtm");
-
-    while (!p.eof()) {
-        try assembly.assembleLine(&p);
-    }
-
-    //FIXME: revisit all tests tbh
-    // try std.testing.expectEqual(@as(usize, 2), assembly.text.items.len);
-    // try std.testing.expectEqual(@as(usize, 1), assembly.relocations.items.len);
+    // as.patchStaticRelocations();
+    // try std.testing.expectEqual(@as(usize, 0), as.relocations.items.len);
 }

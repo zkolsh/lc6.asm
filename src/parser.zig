@@ -30,19 +30,19 @@ pub const IType = struct {
     opcode: isa.InstructionName,
     rs: isa.Register,
     rt: isa.Register,
-    imm: Immediate(i17),
+    imm: Immediate(u17),
 };
 
 pub const LType = struct {
     opcode: isa.InstructionName,
     rs: isa.Register,
     rt: isa.Register,
-    imm: Immediate(i16),
+    imm: Immediate(u16),
 };
 
 pub const JType = struct {
     opcode: isa.InstructionName,
-    imm: Immediate(i27),
+    imm: Immediate(u27),
 };
 
 const Instruction = union(enum) {
@@ -136,12 +136,28 @@ pub const Parser = struct {
     pub fn statementEnd(self: *Parser) ParseError!bool {
         try self.lexer.skipWhitespace();
         const mark = self.lexer.bookmark();
-        const token = try self.lexer.next();
-        if (token.kind == .newline or token.kind == .semicolon) {
+        const token = self.lexer.next() catch |err| switch (err) {
+            lex.LexerError.UnexpectedEOF => return true,
+            else => return err,
+        };
+
+        if (token.kind == .newline or token.kind == .semicolon or token.kind == .eof) {
             return true;
         } else {
             self.lexer.restore(mark);
             return false;
+        }
+    }
+
+    pub fn skipToStatementEnd(self: *Parser) ParseError!void {
+        while (self.lexer.frameHead != null) {
+            try self.lexer.skipWhitespace();
+            const token = try self.lexer.next();
+
+            switch (token.kind) {
+                .newline, .semicolon => break,
+                else => continue,
+            }
         }
     }
 
@@ -236,7 +252,7 @@ pub const Parser = struct {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const name = try self.expect(.identifier);
+        const name = try self.expectWord(.identifier);
         _ = try self.expect(.colon);
 
         return name;
@@ -245,12 +261,10 @@ pub const Parser = struct {
     pub fn parseStatement(self: *Parser) ParseError!Statement {
         const start = self.lexer.bookmark();
         errdefer self.lexer.restore(start);
-        
+
         var statement: Statement = undefined;
-        try self.lexer.skipWhitespace();
         statement.label = self.parseLabel() catch &[_]u8{};
 
-        try self.lexer.skipWhitespace();
         const token = try self.lexer.nextWord();
         switch (token.kind) {
             .identifier => {
@@ -277,7 +291,13 @@ pub const Parser = struct {
                 }
             },
 
-            else => return ParseError.NoMatch,
+            .newline => {
+                return try self.parseStatement();
+            },
+
+            else => {
+                return ParseError.NoMatch;
+            },
         }
 
         if (try self.statementEnd()) {
@@ -371,7 +391,7 @@ pub const Parser = struct {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const imm = try self.parseImmediate(i27);
+        const imm = try self.parseImmediate(u27);
         return .{
             .opcode = mnemo,
             .imm = imm,
@@ -386,7 +406,7 @@ pub const Parser = struct {
         try self.commaSep();
         const rs = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(i17);
+        const imm = try self.parseImmediate(u17);
         return .{
             .opcode = mnemo,
             .rt = rt,
@@ -403,7 +423,7 @@ pub const Parser = struct {
         try self.commaSep();
         const rs = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(i16);
+        const imm = try self.parseImmediate(u16);
         return .{
             .opcode = mnemo,
             .rt = rt,
@@ -418,7 +438,7 @@ pub const Parser = struct {
 
         const rt = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(i16);
+        const imm = try self.parseImmediate(u16);
 
         _ = try self.expectWord(.lparen);
         try self.lexer.skipWhitespace();
@@ -439,7 +459,7 @@ pub const Parser = struct {
 
         const rt = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(i16);
+        const imm = try self.parseImmediate(u16);
         return .{
             .opcode = mnemo,
             .rt = rt,
@@ -571,13 +591,11 @@ pub const Parser = struct {
     }
 
     fn parseDirective(self: *Parser) ParseError!Directive {
-        const mark = self.lexer.bookmark();
-        errdefer self.lexer.restore(mark);
-
         const token = try self.expect(.identifier);
         const directive = std.meta.stringToEnum(isa.DataDirective, token)
             orelse return ParseError.NoMatch;
 
+        try self.lexer.skipWhitespace();
         switch (directive) {
             .asciiz  => return .{.asciiz = try self.parseString()},
             .byte    => return .{.bytes = try self.parseIntegerList(u8)},
@@ -590,18 +608,40 @@ pub const Parser = struct {
         }
     }
 
+    fn dataListContinues(self: *Parser, comptime kind: Token.Kind) ParseError!bool {
+        const mark = self.lexer.bookmark();
+        defer self.lexer.restore(mark);
+
+        try self.lexer.skipWhitespace();
+        const linebreak = try self.lexer.nextWord();
+        if (linebreak.kind == kind) return true;
+        if (linebreak.kind != .newline) return false;
+
+        const next = try self.lexer.nextWord();
+        return next.kind == kind;
+    }
+
     fn parseString(self: *Parser) ParseError![]const u8 {
         var string = std.ArrayList(u8).empty;
         errdefer string.deinit(self.arena.allocator());
 
-        var mark = self.lexer.bookmark();
         while (self.lexer.frameHead != null) {
-            const segment = self.expect(.string) catch {
+            const mark = self.lexer.bookmark();
+            self.lexer.skipWhitespace() catch {
                 self.lexer.restore(mark);
-                break;
             };
 
-            mark = self.lexer.bookmark();
+            const segment = self.expect(.string) catch {
+                if (self.dataListContinues(.string) catch false) {
+                    self.lexer.skipWhitespace() catch break;
+                    _ = self.expect(.newline) catch break;
+                    continue;
+                } else {
+                    self.lexer.restore(mark);
+                    break;
+                }
+            };
+
             try string.appendSlice(self.arena.allocator(), segment);
         }
 
@@ -616,10 +656,24 @@ pub const Parser = struct {
         var numbers = std.ArrayList(T).empty;
         errdefer numbers.deinit(self.arena.allocator());
 
-        var mark = self.lexer.bookmark();
         while (self.lexer.frameHead != null) {
-            mark = self.lexer.bookmark();
-            try numbers.append(self.arena.allocator(), try self.parseInteger(T));
+            const mark = self.lexer.bookmark();
+            self.lexer.skipWhitespace() catch {
+                self.lexer.restore(mark);
+            };
+
+            const x = self.parseInteger(T) catch {
+                if (self.dataListContinues(.number) catch false) {
+                    self.lexer.skipWhitespace() catch break;
+                    _ = self.expect(.newline) catch break;
+                    continue;
+                } else {
+                    self.lexer.restore(mark);
+                    break;
+                }
+            };
+
+            try numbers.append(self.arena.allocator(), x);
         }
 
         if (numbers.items.len == 0) {
@@ -716,10 +770,10 @@ test "parseImmediate constant" {
     var p = try makeParser("42");
     defer p.deinit();
 
-    const imm = try p.parseImmediate(i16);
+    const imm = try p.parseImmediate(u16);
 
     switch (imm) {
-        .static => |v| try std.testing.expectEqual(@as(i16, 42), v),
+        .static => |v| try std.testing.expectEqual(@as(u16, 42), v),
         else => try std.testing.expect(false),
     }
 }
@@ -728,7 +782,7 @@ test "parseImmediate symbol" {
     var p = try makeParser("loop");
     defer p.deinit();
 
-    const imm = try p.parseImmediate(i16);
+    const imm = try p.parseImmediate(u16);
 
     switch (imm) {
         .dynamic => |name|
@@ -807,7 +861,7 @@ test "parseStatement addi" {
 
             switch (i.imm) {
                 .static => |v|
-                    try std.testing.expectEqual(@as(i17, 123), v),
+                    try std.testing.expectEqual(@as(u17, 123), v),
                 else => try std.testing.expect(false),
             }
         },
@@ -853,7 +907,7 @@ test "parseStatement lw" {
 
             switch (l.imm) {
                 .static => |v|
-                    try std.testing.expectEqual(@as(i16, 16), v),
+                    try std.testing.expectEqual(@as(u16, 16), v),
                 else => try std.testing.expect(false),
             }
         },
