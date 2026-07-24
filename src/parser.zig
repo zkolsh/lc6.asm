@@ -134,8 +134,10 @@ pub const Parser = struct {
     }
 
     pub fn statementEnd(self: *Parser) ParseError!bool {
-        try self.lexer.skipWhitespace();
         const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        try self.lexer.skipWhitespace();
         const token = self.lexer.next() catch |err| switch (err) {
             lex.LexerError.UnexpectedEOF => return true,
             else => return err,
@@ -152,7 +154,16 @@ pub const Parser = struct {
     pub fn skipToStatementEnd(self: *Parser) ParseError!void {
         while (self.lexer.frameHead != null) {
             try self.lexer.skipWhitespace();
-            const token = try self.lexer.next();
+            const token = self.lexer.next() catch |err| switch (err) {
+                lex.LexerError.UnexpectedEOF => return err,
+                else => {
+                    if (self.lexer.frameHead) |head| {
+                        head.pos += 1;
+                    }
+
+                    continue;
+                },
+            };
 
             switch (token.kind) {
                 .newline, .semicolon => break,
@@ -194,7 +205,11 @@ pub const Parser = struct {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const signToken: Token = self.lexer.next() catch .{.kind = .string, .data = ""};
+        const signToken: Token = self.lexer.next() catch blk: {
+            self.lexer.restore(mark);
+            break :blk .{.kind = .string, .data = ""};
+        };
+
         var negative = false;
         switch (signToken.kind) {
             .plus => negative = false,
@@ -208,7 +223,7 @@ pub const Parser = struct {
             'b', 'B' => break :blk try self.parseRawInteger(T,  2, number[2..]),
             'o', 'O' => break :blk try self.parseRawInteger(T,  8, number[2..]),
             'x', 'X' => break :blk try self.parseRawInteger(T, 16, number[2..]),
-            else => break :blk try self.parseRawInteger(T, 10, number),
+            else     => break :blk try self.parseRawInteger(T, 10, number),
         };
 
         if (negative) {
@@ -222,12 +237,13 @@ pub const Parser = struct {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const token = try self.expectOneOf(.{.number, .identifier});
+        const token = try self.expectOneOf(.{.number, .identifier, .char, .minus, .plus});
         switch (token.kind) {
-            .number => {
+            .number, .minus, .plus => {
                 self.lexer.restore(mark);
                 return .{.static = try self.parseInteger(T)};
             },
+            .char => return .{.static = @intCast(token.data[0])},
             .identifier => return .{.dynamic = token.data},
             else => unreachable,
         }
@@ -259,13 +275,14 @@ pub const Parser = struct {
     }
 
     pub fn parseStatement(self: *Parser) ParseError!Statement {
-        const start = self.lexer.bookmark();
+        var start = self.lexer.bookmark();
         errdefer self.lexer.restore(start);
 
         var statement: Statement = undefined;
         statement.label = self.parseLabel() catch &[_]u8{};
 
         const token = try self.lexer.nextWord();
+        start = self.lexer.bookmark();
         switch (token.kind) {
             .identifier => {
                 const instr = try self.parseInstruction(token);
@@ -291,10 +308,7 @@ pub const Parser = struct {
                 }
             },
 
-            .newline => {
-                return try self.parseStatement();
-            },
-
+            .newline => unreachable,
             else => {
                 return ParseError.NoMatch;
             },
@@ -598,7 +612,7 @@ pub const Parser = struct {
         try self.lexer.skipWhitespace();
         switch (directive) {
             .asciiz  => return .{.asciiz = try self.parseString()},
-            .byte    => return .{.bytes = try self.parseIntegerList(u8)},
+            .byte    => return .{.bytes = try self.parseBytes()},
             .nascii  => return .{.asciiz = try self.parseString()},
             .pad     => return .{.padding = try self.parsePadding()},
             .ptr     => return .{.ptr = try self.parseSymbolLabel()},
@@ -608,40 +622,14 @@ pub const Parser = struct {
         }
     }
 
-    fn dataListContinues(self: *Parser, comptime kind: Token.Kind) ParseError!bool {
-        const mark = self.lexer.bookmark();
-        defer self.lexer.restore(mark);
-
-        try self.lexer.skipWhitespace();
-        const linebreak = try self.lexer.nextWord();
-        if (linebreak.kind == kind) return true;
-        if (linebreak.kind != .newline) return false;
-
-        const next = try self.lexer.nextWord();
-        return next.kind == kind;
-    }
-
     fn parseString(self: *Parser) ParseError![]const u8 {
         var string = std.ArrayList(u8).empty;
         errdefer string.deinit(self.arena.allocator());
 
         while (self.lexer.frameHead != null) {
-            const mark = self.lexer.bookmark();
-            self.lexer.skipWhitespace() catch {
-                self.lexer.restore(mark);
-            };
+            try self.lexer.skipWhitespace();
 
-            const segment = self.expect(.string) catch {
-                if (self.dataListContinues(.string) catch false) {
-                    self.lexer.skipWhitespace() catch break;
-                    _ = self.expect(.newline) catch break;
-                    continue;
-                } else {
-                    self.lexer.restore(mark);
-                    break;
-                }
-            };
-
+            const segment = self.expect(.string) catch break;
             try string.appendSlice(self.arena.allocator(), segment);
         }
 
@@ -658,19 +646,11 @@ pub const Parser = struct {
 
         while (self.lexer.frameHead != null) {
             const mark = self.lexer.bookmark();
-            self.lexer.skipWhitespace() catch {
-                self.lexer.restore(mark);
-            };
+            try self.lexer.skipWhitespace();
 
             const x = self.parseInteger(T) catch {
-                if (self.dataListContinues(.number) catch false) {
-                    self.lexer.skipWhitespace() catch break;
-                    _ = self.expect(.newline) catch break;
-                    continue;
-                } else {
-                    self.lexer.restore(mark);
-                    break;
-                }
+                self.lexer.restore(mark);
+                break;
             };
 
             try numbers.append(self.arena.allocator(), x);
@@ -683,7 +663,39 @@ pub const Parser = struct {
         }
     }
 
+    fn parseByte(self: *Parser) ParseError!u8 {
+        try self.lexer.skipWhitespace();
+        return self.parseInteger(u8)
+            catch (try self.expect(.char))[0];
+    }
+
+    fn parseBytes(self: *Parser) ParseError![]const u8 {
+        var bytes = std.ArrayList(u8).empty;
+        errdefer bytes.deinit(self.arena.allocator());
+
+        while (self.lexer.frameHead != null) {
+            const mark = self.lexer.bookmark();
+            try self.lexer.skipWhitespace();
+
+            const x = self.parseByte() catch {
+                self.lexer.restore(mark);
+                break;
+            };
+
+            try bytes.append(self.arena.allocator(), x);
+        }
+
+        if (bytes.items.len == 0) {
+            return ParseError.NoMatch;
+        } else {
+            return bytes.items;
+        }
+    }
+
     fn parsePaddingAlignment(self: *Parser) ParseError!usize {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
         _ = try self.expectWord(.lparen);
         const a = try self.parseInteger(usize);
         _ = try self.expect(.rparen);
@@ -692,13 +704,13 @@ pub const Parser = struct {
 
     fn parsePadding(self: *Parser) ParseError!Padding {
         const numbers = try self.parseIntegerList(usize);
+        const alignment = self.parsePaddingAlignment() catch 1;
 
         var padding: usize = 0;
         for (numbers) |x| {
             padding += x;
         }
 
-        const alignment = self.parsePaddingAlignment() catch 1;
         return .{
             .size = padding,
             .alignment = alignment,

@@ -679,9 +679,13 @@ pub const Tokenizer = struct {
                         macro.body = head.input[tokenStart..head.pos];
 
                         const gpr = try self.macros.getOrPut(macro.name);
-                        if (gpr.found_existing) return LexerError.MacroRedefined;
+                        if (gpr.found_existing) {
+                            gpr.value_ptr.deinit(self.allocator);
+                        }
+
                         gpr.value_ptr.* = macro;
 
+                        head = self.frameHead.?;
                         tokenStart = head.pos;
                         continue :state .start;
                     },
@@ -825,7 +829,10 @@ pub const Tokenizer = struct {
                         macro.body = head.input[tokenStart..tokenEnd];
 
                         const gpr = try self.macros.getOrPut(macro.name);
-                        if (gpr.found_existing) return LexerError.MacroRedefined;
+                        if (gpr.found_existing) {
+                            gpr.value_ptr.deinit(self.allocator);
+                        }
+
                         gpr.value_ptr.* = macro;
 
                         head = self.frameHead.?;
@@ -947,7 +954,6 @@ pub const Tokenizer = struct {
                         }
 
                         const gpr = try args.getOrPut(macro.args.items[argc]);
-                        if (gpr.found_existing) return LexerError.MacroRedefined;
                         gpr.value_ptr.* = argName.data;
 
                         continue :argparse .argsep;

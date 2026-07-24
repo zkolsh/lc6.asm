@@ -16,6 +16,7 @@ pub const Symbol = struct {
 pub const Relocation = struct {
     addr: usize,
     name: []const u8,
+    section: []const u8,
     kind: isa.RelocationMode,
     bookmark: Tokenizer.Bookmark,
 };
@@ -374,29 +375,41 @@ pub const Assembly = struct {
 
     pub fn patchStaticRelocations(self: *Assembly) void {
         var i: usize = 0;
-        while (i < self.relocations.items.len) : (i += 1) {
-            const r = self.relocations.items[i];
-            if (r.kind != isa.RelocationMode.pc16) continue;
+        while (i < self.relocations.items.len) {
+            const rel = self.relocations.items[i];
 
-            if (self.symbols.get(r.name)) |symbol| {
-                if (symbol.section != isa.Section.text) continue;
-
-                const pc = r.addr;
-                const target = symbol.offset;
-
-                const delta = @as(i32, @intCast(target)) - @as(i32, @intCast(pc + 4));
-                const imm = @as(i16, @truncate(delta >> 2));
-
-                var view: u32 = undefined;
-                std.mem.copyForwards(u8, std.mem.asBytes(&view), self.text.items[pc .. pc + 4]);
-                
-                view &= 0xFFFF0000;
-                view |= @as(u16, @bitCast(imm));
-                
-                std.mem.copyForwards(u8, self.text.items[pc .. pc + 4], std.mem.asBytes(&view));
-                self.allocator.free(r.name);
-                _ = self.relocations.swapRemove(i);
+            if (rel.kind != .pc16) {
+                i += 1;
+                continue;
             }
+
+            const symbol = self.symbols.get(rel.name) orelse {
+                i += 1;
+                continue;
+            };
+
+            if (!std.mem.eql(u8, rel.section, symbol.segment)) {
+                i += 1;
+                continue;
+            }
+
+            const segment = self.segments.getPtr(rel.section).?;
+
+            const pc = rel.addr;
+            const target = symbol.offset;
+
+            const delta = @as(i32, @intCast(target)) - @as(i32, @intCast(pc + 4));
+            const imm = @as(i16, @truncate(delta >> 2));
+
+            var word: u32 = undefined;
+            std.mem.copyForwards(u8, std.mem.asBytes(&word), segment.items[pc..][0..4]);
+
+            word &= 0xFFFF0000;
+            word |= @as(u16, @bitCast(imm));
+            std.mem.copyForwards(u8, segment.items[pc..][0..4], std.mem.asBytes(&word));
+
+            self.allocator.free(rel.name);
+            _ = self.relocations.swapRemove(i);
         }
     }
 
@@ -558,11 +571,11 @@ test "arbitrary sections" {
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
-        \\.section alpha
+        \\.section "alpha"
         \\.byte 1
-        \\.section beta
+        \\.section "beta"
         \\.byte 2
-        \\.section alpha
+        \\.section "alpha"
         \\.byte 3
     , "<test>");
 
