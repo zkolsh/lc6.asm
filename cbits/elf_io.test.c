@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#if !defined(AS_TELNET_CMDS)
 void vram_to_s_cmd(const uint8_t* desc_mem, const size_t size) {
 	printf("Hex View  00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F\n");
 
@@ -45,6 +46,17 @@ void vram_to_s_cmd(const uint8_t* desc_mem, const size_t size) {
 
 	printf("\n");
 };
+#else
+void vram_to_s_cmd(const uint8_t* desc_mem, const size_t size) {
+	for (size_t i = 0; i < size; i += 4) {
+		const uint32_t word = ((i + 0 < size) ? ((uint32_t)desc_mem[i + 0] <<  0) : 0)
+		                    | ((i + 1 < size) ? ((uint32_t)desc_mem[i + 1] <<  8) : 0)
+		                    | ((i + 2 < size) ? ((uint32_t)desc_mem[i + 2] << 16) : 0)
+		                    | ((i + 3 < size) ? ((uint32_t)desc_mem[i + 3] << 24) : 0);
+		printf("s [0x%08X] 0x%08X\n", (uint32_t)i, word);
+	};
+};
+#endif
 
 static uint8_t* map_file(const char* filepath, size_t* out_size) {
 	int fd = open(filepath, O_RDONLY);
@@ -124,9 +136,6 @@ int main(int argc, char** argv) {
 		return EXIT_FAILURE;
 	};
 
-	const uint32_t text_vaddr = (0 + (layout.text_align - 1)) & ~(layout.text_align - 1);
-	const uint32_t data_vaddr = (text_vaddr + layout.text_size + (layout.data_align - 1)) & ~(layout.data_align - 1);
-
 	status = elf_merge(ram, layout.total_memory_needed, &layout, elves, views);
 	if (status != ELF_SUCCESS) {
 		fprintf(stderr, "unable to merge views into segment space: %d\n", status);
@@ -134,28 +143,62 @@ int main(int argc, char** argv) {
 		return EXIT_FAILURE;
 	};
 
+	ElfSectionAddress section_addresses[ELFIO_MAX_LAYOUT_SECTIONS];
+	for (size_t i = 0; i < layout.section_count; i++) {
+		section_addresses[i].section_name = layout.sections[i].name;
+		section_addresses[i].base_vaddr = (uint32_t)layout.sections[i].base_vaddr;
+	};
+
 	for (size_t i = 0; i < views; i++) {
 		if (elves[i].header->e_type != ET_REL) {
 			continue;
 		};
 
-		elf_view_patch_relocations(&elves[i], ram, layout.total_memory_needed, ".text", text_vaddr, data_vaddr);
-		elf_view_patch_relocations(&elves[i], ram, layout.total_memory_needed, ".data", text_vaddr, data_vaddr);
+		for (size_t s = 0; s < layout.section_count; s++) {
+			const char* sec_name = layout.sections[s].name;
+			uint32_t base_vaddr = (uint32_t)layout.sections[s].base_vaddr;
+			uint32_t size = (uint32_t)layout.sections[s].size;
+
+			if (size == 0) continue;
+
+			status = elf_view_patch_relocations(&elves[i], ram + base_vaddr,
+				size, sec_name, section_addresses, layout.section_count);
+
+			if (status != ELF_SUCCESS) {
+				fprintf(stderr, "failed to patch relocations for section %s: %s (%d)\n", 
+					sec_name, elf_status_str(status), status);
+				free(ram);
+				return EXIT_FAILURE;
+			};
+		};
 	};
 
 	vram_to_s_cmd(ram, layout.total_memory_needed);
 
-	const uint32_t text_end = text_vaddr + layout.text_size;
-	const uint32_t data_end = data_vaddr + layout.data_size;
+#if !defined(AS_TELNET_CMDS)
+	for (size_t i = 0; i < layout.section_count; i++) {
+		uint32_t vaddr = (uint32_t)layout.sections[i].base_vaddr;
+		uint32_t end_vaddr = vaddr + (uint32_t)layout.sections[i].size;
+		printf("%s segment mapping:  0x%08X -> 0x%08X (%zu bytes)\n", 
+			layout.sections[i].name, vaddr, end_vaddr, layout.sections[i].size);
+	};
+#endif
 
 	uint32_t global_entry = elves[0].header->e_entry;
 	if (elves[0].header->e_type == ET_REL) {
-		global_entry += text_vaddr;
+		for (size_t i = 0; i < layout.section_count; i++) {
+			if (strcmp(layout.sections[i].name, ".text") == 0) {
+				global_entry += (uint32_t)layout.sections[i].base_vaddr;
+				break;
+			};
+		};
 	};
 
-	printf(".text segment mapping:  0x%08X -> 0x%08X (%zu bytes)\n", text_vaddr, text_end, layout.text_size);
-	printf(".data segment mapping:  0x%08X -> 0x%08X (%zu bytes)\n", data_vaddr, data_end, layout.data_size);
+#if !defined(AS_TELNET_CMDS)
 	printf("entry point is 0x%08X\n", global_entry);
+#else
+	printf("s PC 0x%08X\n", global_entry);
+#endif
 
 	free(ram);
 	for (size_t i = 0; i < views; i++) {

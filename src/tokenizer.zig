@@ -104,20 +104,33 @@ pub const Tokenizer = struct {
 
     pub const Bookmark = struct {
         frame: ?*Frame,
-        pos: usize,
+        pos: [8]usize,
     };
 
     pub fn bookmark(self: *Tokenizer) Bookmark {
-        return .{
+        var b = Bookmark{
             .frame = self.frameHead,
-            .pos = if (self.frameHead) |h| h.pos else 0,
+            .pos = [_]usize{0} ** 8
         };
+
+        var it = self.frameHead;
+        var i: usize = 0;
+        while (it) |f| : (it = f.next) {
+            if (i < b.pos.len) b.pos[i] = f.pos;
+            i += 1;
+        }
+
+        return b;
     }
 
     pub fn restore(self: *Tokenizer, mark: Bookmark) void {
         self.frameHead = mark.frame;
-        if (self.frameHead) |head| {
-            head.pos = mark.pos;
+
+        var it = self.frameHead;
+        var i: usize = 0;
+        while (it) |f| : (it = f.next) {
+            if (i < mark.pos.len) f.pos = mark.pos[i];
+            i += 1;
         }
     }
 
@@ -648,45 +661,54 @@ pub const Tokenizer = struct {
             },
 
             .pp_directive => {
+                const directiveStart = head.pos - 1;
+
                 tokenStart = head.pos;
                 while (head.pos < head.input.len and std.ascii.isAlphanumeric(head.input[head.pos]))
                     : (head.pos += 1) {}
 
                 const directive = std.meta.stringToEnum(isa.PreprocessorDirective, head.input[tokenStart..head.pos])
-                    orelse {
-                        head.pos = tokenStart;
-                        return LexerError.InvalidPreprocessorDirective;
-                    };
+                    orelse return LexerError.InvalidPreprocessorDirective;
 
                 while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
                     : (head.pos += 1) {}
 
                 switch (directive) {
                     .define => {
-                        const name = try self.nextWord();
-                        if (name.kind != .identifier) return LexerError.ExpectedIdentifier;
+                        tokenStart = head.pos;
+                        while (head.pos < head.input.len and std.ascii.isAlphanumeric(head.input[head.pos]))
+                            : (head.pos += 1) {}
+
+                        const name = head.input[tokenStart..head.pos];
 
                         while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
                             : (head.pos += 1) {}
                         
                         tokenStart = head.pos;
 
-                        while (head.pos < head.input.len and (head.input[head.pos] == '\n'))
+                        while (head.pos < head.input.len and (head.input[head.pos] != '\n'))
                             : (head.pos += 1) {}
 
                         var macro = Macro.init(head.filename);
-                        macro.name = name.data;
+                        macro.name = name;
                         macro.body = head.input[tokenStart..head.pos];
 
                         const gpr = try self.macros.getOrPut(macro.name);
                         if (gpr.found_existing) {
-                            gpr.value_ptr.deinit(self.allocator);
+                            return LexerError.MacroRedefined;
+                            //gpr.value_ptr.deinit(self.allocator);
                         }
 
                         gpr.value_ptr.* = macro;
 
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
+                        const newInput = try self.stringArena.allocator().dupe(u8, head.input);
+                        for (newInput[directiveStart..head.pos]) |*c| {
+                            if (c.* != '\n' and c.* != '\r') c.* = ' ';
+                        }
+
+                        head.input = newInput;
+                        head.pos = directiveStart;
+
                         continue :state .start;
                     },
 
@@ -815,7 +837,7 @@ pub const Tokenizer = struct {
                                 },
 
                                 else => {
-                                    if (lastError.frame == self.frameHead and lastError.pos == self.frameHead.?.pos) {
+                                    if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
                                         self.frameHead.?.pos += 1;
                                     }
 
@@ -830,13 +852,19 @@ pub const Tokenizer = struct {
 
                         const gpr = try self.macros.getOrPut(macro.name);
                         if (gpr.found_existing) {
-                            gpr.value_ptr.deinit(self.allocator);
+                            return LexerError.MacroRedefined;
+                            //gpr.value_ptr.deinit(self.allocator);
                         }
 
                         gpr.value_ptr.* = macro;
 
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
+                        const newInput = try self.stringArena.allocator().dupe(u8, head.input);
+                        for (newInput[directiveStart..head.pos]) |*c| {
+                            if (c.* != '\n' and c.* != '\r') c.* = ' ';
+                        }
+
+                        head.input = newInput;
+                        head.pos = directiveStart;
 
                         continue :state .start;
                     },
@@ -889,7 +917,7 @@ pub const Tokenizer = struct {
                                 },
 
                                 else => {
-                                    if (lastError.frame == self.frameHead and lastError.pos == self.frameHead.?.pos) {
+                                    if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
                                         self.frameHead.?.pos += 1;
                                     }
 
@@ -1023,7 +1051,7 @@ pub const Tokenizer = struct {
                         LexerError.UnexpectedEOF => break :subst,
 
                         else => {
-                            if (lastError.frame == self.frameHead and lastError.pos == self.frameHead.?.pos) {
+                            if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
                                 self.frameHead.?.pos += 1;
                             }
 

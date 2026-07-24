@@ -106,8 +106,8 @@ pub const InstructionName = enum {
         return switch (self) {
             .rtype => .{.op = 0b00000, .high = false, .reltype = .rtype},
             .addi  => .{.op = 0b00001, .high = false, .reltype = .lo16},
-            .j     => .{.op = 0b00010, .high = false, .reltype = .lo16},
-            .jal   => .{.op = 0b00011, .high = false, .reltype = .lo16},
+            .j     => .{.op = 0b00010, .high = false, .reltype = .tail27},
+            .jal   => .{.op = 0b00011, .high = false, .reltype = .tail27},
             .andi  => .{.op = 0b00100, .high = false, .reltype = .lo16},
             .andih => .{.op = 0b00100, .high = true,  .reltype = .hi16},
             .ori   => .{.op = 0b00101, .high = false, .reltype = .lo16},

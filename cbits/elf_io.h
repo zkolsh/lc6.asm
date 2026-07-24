@@ -1,4 +1,5 @@
-#pragma once
+#if !defined(ELFIO_H)
+#define ELFIO_H
 // References:
 // [1]: https://refspecs.linuxfoundation.org/elf/elf.pdf
 // [2]: https://gabi.xinuos.com/elf/a-emachine.html
@@ -121,6 +122,7 @@ typedef struct {
 	uint32_t size;
 	ElfShType type;
 	ElfShFlags flags;
+	uint32_t vaddr;
 	uint32_t addralign;
 	uint32_t link;
 	uint32_t info;
@@ -170,20 +172,35 @@ enum {
 	R_RTM32_WORD   = 6,
 };
 
+typedef struct {
+	const char* section_name;
+	uint32_t base_vaddr;
+} ElfSectionAddress;
+
 #define ELF32_R_SYM(i)   ((i) >> 8)
 #define ELF32_R_TYPE(i)  ((uint8_t)(i))
 #define ELF32_R_INFO(s, t) (((s) << 8) + (uint8_t)(t))
 
 ElfStatus elf_view_patch_relocations(
 		const ElfView* view, uint8_t* section_data, size_t section_data_size,
-		const char* section_name, uint32_t text_base_vaddr, uint32_t data_base_vaddr);
+		const char* section_name, const ElfSectionAddress* layout, size_t layout_count);
+
+#if !defined(ELFIO_MAX_LAYOUT_SECTIONS)
+#define ELFIO_MAX_LAYOUT_SECTIONS 64
+#endif
 
 typedef struct {
-	size_t text_size;
-	size_t text_align;
-	size_t data_size;
-	size_t data_align;
-	size_t total_memory_needed; 
+	char name[32];
+	size_t size;
+	size_t alignment;
+	size_t base_vaddr;
+} ElfLayoutSection;
+
+typedef struct {
+    ElfLayoutSection sections[ELFIO_MAX_LAYOUT_SECTIONS];
+    size_t section_count;
+
+    size_t total_memory_needed;
 } ElfLayoutMap;
 
 ElfStatus elf_merge_calculate_layout(ElfLayoutMap* out_layout, const ElfView* views, size_t view_count);
@@ -191,3 +208,5 @@ ElfStatus elf_merge_calculate_layout(ElfLayoutMap* out_layout, const ElfView* vi
 ElfStatus elf_merge(
 		uint8_t* dest_memory, size_t dest_capacity,
 		const ElfLayoutMap* layout, const ElfView* views, size_t view_count);
+
+#endif // ELFIO_H

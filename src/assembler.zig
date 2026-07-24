@@ -144,6 +144,7 @@ pub const Assembly = struct {
                 try self.relocations.append(self.allocator, .{
                     .addr = labelLoc,
                     .name = label,
+                    .section = self.currentSegmentName,
                     .kind = .word,
                     .bookmark = bookmark,
                 });
@@ -161,6 +162,7 @@ pub const Assembly = struct {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = label,
+                            .section = self.currentSegmentName,
                             .kind = .rtype,
                             .bookmark = bookmark,
                         });
@@ -191,6 +193,7 @@ pub const Assembly = struct {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = label,
+                            .section = self.currentSegmentName,
                             .kind = info.reltype,
                             .bookmark = bookmark,
                         });
@@ -220,6 +223,7 @@ pub const Assembly = struct {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = label,
+                            .section = self.currentSegmentName,
                             .kind = info.reltype,
                             .bookmark = bookmark,
                         });
@@ -250,6 +254,7 @@ pub const Assembly = struct {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = label,
+                            .section = self.currentSegmentName,
                             .kind = info.reltype,
                             .bookmark = bookmark,
                         });
@@ -334,6 +339,9 @@ pub const Assembly = struct {
             const mark = parser.lexer.bookmark();
             
             const statement = parser.parseStatement() catch |err| {
+                if (err == parsing.ParseError.UnexpectedEOF) break;
+                if (parser.lexer.frameHead == null) break;
+
                 parser.lexer.showErrorHere(err);
                 try parser.skipToStatementEnd();
                 continue;
@@ -362,8 +370,11 @@ pub const Assembly = struct {
 
         while (parser.lexer.frameHead != null) {
             const mark = parser.lexer.bookmark();
-            
+
             const statement = parser.parseStatement() catch |err| {
+                if (err == parsing.ParseError.UnexpectedEOF) break;
+                if (parser.lexer.frameHead == null) break;
+
                 parser.lexer.showErrorHere(err);
                 try parser.skipToStatementEnd();
                 continue;
@@ -414,50 +425,92 @@ pub const Assembly = struct {
     }
 
     pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8 {
-        var strtab = try std.ArrayList(u8).initCapacity(self.allocator, 1);
-        defer strtab.deinit(self.allocator);
-        try strtab.append(self.allocator, 0);
-
-        var stringOffsets = std.StringHashMap(u32).init(self.allocator);
-        defer stringOffsets.deinit();
+        var strtab = try std.ArrayList(u8).initCapacity(self.strings.allocator(), 1);
+        defer strtab.deinit(self.strings.allocator());
+        try strtab.append(self.strings.allocator(), 0);
 
         var symtab = try std.ArrayList(c.ElfSym).initCapacity(self.allocator, 1);
         defer symtab.deinit(self.allocator);
         try symtab.append(self.allocator, std.mem.zeroes(c.ElfSym));
 
-        var symbols = self.symbols.iterator();
-        while (symbols.next()) |entry| {
-            const name = entry.key_ptr.*;
-            const value = entry.value_ptr.*;
+        var symbolIndices = std.StringHashMap(u32).init(self.allocator);
+        defer symbolIndices.deinit();
 
-            const offset = @as(u32, @intCast(strtab.items.len));
-            try strtab.appendSlice(self.allocator, name);
-            try strtab.append(self.allocator, 0);
-            try stringOffsets.put(name, offset);
+        var sectionIndices = std.StringHashMap(u16).init(self.allocator);
+        defer sectionIndices.deinit();
 
-            try symtab.append(self.allocator, .{
-                .st_name = offset,
-                .st_value = @as(u32, @intCast(value.offset)),
-                .st_size = 0,
-                .st_info = 0,
-                .st_other = 0,
-                .st_shndx = if (value.section == .text) 1 else 2,
+        var sections = try std.ArrayList(c.ElfRawSection).initCapacity(self.allocator, 8);
+        defer sections.deinit(self.allocator);
+
+        var segit = self.segments.iterator();
+        var nextSectionIndex: u16 = 1;
+        while (segit.next()) |entry| {
+            const name = try self.strings.allocator().dupeZ(u8, entry.key_ptr.*);
+            const seg = entry.value_ptr.*;
+
+            try sectionIndices.put(entry.key_ptr.*, nextSectionIndex);
+            nextSectionIndex += 1;
+
+            const flags: c.ElfShFlags =
+                if (std.mem.eql(u8, name, ".text"))
+                    c.SHF_ALLOC | c.SHF_EXECINSTR
+                else if (std.mem.eql(u8, name, ".data"))
+                    c.SHF_ALLOC | c.SHF_WRITE
+                else if (std.mem.eql(u8, name, ".rodata"))
+                    c.SHF_ALLOC
+                else
+                    c.SHF_NONE;
+
+            try sections.append(self.allocator, .{
+                .name = name.ptr,
+                .data = seg.items.ptr,
+                .size = @intCast(seg.items.len),
+                .type = c.SHT_PROGBITS,
+                .flags = flags,
+                .addralign = 4,
+                .link = 0,
+                .info = 0,
+                .entsize = 0
             });
         }
 
-        var relText = try std.ArrayList(c.ElfRel).initCapacity(self.allocator, self.relocations.items.len);
-        defer relText.deinit(self.allocator);
+        var syms = self.symbols.iterator();
+        while (syms.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const sym = entry.value_ptr.*;
+
+            const stringOff: u32 = @intCast(strtab.items.len);
+
+            try strtab.appendSlice(self.allocator, name);
+            try strtab.append(self.allocator, 0);
+
+            const index: u32 = @intCast(symtab.items.len);
+            try symbolIndices.put(name, index);
+
+            try symtab.append(self.allocator, .{
+                .st_name = stringOff,
+                .st_value = @intCast(sym.offset),
+                .st_size = 0,
+                .st_info = 0,
+                .st_other = 0,
+                .st_shndx = sectionIndices.get(sym.segment).?
+            });
+        }
+
+        var relocsBySection = std.StringHashMap(std.ArrayList(c.ElfRel)).init(self.allocator);
+        defer {
+            var it = relocsBySection.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
+
+            relocsBySection.deinit();
+        }
 
         for (self.relocations.items) |rel| {
-            var symbolIndex: u32 = 0;
-            for (symtab.items, 0..) |sym, i| {
-                if (i == 0) continue;
-
-                const tabName = std.mem.sliceTo(strtab.items[sym.st_name..], 0);
-                if (std.mem.eql(u8, tabName, rel.name)) {
-                    symbolIndex = @as(u32, @intCast(i));
-                    break;
-                }
+            const gpr = try relocsBySection.getOrPut(rel.section);
+            if (!gpr.found_existing) {
+                gpr.value_ptr.* = std.ArrayList(c.ElfRel).empty;
             }
 
             const relType = switch (rel.kind) {
@@ -469,80 +522,82 @@ pub const Assembly = struct {
                 .word => c.R_RTM32_WORD,
             };
 
-            try relText.append(self.allocator, .{
-                .r_offset = @as(u32, @intCast(rel.addr)),
-                .r_info = (@as(u32, symbolIndex) << 8) | @as(u32, @intCast(relType)),
+            try gpr.value_ptr.append(self.allocator, .{
+                .r_offset = @intCast(rel.addr),
+                .r_info = c.ELF32_R_INFO(
+                    symbolIndices.get(rel.name).?,
+                    relType
+                )
             });
         }
 
-        const sections = [_]c.ElfRawSection{
-            .{
-                .name = ".text",
-                .data = self.text.items.ptr,
-                .size = @as(u32, @intCast(self.text.items.len)),
-                .type = c.SHT_PROGBITS,
-                .flags = c.SHF_ALLOC | c.SHF_EXECINSTR,
-                .addralign = 4,
-                .link = 0,
-                .info = 0,
-                .entsize = 0,
-            },
-            .{
-                .name = ".data",
-                .data = self.data.items.ptr,
-                .size = @as(u32, @intCast(self.data.items.len)),
-                .type = c.SHT_PROGBITS,
-                .flags = c.SHF_ALLOC | c.SHF_WRITE,
-                .addralign = 4,
-                .link = 0,
-                .info = 0,
-                .entsize = 0,
-            },
-            .{
-                .name = ".strtab",
-                .data = strtab.items.ptr,
-                .size = @as(u32, @intCast(strtab.items.len)),
-                .type = c.SHT_STRTAB,
-                .flags = c.SHF_NONE,
-                .addralign = 1,
-                .link = 0,
-                .info = 0,
-                .entsize = 0,
-            },
-            .{
-                .name = ".symtab",
-                .data = @ptrCast(symtab.items.ptr),
-                .size = @as(u32, @intCast(symtab.items.len * @sizeOf(c.ElfSym))),
-                .type = c.SHT_SYMTAB,
-                .flags = c.SHF_NONE,
-                .addralign = 4,
-                .link = 3,
-                .info = 0,
-                .entsize = @sizeOf(c.ElfSym),
-            },
-            .{
-                .name = ".rel.text",
-                .data = @ptrCast(relText.items.ptr),
-                .size = @as(u32, @intCast(relText.items.len * @sizeOf(c.ElfRel))),
+        const strtabIndex: u16 = nextSectionIndex;
+        nextSectionIndex += 1;
+
+        try sections.append(self.allocator, .{
+            .name = ".strtab",
+            .data = strtab.items.ptr,
+            .size = @intCast(strtab.items.len),
+            .type = c.SHT_STRTAB,
+            .flags = c.SHF_NONE,
+            .addralign = 1,
+            .link = 0,
+            .info = 0,
+            .entsize = 0
+        });
+
+        const symtabIndex: u16 = nextSectionIndex;
+        nextSectionIndex += 1;
+
+        try sections.append(self.allocator, .{
+            .name = ".symtab",
+            .data = @ptrCast(symtab.items.ptr),
+            .size = @intCast(symtab.items.len * @sizeOf(c.ElfSym)),
+            .type = c.SHT_SYMTAB,
+            .flags = c.SHF_NONE,
+            .addralign = 4,
+            .link = strtabIndex,
+            .info = 0,
+            .entsize = @sizeOf(c.ElfSym)
+        });
+
+        var relit = relocsBySection.iterator();
+        while (relit.next()) |entry| {
+            const secname = entry.key_ptr.*;
+            const rels = entry.value_ptr.*;
+
+            const relname = try std.fmt.allocPrint(self.strings.allocator(), ".rel{s}", .{secname});
+            try sections.append(self.allocator, .{
+                .name = relname.ptr,
+                .data = @ptrCast(rels.items.ptr),
+                .size = @intCast(rels.items.len * @sizeOf(c.ElfRel)),
                 .type = c.SHT_REL,
                 .flags = c.SHF_NONE,
                 .addralign = 4,
-                .link = 4,
-                .info = 1,
-                .entsize = @sizeOf(c.ElfRel),
-            },
-        };
-
-        const size = c.elf_writer_calculate_size(&sections, sections.len);
-        const blob = try self.allocator.alloc(u8, size);
-
-        const status =  c.elf_writer_serialize(blob.ptr, blob.len, elfType, entryPoint, &sections, sections.len);
-        if (status != c.ELF_SUCCESS) {
-            self.allocator.free(blob);
-            return AssemblyError.SerializationFailed;
+                .link = symtabIndex,
+                .info = sectionIndices.get(secname).?,
+                .entsize = @sizeOf(c.ElfRel)
+            });
         }
 
-        return blob;
+        const size = c.elf_writer_calculate_size(sections.items.ptr, sections.items.len);
+        const blob = try self.allocator.alloc(u8, size);
+        errdefer self.allocator.free(blob);
+
+        const status = c.elf_writer_serialize(
+            blob.ptr,
+            blob.len,
+            elfType,
+            entryPoint,
+            sections.items.ptr,
+            sections.items.len,
+        );
+
+        if (status != c.ELF_SUCCESS) {
+            return AssemblyError.SerializationFailed;
+        } else {
+            return blob;
+        }
     }
 
     pub fn writeElf(self: *Assembly, io: std.Io, filepath: []const u8, elfType: c.ElfType, entryPoint: u32) !void {

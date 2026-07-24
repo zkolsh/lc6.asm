@@ -1,4 +1,5 @@
 #include "elf_io.h" // references defined here
+#define DEBUG
 
 #include <string.h>
 
@@ -143,8 +144,9 @@ ElfStatus elf_writer_serialize(
 	uint32_t string_indices[32] = {0};
 	for (size_t i = 0; i < count; i++) {
 		string_indices[i] = (uint32_t)(str_ptr - &dest_buffer[shstrtab_file_offset]);
-		strcat((char*)str_ptr, sections[i].name);
-		str_ptr += 1 + strlen(sections[i].name);
+		size_t len = strlen(sections[i].name);
+		memcpy(str_ptr, sections[i].name, len + 1);
+		str_ptr += len + 1;
 	};
 
 	const uint32_t shstrtab_name_index = (uint32_t)(str_ptr - &dest_buffer[shstrtab_file_offset]);
@@ -164,7 +166,7 @@ ElfStatus elf_writer_serialize(
 			.sh_name      = string_indices[i],
 			.sh_type      = sections[i].type,
 			.sh_flags     = sections[i].flags,
-			.sh_addr      = 0,
+			.sh_addr      = sections[i].vaddr,
 			.sh_offset    = file_offsets[i],
 			.sh_size      = sections[i].size,
 			.sh_link      = sections[i].link,
@@ -346,7 +348,7 @@ const uint8_t* elf_view_get_section(const ElfView* view, const char* name, uint3
 
 ElfStatus elf_view_patch_relocations(
 		const ElfView* view, uint8_t* section_data, size_t section_data_size,
-		const char* section_name, uint32_t text_base_vaddr, uint32_t data_base_vaddr) {
+		const char* section_name, const ElfSectionAddress* layout, size_t layout_count) {
 	if (!view || !section_data) return ELF_MISSING_PARAMS;
 
 	char relsection_name[40] = ".rel";
@@ -357,6 +359,20 @@ ElfStatus elf_view_patch_relocations(
 	if (!rel_bytes || rel_size == 0) {
 		/* no relocations to patch. */
 		return ELF_SUCCESS; 
+	};
+
+	uint32_t current_sec_vaddr = 0;
+	uint8_t current_vaddr_found = 0;
+	for (size_t j = 0; j < layout_count; j++) {
+		if (strcmp(layout[j].section_name, section_name) == 0) {
+			current_sec_vaddr = layout[j].base_vaddr;
+			current_vaddr_found = 1;
+			break;
+		};
+	};
+
+	if (!current_vaddr_found) {
+		return ELF_INVALID_RELOCATION;
 	};
 
 	const ElfSHDR* symtab_shdr = elf_view_get_section_header(view, ".symtab");
@@ -383,16 +399,22 @@ ElfStatus elf_view_patch_relocations(
 		const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
 		const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
 
+		uint8_t base_vaddr_found = 0;
 		uint32_t base_vaddr = 0;
-		if (strcmp(sym_sec_name, ".text") == 0) {
-			base_vaddr = text_base_vaddr;
-		} else if (strcmp(sym_sec_name, ".data") == 0) {
-			base_vaddr = data_base_vaddr;
-		} else {
+
+		for (size_t j = 0; j < layout_count; j++) {
+			if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+				base_vaddr = layout[j].base_vaddr;
+				base_vaddr_found = 1;
+				break;
+			};
+		};
+
+		if (!base_vaddr_found) {
 #if defined(DEBUG)
-			fprintf(stderr, "[elf]: WARNING: relocations on section %s is unsupported.\n", sym_sec_name);
+			fprintf(stderr, "base vaddress was not found.\n");
 #endif
-			continue;
+			return ELF_INVALID_RELOCATION;
 		};
 
 		const uint32_t absolute_addr = base_vaddr + sym.st_value;
@@ -422,8 +444,7 @@ ElfStatus elf_view_patch_relocations(
 		};
 
 		case R_RTM32_PC16: {
-			uint32_t patched_vaddr = (strcmp(section_name, ".text") == 0)? text_base_vaddr : data_base_vaddr;
-			uint32_t ci_vaddr = patched_vaddr + rel.r_offset;
+			uint32_t ci_vaddr = current_sec_vaddr + rel.r_offset;
 			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
 			uint32_t imm16 = (uint32_t)(offset >> 2) & 0xFFFF;
 			instruction &= ~0xFFFF;
@@ -444,6 +465,9 @@ ElfStatus elf_view_patch_relocations(
 		};
 
 		default:
+#if defined(DEBUG)
+			fprintf(stderr, "relocation was type %zu\n", (size_t)reloc_type);
+#endif
 			return ELF_INVALID_RELOCATION;
 		};
 
@@ -454,81 +478,92 @@ ElfStatus elf_view_patch_relocations(
 };
 
 ElfStatus elf_merge_calculate_layout(ElfLayoutMap* out_layout, const ElfView* views, size_t view_count) {
-	if (!out_layout || !views || view_count == 0) return ELF_MISSING_PARAMS;
-	out_layout->text_size = out_layout->data_size = 0;
-	out_layout->text_align = out_layout->data_align = 1;
+	if (!out_layout || !views || view_count == 0) {
+		return ELF_MISSING_PARAMS;
+	};
 
+	memset(out_layout, 0, sizeof(*out_layout));
 	for (size_t v = 0; v < view_count; v++) {
 		const ElfView* view = &views[v];
 
 		for (size_t s = 1; s < view->section_count; s++) {
 			const ElfSHDR* shdr = &view->section_headers[s];
-			const char* name = view->shstrtab + shdr->sh_name;
 
-			if (strcmp(name, ".text") == 0) {
-				uint32_t align = shdr->sh_addralign ? shdr->sh_addralign : 1;
-				if (align > out_layout->text_align) out_layout->text_align = align;
-				out_layout->text_size = (out_layout->text_size + (align - 1)) & ~(align - 1);
-				out_layout->text_size += shdr->sh_size;
-			} else if (strcmp(name, ".data") == 0) {
-				uint32_t align = shdr->sh_addralign ? shdr->sh_addralign : 1;
-				if (align > out_layout->data_align) out_layout->data_align = align;
-				out_layout->data_size = (out_layout->data_size + (align - 1)) & ~(align - 1);
-				out_layout->data_size += shdr->sh_size;
-#if defined(DEBUG)
-			} else {
-				fprintf(stderr, "[elf]: WARNING: not merging section %s\n", name);
-#endif
+			if (!(shdr->sh_flags & SHF_ALLOC)) {
+				continue;
 			};
-		}
-	}
 
-	uint32_t total = 0;
-	total = (total + (out_layout->text_align - 1)) & ~(out_layout->text_align - 1);
-	total += out_layout->text_size;
-	total = (total + (out_layout->data_align - 1)) & ~(out_layout->data_align - 1);
-	total += out_layout->data_size;
-	out_layout->total_memory_needed = total;
+			const char* name = view->shstrtab + shdr->sh_name;
+			size_t slot = SIZE_MAX;
+			for (size_t i = 0; i < out_layout->section_count; ++i) {
+				if (strcmp(out_layout->sections[i].name, name) == 0) {
+					slot = i;
+					break;
+				};
+			};
+
+			if (slot == SIZE_MAX) {
+				if (out_layout->section_count >= ELFIO_MAX_LAYOUT_SECTIONS) {
+					return ELF_BUFFER_TOO_SMALL;
+				};
+
+				slot = out_layout->section_count++;
+				memset(&out_layout->sections[slot], 0, sizeof(out_layout->sections[slot]));
+				strncpy(out_layout->sections[slot].name, name, sizeof(out_layout->sections[slot].name) - 1);
+				out_layout->sections[slot].alignment = 1;
+			};
+
+			size_t align = shdr->sh_addralign ? shdr->sh_addralign : 1;
+			if (align > out_layout->sections[slot].alignment) {
+				out_layout->sections[slot].alignment = align;
+			};
+
+			out_layout->sections[slot].size = (out_layout->sections[slot].size + align - 1) & ~(align - 1);
+			out_layout->sections[slot].size += shdr->sh_size;
+		};
+	};
+
+	size_t current = 0;
+	for (size_t i = 0; i < out_layout->section_count; ++i) {
+		size_t align = out_layout->sections[i].alignment;
+		current = (current + align - 1) & ~(align - 1);
+		out_layout->sections[i].base_vaddr = current;
+		current += out_layout->sections[i].size;
+	};
+
+	out_layout->total_memory_needed = current;
 	return ELF_SUCCESS;
 };
 
 ElfStatus elf_merge(
-		uint8_t* dest_memory, size_t dest_capacity,
-		const ElfLayoutMap* layout, const ElfView* views, size_t view_count) {
-	if (!dest_memory || !layout || !views || view_count == 0) return ELF_MISSING_PARAMS;
-	if (dest_capacity < layout->total_memory_needed) return ELF_BUFFER_TOO_SMALL;
+		uint8_t* dest, size_t capacity, const ElfLayoutMap* layout,
+		const ElfView* views, size_t view_count) {
+	if (!dest || !layout || !views) {
+		return ELF_MISSING_PARAMS;
+	};
 
-	uint32_t current_offset = 0;
-	const uint32_t text_start = (current_offset + (layout->text_align - 1)) & ~(layout->text_align - 1);
-	uint32_t text_ptr = text_start;
-	current_offset = text_start + layout->text_size;
+	if (capacity < layout->total_memory_needed) {
+		return ELF_BUFFER_TOO_SMALL;
+	};
 
-	const uint32_t data_start = (current_offset + (layout->data_align - 1)) & ~(layout->data_align - 1);
-	uint32_t data_ptr = data_start;
-	current_offset = data_start + layout->data_size;
+	memset(dest, 0, capacity);
+	for (size_t l = 0; l < layout->section_count; l++) {
+		const ElfLayoutSection* merged = &layout->sections[l];
+		size_t dst = merged->base_vaddr;
 
-	for (size_t v = 0; v < view_count; v++) {
-		const ElfView* view = &views[v];
+		for (size_t v = 0; v < view_count; v++) {
+			const ElfView* view = &views[v];
+			uint32_t src_size = 0;
 
-		uint32_t src_size = 0;
-		const uint8_t* src_text = elf_view_get_section(view, ".text", &src_size, NULL);
-		if (src_text && src_size > 0) {
-			const ElfSHDR* shdr = elf_view_get_section_header(view, ".text");
-			uint32_t align = shdr->sh_addralign ? shdr->sh_addralign : 1;
-			text_ptr = (text_ptr + (align - 1)) & ~(align - 1);
+			const uint8_t* src = elf_view_get_section(view, merged->name, &src_size, NULL);
+			if (!src) continue;
 
-			memcpy(&dest_memory[text_ptr], src_text, src_size);
-			text_ptr += src_size;
-		};
+			const ElfSHDR* shdr = elf_view_get_section_header(view, merged->name);
+			size_t align = shdr->sh_addralign? shdr->sh_addralign : 1;
+			dst = (dst + align - 1) & ~(align - 1);
 
-		const uint8_t* src_data = elf_view_get_section(view, ".data", &src_size, NULL);
-		if (src_data && src_size > 0) {
-			const ElfSHDR* shdr = elf_view_get_section_header(view, ".data");
-			uint32_t align = shdr->sh_addralign ? shdr->sh_addralign : 1;
-			data_ptr = (data_ptr + (align - 1)) & ~(align - 1);
-
-			memcpy(&dest_memory[data_ptr], src_data, src_size);
-			data_ptr += src_size;
+			memcpy(dest + dst, src, src_size);
+			dst += src_size;
 		};
 	};
 

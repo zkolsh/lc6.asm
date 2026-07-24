@@ -78,35 +78,39 @@ pub fn main(init: std.process.Init) !void {
     var assembler: A.Assembly = try A.Assembly.init(allocator);
     defer assembler.deinit();
     try assembler.assembleEntireFile(init.io, inputName.?);
+    // assembler.patchStaticRelocations();
 
-    const main_blob = try assembler.createElfBlob(c.ET_REL, 0);
-    defer init.arena.allocator().free(main_blob);
+    const mainBlob = try assembler.createElfBlob(c.ET_REL, 0);
+    defer init.arena.allocator().free(mainBlob);
 
     if (!linkObject) {
-        const out_file = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
-        defer out_file.close(init.io);
-        try out_file.writeStreamingAll(init.io, main_blob);
+        const outFile = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
+        defer outFile.close(init.io);
+
+        try outFile.writeStreamingAll(init.io, mainBlob);
         std.process.exit(0);
     }
 
     var views = try allocator.alloc(c.ElfView, libraries.items.len + 1);
-    var status = c.elf_view_parse(&views[0], main_blob.len, main_blob.ptr);
+    var status = c.elf_view_parse(&views[0], mainBlob.len, mainBlob.ptr);
     if (status != c.ELF_SUCCESS) {
         try stdout.interface.print("error: failed to parse assembled object: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
     }
 
-    for (libraries.items, 0..) |lib_path, i| {
-        const lib_blob = try std.Io.Dir.cwd().readFileAlloc(init.io, lib_path, init.arena.allocator(), .unlimited);
-        status = c.elf_view_parse(&views[i + 1], lib_blob.len, lib_blob.ptr);
+    for (libraries.items, 0..) |libPath, i| {
+        const libBlob = try std.Io.Dir.cwd().readFileAlloc(init.io, libPath, init.arena.allocator(), .unlimited);
+
+        status = c.elf_view_parse(&views[i + 1], libBlob.len, libBlob.ptr);
         if (status != c.ELF_SUCCESS) {
-            try stdout.interface.print("error: failed to parse library {s}: {s}\n", .{lib_path, c.elf_status_str(status)});
+            try stdout.interface.print("error: failed to parse library {s}: {s}\n", .{libPath, c.elf_status_str(status)});
             std.process.exit(1);
         }
     }
 
     var layout: c.ElfLayoutMap = undefined;
     status = c.elf_merge_calculate_layout(&layout, views.ptr, views.len);
+
     if (status != c.ELF_SUCCESS) {
         try stdout.interface.print("error: linker layout failed: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
@@ -114,62 +118,89 @@ pub fn main(init: std.process.Init) !void {
 
     const ram = try allocator.alloc(u8, layout.total_memory_needed);
     status = c.elf_merge(ram.ptr, ram.len, &layout, views.ptr, views.len);
+
     if (status != c.ELF_SUCCESS) {
         try stdout.interface.print("error: linker merge failed: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
     }
 
-    const text_vaddr = (0 + (layout.text_align - 1)) & ~(layout.text_align - 1);
-    const data_vaddr = (text_vaddr + layout.text_size + (layout.data_align - 1)) & ~(layout.data_align - 1);
+    var sectionLayout = try allocator.alloc(c.ElfSectionAddress, layout.section_count);
+    defer allocator.free(sectionLayout);
+
+    for (layout.sections[0..layout.section_count], 0..) |*section, i| {
+        sectionLayout[i] = .{
+            .section_name = &section.name,
+            .base_vaddr = @as(u32, @intCast(section.base_vaddr)),
+        };
+    }
 
     for (views) |view| {
-        if (view.header.*.e_type != c.ET_REL) continue;
-
-        status = c.elf_view_patch_relocations(&view, ram.ptr, ram.len, ".text", @as(u32, @intCast(text_vaddr)), @as(u32, @intCast(data_vaddr)));
-        if (status != c.ELF_SUCCESS) {
-            try stdout.interface.print("error: .text relocation failed: {s}\n", .{c.elf_status_str(status)});
-            std.process.exit(1);
+        if (view.header.*.e_type != c.ET_REL) {
+            continue;
         }
-        
-        status = c.elf_view_patch_relocations(&view, ram.ptr, ram.len, ".data", @as(u32, @intCast(text_vaddr)), @as(u32, @intCast(data_vaddr)));
-        if (status != c.ELF_SUCCESS) {
-            try stdout.interface.print("error: .data relocation failed: {s}\n", .{c.elf_status_str(status)});
-            std.process.exit(1);
+
+        for (layout.sections[0..layout.section_count]) |*section| {
+            const begin = section.base_vaddr;
+            const end = begin + section.size;
+            const name = std.mem.sliceTo(&section.name, 0);
+
+            if (!std.mem.eql(u8, name, ".text") and !std.mem.eql(u8, name, ".data")) {
+                continue;
+            }
+
+            status = c.elf_view_patch_relocations(&view, ram.ptr + begin, end - begin, &section.name, sectionLayout.ptr, sectionLayout.len);
+            if (status != c.ELF_SUCCESS) {
+                try stdout.interface.print("error: relocation of section {s} failed: {s}\n", .{&section.name, c.elf_status_str(status)});
+                std.process.exit(1);
+            }
         }
     }
 
-    const entry_point = views[0].header.*.e_entry + @as(u32, @intCast(text_vaddr));
-    const final_sections = [_]c.ElfRawSection{
-        .{
-            .name = ".text",
-            .data = ram.ptr + text_vaddr,
-            .size = @as(u32, @intCast(layout.text_size)),
-            .type = c.SHT_PROGBITS,
-            .flags = c.SHF_ALLOC | c.SHF_EXECINSTR,
-            .addralign = @as(u32, @intCast(layout.text_align)),
-            .link = 0, .info = 0, .entsize = 0,
-        },
-        .{
-            .name = ".data",
-            .data = ram.ptr + data_vaddr,
-            .size = @as(u32, @intCast(layout.data_size)),
-            .type = c.SHT_PROGBITS,
-            .flags = c.SHF_ALLOC | c.SHF_WRITE,
-            .addralign = @as(u32, @intCast(layout.data_align)),
-            .link = 0, .info = 0, .entsize = 0,
-        },
-    };
+    var finalSections = try std.ArrayList(c.ElfRawSection).initCapacity(allocator, layout.section_count);
+    defer finalSections.deinit(allocator);
 
-    const final_size = c.elf_writer_calculate_size(&final_sections, final_sections.len);
-    const final_blob = try allocator.alloc(u8, final_size);
-    
-    status = c.elf_writer_serialize(final_blob.ptr, final_blob.len, c.ET_EXEC, entry_point, &final_sections, final_sections.len);
+    var textBase: u32 = 0;
+    for (layout.sections[0..layout.section_count]) |*section| {
+        var flags: c.ElfShFlags = c.SHF_ALLOC;
+
+        if (std.mem.eql(u8, std.mem.sliceTo(&section.name, 0), ".text")) {
+            flags |= c.SHF_EXECINSTR;
+            textBase = @as(u32, @intCast(section.base_vaddr));
+        } else if (std.mem.eql(u8, std.mem.sliceTo(&section.name, 0), ".data")) {
+            flags |= c.SHF_WRITE;
+        }
+
+        try finalSections.append(allocator, .{
+            .name = std.mem.sliceTo(&section.name, 0).ptr,
+            .data = ram.ptr + section.base_vaddr,
+            .size = @as(u32, @intCast(section.size)),
+            .type = c.SHT_PROGBITS,
+            .flags = flags,
+            .addralign = @as(u32, @intCast(section.alignment)),
+            .link = 0,
+            .info = 0,
+            .entsize = 0
+        });
+    }
+
+    const entryPoint = views[0].header.*.e_entry + textBase;
+    const finalSize = c.elf_writer_calculate_size(finalSections.items.ptr, finalSections.items.len);
+    const finalBlob = try allocator.alloc(u8, finalSize);
+    status = c.elf_writer_serialize(
+        finalBlob.ptr,
+        finalBlob.len,
+        c.ET_EXEC,
+        entryPoint,
+        finalSections.items.ptr,
+        finalSections.items.len,
+    );
+
     if (status != c.ELF_SUCCESS) {
         try stdout.interface.print("error: final serialization failed: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
     }
 
-    const out_file = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
-    defer out_file.close(init.io);
-    try out_file.writeStreamingAll(init.io, final_blob);
+    const outFile = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
+    defer outFile.close(init.io);
+    try outFile.writeStreamingAll(init.io, finalBlob);
 }

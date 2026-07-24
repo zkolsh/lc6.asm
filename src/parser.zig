@@ -346,12 +346,12 @@ pub const Parser = struct {
             .lhu   => return .{.ltype = try self.parseLMem(mnemo)},
             .lb    => return .{.ltype = try self.parseLMem(mnemo)},
             .lbu   => return .{.ltype = try self.parseLMem(mnemo)},
-            .beq   => return .{.itype = try self.parseI(mnemo)},
-            .bne   => return .{.itype = try self.parseI(mnemo)},
-            .blt   => return .{.itype = try self.parseI(mnemo)},
-            .bgt   => return .{.itype = try self.parseI(mnemo)},
-            .ble   => return .{.itype = try self.parseI(mnemo)},
-            .bge   => return .{.itype = try self.parseI(mnemo)},
+            .beq   => return .{.itype = try self.parseBranch(mnemo)},
+            .bne   => return .{.itype = try self.parseBranch(mnemo)},
+            .blt   => return .{.itype = try self.parseBranch(mnemo)},
+            .bgt   => return .{.itype = try self.parseBranch(mnemo)},
+            .ble   => return .{.itype = try self.parseBranch(mnemo)},
+            .bge   => return .{.itype = try self.parseBranch(mnemo)},
             .slti  => return .{.itype = try self.parseI(mnemo)},
             .sltiu => return .{.itype = try self.parseI(mnemo)},
         };
@@ -419,6 +419,23 @@ pub const Parser = struct {
         const rt = try self.parseRegisterName();
         try self.commaSep();
         const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(u17);
+        return .{
+            .opcode = mnemo,
+            .rt = rt,
+            .rs = rs,
+            .imm = imm,
+        };
+    }
+
+    fn parseBranch(self: *Parser, mnemo: isa.InstructionName) ParseError!IType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const rt = try self.parseRegisterName();
         try self.commaSep();
         const imm = try self.parseImmediate(u17);
         return .{
