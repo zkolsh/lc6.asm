@@ -1,5 +1,4 @@
 #include "elf_io.h" // references defined here
-#define DEBUG
 
 #include <string.h>
 
@@ -112,8 +111,8 @@ ElfStatus elf_writer_serialize(
 		const ElfRawSection* sections, size_t count) {
 	if (!dest_buffer || !sections || count == 0) return ELF_MISSING_PARAMS;
 
-	// const size_t required_size = elf_writer_calculate_size(sections, count);
-	// if (dest_capacity < required_size) return ELF_BUFFER_TOO_SMALL;
+	const size_t required_size = elf_writer_calculate_size(sections, count);
+	if (dest_capacity < required_size) return ELF_BUFFER_TOO_SMALL;
 
 	for (size_t i = 0; i < dest_capacity; i++) dest_buffer[i] = 0;
 	memset(dest_buffer, 0, dest_capacity);
@@ -421,52 +420,76 @@ ElfStatus elf_view_patch_relocations(
 		uint32_t instruction;
 		memcpy(&instruction, &section_data[rel.r_offset], sizeof(uint32_t));
 
+		uint32_t ci_vaddr = current_sec_vaddr + rel.r_offset;
 		switch (reloc_type) {
-		case R_RTM32_RTYPE: {
-			const uint32_t imm5 = (absolute_addr) & 0x1F;
-			instruction &= ~(0x1F << 22);
-			instruction |= (imm5 << 22);
+		case R_RTM32_WORD: {
+			instruction = absolute_addr;
 			break;
 		};
 
-		case R_RTM32_LO16: {
+		case R_RTM32_ELIMM: {
+			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+			uint32_t imm25 = (uint32_t)(offset >> 2) & 0x1FFFFFF;
+			instruction &= ~0x1FFFFFF;
+			instruction |= imm25;
+			break;
+		};
+
+		case R_RTM32_VLIMM: {
+			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+			uint32_t imm24 = (uint32_t)(offset >> 2) & 0xFFFFFF;
+			instruction &= ~0xFFFFFF;
+			instruction |= imm24;
+			break;
+		};
+
+		case R_RTM32_LLIMM: {
+			uint32_t imm20 = (absolute_addr >> 2) & 0xFFFFF;
+			instruction &= ~0xFFFFF;
+			instruction |= imm20;
+			break;
+		};
+
+		case R_RTM32_LIMM: {
+			uint32_t imm19 = (absolute_addr >> 2) & 0x7FFFF;
+			instruction &= ~0x7FFFF;
+			instruction |= imm19;
+			break;
+		};
+
+		case R_RTM32_IMM: {
+			uint8_t opcode = instruction >> 27;
+			uint32_t imm17;
+
+			if (opcode >= 16 && opcode <= 21) {
+				int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+				imm17 = (uint32_t)(offset >> 2) & 0x1FFFF;
+			} else {
+				imm17 = absolute_addr & 0x1FFFF;
+			};
+
+			instruction &= ~0x1FFFF;
+			instruction |= imm17;
+			break;
+		};
+
+		case R_RTM32_SIMM: {
 			uint32_t imm16 = absolute_addr & 0xFFFF;
 			instruction &= ~0xFFFF;
 			instruction |= imm16;
 			break;
 		};
 
-		case R_RTM32_HI16: {
-			uint32_t imm16 = (absolute_addr >> 16) & 0xFFFF;
-			instruction &= ~0xFFFF;
-			instruction |= imm16;
-			break;
-		};
-
-		case R_RTM32_PC16: {
-			uint32_t ci_vaddr = current_sec_vaddr + rel.r_offset;
-			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
-			uint32_t imm16 = (uint32_t)(offset >> 2) & 0xFFFF;
-			instruction &= ~0xFFFF;
-			instruction |= imm16;
-			break;
-		};
-
-		case R_RTM32_TAIL27: {
-			uint32_t imm27 = (absolute_addr >> 2) & 0x07FFFFFF;
-			instruction &= ~0x07FFFFFF;
-			instruction |= imm27;
-			break;
-		};
-
-		case R_RTM32_WORD: {
-			instruction = absolute_addr;
+		case R_RTM32_AUX: {
+			uint32_t imm5 = absolute_addr & 0x1F;
+			instruction &= ~(0x1F << 7);
+			instruction |= (imm5 << 7);
 			break;
 		};
 
 		default:
 #if defined(DEBUG)
-			fprintf(stderr, "relocation was type %zu\n", (size_t)reloc_type);
+			fprintf(stderr, "hit default branch, relocation was type %zu\n", (size_t)reloc_type);
 #endif
 			return ELF_INVALID_RELOCATION;
 		};

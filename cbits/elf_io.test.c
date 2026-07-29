@@ -53,6 +53,7 @@ void vram_to_s_cmd(const uint8_t* desc_mem, const size_t size) {
 		                    | ((i + 1 < size) ? ((uint32_t)desc_mem[i + 1] <<  8) : 0)
 		                    | ((i + 2 < size) ? ((uint32_t)desc_mem[i + 2] << 16) : 0)
 		                    | ((i + 3 < size) ? ((uint32_t)desc_mem[i + 3] << 24) : 0);
+		if (word == 0) continue;
 		printf("s [0x%08X] 0x%08X\n", (uint32_t)i, word);
 	};
 };

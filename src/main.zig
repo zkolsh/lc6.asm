@@ -78,7 +78,6 @@ pub fn main(init: std.process.Init) !void {
     var assembler: A.Assembly = try A.Assembly.init(allocator);
     defer assembler.deinit();
     try assembler.assembleEntireFile(init.io, inputName.?);
-    // assembler.patchStaticRelocations();
 
     const mainBlob = try assembler.createElfBlob(c.ET_REL, 0);
     defer init.arena.allocator().free(mainBlob);

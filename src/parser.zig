@@ -6,85 +6,11 @@ const Tokenizer = lex.Tokenizer;
 
 pub const ParseError = error {
     InvalidEnumeration,
+    InvalidInstruction,
     NoMatch,
     NumericOverflow,
     UnexpectedToken,
 } || lex.LexerError;
-
-pub fn Immediate(comptime T: type) type {
-    return union(enum) {
-        static: T,
-        dynamic: []const u8,
-    };
-}
-
-pub const RType = struct {
-    funct: isa.RType,
-    rs: isa.Register,
-    rt: isa.Register,
-    rd: isa.Register,
-    aux: Immediate(u6),
-};
-
-pub const IType = struct {
-    opcode: isa.InstructionName,
-    rs: isa.Register,
-    rt: isa.Register,
-    imm: Immediate(u17),
-};
-
-pub const LType = struct {
-    opcode: isa.InstructionName,
-    rs: isa.Register,
-    rt: isa.Register,
-    imm: Immediate(u16),
-};
-
-pub const JType = struct {
-    opcode: isa.InstructionName,
-    imm: Immediate(u27),
-};
-
-const Instruction = union(enum) {
-    rtype: RType,
-    itype: IType,
-    ltype: LType,
-    jtype: JType,
-};
-
-const Padding = struct {
-    size: usize,
-    alignment: usize,
-};
-
-const Directive = union(enum) {
-    section: []const u8,
-    bytes: []const u8,
-    shorts: []const u16,
-    words: []const u32,
-    asciiz: []const u8,
-    nascii: []const u8,
-    padding: Padding,
-    ptr: []const u8,
-};
-
-pub const Statement = struct {
-    label: []const u8,
-    value: union(enum) {
-        section: []const u8,
-        bytes: []const u8,
-        shorts: []const u16,
-        words: []const u32,
-        asciiz: []const u8,
-        nascii: []const u8,
-        padding: Padding,
-        ptr: []const u8,
-        rtype: RType,
-        itype: IType,
-        ltype: LType,
-        jtype: JType,
-    }
-};
 
 pub const Parser = struct {
     lexer: Tokenizer,
@@ -233,7 +159,7 @@ pub const Parser = struct {
         }
     }
 
-    pub fn parseImmediate(self: *Parser, comptime T: type) ParseError!Immediate(T) {
+    pub fn parseImmediate(self: *Parser, kind: isa.ImmediateKind) ParseError!isa.Immediate(u25) {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
@@ -241,7 +167,17 @@ pub const Parser = struct {
         switch (token.kind) {
             .number, .minus, .plus => {
                 self.lexer.restore(mark);
-                return .{.static = try self.parseInteger(T)};
+                const integer = switch (kind) {
+                    .elimm => try self.parseInteger(u25),
+                    .vlimm => try self.parseInteger(u24),
+                    .llimm => try self.parseInteger(u20),
+                    .limm  => try self.parseInteger(u19),
+                    .imm   => try self.parseInteger(u17),
+                    .simm  => try self.parseInteger(u16),
+                    .aux   => try self.parseInteger(u5),
+                };
+                return .{.static = std.math.cast(u25, integer)
+                    orelse return ParseError.NumericOverflow};
             },
             .char => return .{.static = @intCast(token.data[0])},
             .identifier => return .{.dynamic = token.data},
@@ -264,6 +200,21 @@ pub const Parser = struct {
         }
     }
 
+    pub fn parseSpecialRegisterName(self: *Parser) ParseError!isa.SpecialRegister {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        _ = try self.expect(.dollar);
+        const name = try self.expectOneOf(.{.number, .identifier});
+        switch (name.kind) {
+            .number => return @enumFromInt(self.parseRawInteger(u5, 10, name.data)
+                catch return ParseError.InvalidEnumeration),
+            .identifier => return std.meta.stringToEnum(isa.SpecialRegister, name.data)
+                orelse return ParseError.InvalidEnumeration,
+            else => unreachable,
+        }
+    }
+
     pub fn parseLabel(self: *Parser) ParseError![]const u8 {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
@@ -274,11 +225,11 @@ pub const Parser = struct {
         return name;
     }
 
-    pub fn parseStatement(self: *Parser) ParseError!Statement {
+    pub fn parseStatement(self: *Parser) ParseError!isa.Statement {
         var start = self.lexer.bookmark();
         errdefer self.lexer.restore(start);
 
-        var statement: Statement = undefined;
+        var statement: isa.Statement = undefined;
         statement.label = self.parseLabel() catch &[_]u8{};
 
         const token = try self.lexer.nextWord();
@@ -289,7 +240,6 @@ pub const Parser = struct {
                 switch (instr) {
                     .rtype => |x| statement.value = .{.rtype = x},
                     .itype => |x| statement.value = .{.itype = x},
-                    .ltype => |x| statement.value = .{.ltype = x},
                     .jtype => |x| statement.value = .{.jtype = x},
                 }
             },
@@ -314,80 +264,57 @@ pub const Parser = struct {
             },
         }
 
-        if (try self.statementEnd()) {
+        const end = self.statementEnd() catch return ParseError.UnexpectedToken;
+        if (end) {
             return statement;
         } else {
             return ParseError.UnexpectedToken;
         }
     }
 
-    fn parseInstruction(self: *Parser, token: Token) ParseError!Instruction {
+    fn parseInstruction(self: *Parser, token: Token) ParseError!isa.Instruction {
         if (token.kind != .identifier) return ParseError.NoMatch;
         try self.lexer.skipWhitespace();
-        
-        const regular = std.meta.stringToEnum(isa.InstructionName, token.data);
-        if (regular) |mnemo| switch (mnemo) {
-            .rtype => return ParseError.NoMatch,
-            .addi  => return .{.itype = try self.parseI(mnemo)},
-            .j     => return .{.jtype = try self.parseJ(mnemo)},
-            .jal   => return .{.jtype = try self.parseJ(mnemo)},
-            .andi  => return .{.ltype = try self.parseLALU(mnemo)},
-            .andih => return .{.ltype = try self.parseLALU(mnemo)},
-            .ori   => return .{.ltype = try self.parseLALU(mnemo)},
-            .orih  => return .{.ltype = try self.parseLALU(mnemo)},
-            .xori  => return .{.ltype = try self.parseLALU(mnemo)},
-            .xorih => return .{.ltype = try self.parseLALU(mnemo)},
-            .lui   => return .{.ltype = try self.parseLUI(mnemo)},
-            .lw    => return .{.ltype = try self.parseLMem(mnemo)},
-            .sw    => return .{.ltype = try self.parseLMem(mnemo)},
-            .sh    => return .{.ltype = try self.parseLMem(mnemo)},
-            .sb    => return .{.ltype = try self.parseLMem(mnemo)},
-            .lh    => return .{.ltype = try self.parseLMem(mnemo)},
-            .lhu   => return .{.ltype = try self.parseLMem(mnemo)},
-            .lb    => return .{.ltype = try self.parseLMem(mnemo)},
-            .lbu   => return .{.ltype = try self.parseLMem(mnemo)},
-            .beq   => return .{.itype = try self.parseBranch(mnemo)},
-            .bne   => return .{.itype = try self.parseBranch(mnemo)},
-            .blt   => return .{.itype = try self.parseBranch(mnemo)},
-            .bgt   => return .{.itype = try self.parseBranch(mnemo)},
-            .ble   => return .{.itype = try self.parseBranch(mnemo)},
-            .bge   => return .{.itype = try self.parseBranch(mnemo)},
-            .slti  => return .{.itype = try self.parseI(mnemo)},
-            .sltiu => return .{.itype = try self.parseI(mnemo)},
-        };
 
-        const rtype = std.meta.stringToEnum(isa.RType, token.data);
-        if (rtype) |mnemo| switch (mnemo) {
+        const r = std.meta.stringToEnum(isa.RTypeMnemo, token.data);
+        const i = std.meta.stringToEnum(isa.ITypeMnemo, token.data);
+        const j = std.meta.stringToEnum(isa.JTypeMnemo, token.data);
+
+        if (r) |mnemo| switch (mnemo) {
             .sll    => return .{.rtype = try self.parseRShift(mnemo)},
+            .rlc    => return .{.rtype = try self.parseRShift(mnemo)},
             .srl    => return .{.rtype = try self.parseRShift(mnemo)},
-            .sra    => return .{.rtype = try self.parseSRA(mnemo)},
+            .sra    => return .{.rtype = try self.parseRShift(mnemo)},
             .sllr   => return .{.rtype = try self.parseRShiftV(mnemo)},
+            .rlcr   => return .{.rtype = try self.parseRShiftV(mnemo)},
             .srlr   => return .{.rtype = try self.parseRShiftV(mnemo)},
             .srar   => return .{.rtype = try self.parseRShiftV(mnemo)},
-            .cfs    => return .{.rtype = try self.parseRAux(mnemo)},
-            .cts    => return .{.rtype = try self.parseRAux(mnemo)},
             .@"and" => return .{.rtype = try self.parseR3(mnemo)},
             .@"or"  => return .{.rtype = try self.parseR3(mnemo)},
-            .xor    => return .{.rtype = try self.parseR3(mnemo)},
             .nor    => return .{.rtype = try self.parseR3(mnemo)},
+            .xor    => return .{.rtype = try self.parseR3(mnemo)},
+            .add    => return .{.rtype = try self.parseR3(mnemo)},
+            .sub    => return .{.rtype = try self.parseR3(mnemo)},
             .slt    => return .{.rtype = try self.parseR3(mnemo)},
             .sltu   => return .{.rtype = try self.parseR3(mnemo)},
-            .jr     => return .{.rtype = try self.parseRJ(mnemo)},
-            .jalr   => return .{.rtype = try self.parseRJ(mnemo)},
-            .lhx    => return .{.rtype = try self.parseRMemX(mnemo)},
-            .lhux   => return .{.rtype = try self.parseRMemX(mnemo)},
-            .lbx    => return .{.rtype = try self.parseRMemX(mnemo)},
-            .lbux   => return .{.rtype = try self.parseRMemX(mnemo)},
-            .lwx    => return .{.rtype = try self.parseRMemX(mnemo)},
+            .lhx    => return .{.rtype = try self.parseR3(mnemo)},
+            .lhux   => return .{.rtype = try self.parseR3(mnemo)},
+            .lbx    => return .{.rtype = try self.parseR3(mnemo)},
+            .lbux   => return .{.rtype = try self.parseR3(mnemo)},
+            .lwx    => return .{.rtype = try self.parseR3(mnemo)},
+            .swx    => return .{.rtype = try self.parseR3(mnemo)},
+            .shx    => return .{.rtype = try self.parseR3(mnemo)},
+            .sbx    => return .{.rtype = try self.parseR3(mnemo)},
             .mul    => return .{.rtype = try self.parseR3(mnemo)},
             .mulh   => return .{.rtype = try self.parseR3(mnemo)},
             .mulhu  => return .{.rtype = try self.parseR3(mnemo)},
+            .mulhsu => return .{.rtype = try self.parseR3(mnemo)},
             .div    => return .{.rtype = try self.parseR3(mnemo)},
             .divu   => return .{.rtype = try self.parseR3(mnemo)},
             .rest   => return .{.rtype = try self.parseR3(mnemo)},
             .restu  => return .{.rtype = try self.parseR3(mnemo)},
-            .add    => return .{.rtype = try self.parseR3(mnemo)},
-            .sub    => return .{.rtype = try self.parseR3(mnemo)},
+            .cfs    => return .{.rtype = try self.parseRAux(mnemo)},
+            .cts    => return .{.rtype = try self.parseRAux(mnemo)},
             .trap   => return .{.rtype = try self.parseTRAP(mnemo)},
             .rft    => return .{.rtype = .{
                 .funct = .rft,
@@ -398,21 +325,58 @@ pub const Parser = struct {
             }},
         };
 
-        return ParseError.NoMatch;
+        if (i) |mnemo| switch (mnemo) {
+            .jr    => return .{.itype = try self.parseJR(mnemo)},
+            .jalr  => return .{.itype = try self.parseJR(mnemo)},
+            .jalrx => return .{.itype = try self.parseJR(mnemo)},
+            .addi  => return .{.itype = try self.parseIALU(mnemo)},
+            .andi  => return .{.itype = try self.parseIALU(mnemo)},
+            .lci   => return .{.itype = try self.parseIALU(mnemo)},
+            .ani   => return .{.itype = try self.parseIALU(mnemo)},
+            .anh   => return .{.itype = try self.parseIALU(mnemo)},
+            .ori   => return .{.itype = try self.parseIALU(mnemo)},
+            .orh   => return .{.itype = try self.parseIALU(mnemo)},
+            .xori  => return .{.itype = try self.parseIALU(mnemo)},
+            .xorh => return .{.itype = try self.parseIALU(mnemo)},
+            .lw    => return .{.itype = try self.parseIMem(mnemo)},
+            .sw    => return .{.itype = try self.parseIMem(mnemo)},
+            .sh    => return .{.itype = try self.parseIMem(mnemo)},
+            .sb    => return .{.itype = try self.parseIMem(mnemo)},
+            .lh    => return .{.itype = try self.parseIMem(mnemo)},
+            .lhu   => return .{.itype = try self.parseIMem(mnemo)},
+            .lb    => return .{.itype = try self.parseIMem(mnemo)},
+            .lbu   => return .{.itype = try self.parseIMem(mnemo)},
+            .beq   => return .{.itype = try self.parseBranch(mnemo)},
+            .bne   => return .{.itype = try self.parseBranch(mnemo)},
+            .blt   => return .{.itype = try self.parseBranch(mnemo)},
+            .bge   => return .{.itype = try self.parseBranch(mnemo)},
+            .bltu  => return .{.itype = try self.parseBranch(mnemo)},
+            .bgeu  => return .{.itype = try self.parseBranch(mnemo)},
+            .slti  => return .{.itype = try self.parseI(mnemo)},
+            .sltiu => return .{.itype = try self.parseI(mnemo)},
+        };
+
+        if (j) |mnemo| switch (mnemo) {
+            .j    => return .{.jtype = try self.parseJ(mnemo)},
+            .jal  => return .{.jtype = try self.parseJ(mnemo)},
+            .jalx => return .{.jtype = try self.parseJ(mnemo)},
+        };
+
+        return ParseError.InvalidInstruction;
     }
 
-    fn parseJ(self: *Parser, mnemo: isa.InstructionName) ParseError!JType {
+    fn parseJ(self: *Parser, mnemo: isa.JTypeMnemo) ParseError!isa.JType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const imm = try self.parseImmediate(u27);
+        const imm = try self.parseImmediate(isa.JType.getInfo(mnemo).immtype.?);
         return .{
             .opcode = mnemo,
             .imm = imm,
         };
     }
 
-    fn parseI(self: *Parser, mnemo: isa.InstructionName) ParseError!IType {
+    fn parseI(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
@@ -420,7 +384,7 @@ pub const Parser = struct {
         try self.commaSep();
         const rs = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(u17);
+        const imm = try self.parseImmediate(isa.IType.getInfo(mnemo).immtype.?);
         return .{
             .opcode = mnemo,
             .rt = rt,
@@ -429,15 +393,15 @@ pub const Parser = struct {
         };
     }
 
-    fn parseBranch(self: *Parser, mnemo: isa.InstructionName) ParseError!IType {
+    fn parseIALU(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const rs = try self.parseRegisterName();
-        try self.commaSep();
         const rt = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(u17);
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(isa.IType.getInfo(mnemo).immtype.?);
         return .{
             .opcode = mnemo,
             .rt = rt,
@@ -446,30 +410,13 @@ pub const Parser = struct {
         };
     }
 
-    fn parseLALU(self: *Parser, mnemo: isa.InstructionName) ParseError!LType {
+    fn parseIMem(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rt = try self.parseRegisterName();
         try self.commaSep();
-        const rs = try self.parseRegisterName();
-        try self.commaSep();
-        const imm = try self.parseImmediate(u16);
-        return .{
-            .opcode = mnemo,
-            .rt = rt,
-            .rs = rs,
-            .imm = imm,
-        };
-    }
-
-    fn parseLMem(self: *Parser, mnemo: isa.InstructionName) ParseError!LType {
-        const mark = self.lexer.bookmark();
-        errdefer self.lexer.restore(mark);
-
-        const rt = try self.parseRegisterName();
-        try self.commaSep();
-        const imm = try self.parseImmediate(u16);
+        const imm = try self.parseImmediate(isa.IType.getInfo(mnemo).immtype.?);
 
         _ = try self.expectWord(.lparen);
         try self.lexer.skipWhitespace();
@@ -484,22 +431,40 @@ pub const Parser = struct {
         };
     }
 
-    fn parseLUI(self: *Parser, mnemo: isa.InstructionName) ParseError!LType {
+    fn parseBranch(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
         const rt = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(u16);
+        const imm = try self.parseImmediate(isa.IType.getInfo(mnemo).immtype.?);
         return .{
             .opcode = mnemo,
             .rt = rt,
-            .rs = rt,
+            .rs = rs,
             .imm = imm,
         };
     }
 
-    fn parseRShift(self: *Parser, mnemo: isa.RType) ParseError!RType {
+    fn parseJR(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+        
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(isa.IType.getInfo(mnemo).immtype.?);
+
+        return .{
+            .opcode = mnemo,
+            .rt = .zero,
+            .rs = rs,
+            .imm = imm,
+        };
+    }
+
+    fn parseRShift(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
         
@@ -507,7 +472,12 @@ pub const Parser = struct {
         try self.commaSep();
         const rt = try self.parseRegisterName();
         try self.commaSep();
-        const imm = try self.parseImmediate(u6);
+        const evilImmediate = try self.parseImmediate(.aux);
+        const imm: isa.Immediate(u5) = switch (evilImmediate) {
+            .dynamic => |x| .{.dynamic = x},
+            .static  => |x| .{.static = std.math.cast(u5, x)
+                orelse return ParseError.NumericOverflow},
+        };
 
         return .{
             .funct = mnemo,
@@ -518,26 +488,7 @@ pub const Parser = struct {
         };
     }
 
-    fn parseSRA(self: *Parser, mnemo: isa.RType) ParseError!RType {
-        const mark = self.lexer.bookmark();
-        errdefer self.lexer.restore(mark);
-
-        const rd = try self.parseRegisterName();
-        try self.commaSep();
-        const rs = try self.parseRegisterName();
-        try self.commaSep();
-        const imm = try self.parseImmediate(u6);
-
-        return .{
-            .funct = mnemo,
-            .rs = rs,
-            .rd = rd,
-            .rt = .zero,
-            .aux = imm,
-        };
-    }
-
-    fn parseRShiftV(self: *Parser, mnemo: isa.RType) ParseError!RType {
+    fn parseRShiftV(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
@@ -556,55 +507,32 @@ pub const Parser = struct {
         };
     }
 
-    fn parseRAux(self: *Parser, mnemo: isa.RType) ParseError!RType {
-        const mark = self.lexer.bookmark();
-        errdefer self.lexer.restore(mark);
-        _ = mnemo; @panic("UNIMPLEMENTED");
-    }
-
-    fn parseR3(self: *Parser, mnemo: isa.RType) ParseError!RType {
+    fn parseRAux(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const rd = try self.parseRegisterName();
-        try self.commaSep();
         const rs = try self.parseRegisterName();
         try self.commaSep();
-        const rt = try self.parseRegisterName();
-
-        return .{
-            .funct = mnemo,
-            .rs = rs,
-            .rd = rd,
-            .rt = rt,
-            .aux = .{.static = 0},
-        };
-    }
-
-    fn parseRJ(self: *Parser, mnemo: isa.RType) ParseError!RType {
-        const mark = self.lexer.bookmark();
-        errdefer self.lexer.restore(mark);
-        
-        const rs = try self.parseRegisterName();
+        const aux = try self.parseSpecialRegisterName();
 
         return .{
             .funct = mnemo,
             .rs = rs,
             .rd = .zero,
             .rt = .zero,
-            .aux = .{.static = 0},
+            .aux = .{.static = @intFromEnum(aux)},
         };
     }
 
-    fn parseRMemX(self: *Parser, mnemo: isa.RType) ParseError!RType {
+    fn parseR3(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const rt = try self.parseRegisterName();
+        const rd = try self.parseRegisterName();
         try self.commaSep();
         const rs = try self.parseRegisterName();
         try self.commaSep();
-        const rd = try self.parseRegisterName();
+        const rt = try self.parseRegisterName();
 
         return .{
             .funct = mnemo,
@@ -615,13 +543,27 @@ pub const Parser = struct {
         };
     }
 
-    fn parseTRAP(self: *Parser, mnemo: isa.RType) ParseError!RType {
+    fn parseTRAP(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
         const mark = self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
-        _ = mnemo; @panic("UNIMPLEMENTED");
+
+        const evilImmediate = try self.parseImmediate(.aux);
+        const imm: isa.Immediate(u5) = switch (evilImmediate) {
+            .dynamic => |x| .{.dynamic = x},
+            .static  => |x| .{.static = std.math.cast(u5, x)
+                orelse return ParseError.NumericOverflow},
+        };
+
+        return .{
+            .funct = mnemo,
+            .rs = .zero,
+            .rd = .zero,
+            .rt = .zero,
+            .aux = imm,
+        };
     }
 
-    fn parseDirective(self: *Parser) ParseError!Directive {
+    fn parseDirective(self: *Parser) ParseError!isa.Directive {
         const token = try self.expect(.identifier);
         const directive = std.meta.stringToEnum(isa.DataDirective, token)
             orelse return ParseError.NoMatch;
@@ -630,7 +572,7 @@ pub const Parser = struct {
         switch (directive) {
             .asciiz  => return .{.asciiz = try self.parseString()},
             .byte    => return .{.bytes = try self.parseBytes()},
-            .nascii  => return .{.asciiz = try self.parseString()},
+            .nascii  => return .{.nascii = try self.parseString()},
             .pad     => return .{.padding = try self.parsePadding()},
             .ptr     => return .{.ptr = try self.parseSymbolLabel()},
             .section => return .{.section = try self.parseSectionLabel()},
@@ -719,7 +661,7 @@ pub const Parser = struct {
         return a;
     }
 
-    fn parsePadding(self: *Parser) ParseError!Padding {
+    fn parsePadding(self: *Parser) ParseError!isa.Padding {
         const numbers = try self.parseIntegerList(usize);
         const alignment = self.parsePaddingAlignment() catch 1;
 
@@ -799,7 +741,7 @@ test "parseImmediate constant" {
     var p = try makeParser("42");
     defer p.deinit();
 
-    const imm = try p.parseImmediate(u16);
+    const imm = try p.parseImmediate(.imm);
 
     switch (imm) {
         .static => |v| try std.testing.expectEqual(@as(u16, 42), v),
@@ -811,7 +753,7 @@ test "parseImmediate symbol" {
     var p = try makeParser("loop");
     defer p.deinit();
 
-    const imm = try p.parseImmediate(u16);
+    const imm = try p.parseImmediate(.imm);
 
     switch (imm) {
         .dynamic => |name|
@@ -824,7 +766,7 @@ test "parseRegisterName numeric" {
     var p = try makeParser("$10");
     defer p.deinit();
 
-    try std.testing.expectEqual(@as(isa.Register, .t0), try p.parseRegisterName());
+    try std.testing.expectEqual(@as(isa.Register, .a2), try p.parseRegisterName());
 }
 
 test "parseRegisterName symbolic" {
@@ -860,11 +802,11 @@ test "parseStatement add" {
     defer p.deinit();
 
     const stmt = try p.parseStatement();
-    const imm: Immediate(u6) = .{.static = 0};
+    const imm: isa.Immediate(u5) = .{.static = 0};
 
     switch (stmt.value) {
         .rtype => |r| {
-            try std.testing.expectEqual(isa.RType.add, r.funct);
+            try std.testing.expectEqual(isa.RTypeMnemo.add, r.funct);
             try std.testing.expectEqual(isa.Register.t0, r.rd);
             try std.testing.expectEqual(isa.Register.t1, r.rs);
             try std.testing.expectEqual(isa.Register.t2, r.rt);
@@ -884,7 +826,7 @@ test "parseStatement addi" {
 
     switch (stmt.value) {
         .itype => |i| {
-            try std.testing.expectEqual(isa.InstructionName.addi, i.opcode);
+            try std.testing.expectEqual(isa.ITypeMnemo.addi, i.opcode);
             try std.testing.expectEqual(isa.Register.t0, i.rt);
             try std.testing.expectEqual(isa.Register.t1, i.rs);
 
@@ -908,35 +850,11 @@ test "parseStatement jump label" {
 
     switch (stmt.value) {
         .jtype => |j| {
-            try std.testing.expectEqual(isa.InstructionName.j, j.opcode);
+            try std.testing.expectEqual(isa.JTypeMnemo.j, j.opcode);
 
             switch (j.imm) {
                 .dynamic => |name|
                     try std.testing.expectEqualStrings("loop", name),
-                else => try std.testing.expect(false),
-            }
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "parseStatement lw" {
-    var p = try makeParser(
-        "lw $t0, 16($sp)\n",
-    );
-    defer p.deinit();
-
-    const stmt = try p.parseStatement();
-
-    switch (stmt.value) {
-        .ltype => |l| {
-            try std.testing.expectEqual(isa.InstructionName.lw, l.opcode);
-            try std.testing.expectEqual(isa.Register.t0, l.rt);
-            try std.testing.expectEqual(isa.Register.sp, l.rs);
-
-            switch (l.imm) {
-                .static => |v|
-                    try std.testing.expectEqual(@as(u16, 16), v),
                 else => try std.testing.expect(false),
             }
         },
@@ -956,7 +874,7 @@ test "parseStatement with label" {
 
     switch (stmt.value) {
         .rtype => |r|
-            try std.testing.expectEqual(isa.RType.add, r.funct),
+            try std.testing.expectEqual(isa.RTypeMnemo.add, r.funct),
         else => try std.testing.expect(false),
     }
 }

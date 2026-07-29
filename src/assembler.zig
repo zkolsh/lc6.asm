@@ -4,7 +4,7 @@ const parsing = @import("parser.zig");
 const lexing = @import("tokenizer.zig");
 const isa =  @import("isa.zig");
 
-const Statement = parsing.Statement;
+const Statement = isa.Statement;
 const Parser = parsing.Parser;
 const Tokenizer = lexing.Tokenizer;
 
@@ -22,13 +22,12 @@ pub const Relocation = struct {
 };
 
 pub const AssemblyError = error {
-    InvalidInstruction,
     InvalidAlignment,
     InvalidLabel,
     LabelNotAllowedHere,
-    SymbolRedefined,
     NoData,
     SerializationFailed,
+    SymbolRedefined,
     UnresolvedSymbol,
 } || parsing.ParseError;
 
@@ -36,6 +35,7 @@ const Segment = std.ArrayList(u8);
 pub const Assembly = struct {
     allocator: std.mem.Allocator,
     strings: std.heap.ArenaAllocator,
+    sources: ?Tokenizer,
 
     segments: std.StringHashMap(Segment),
     currentSegment: *Segment,
@@ -52,6 +52,7 @@ pub const Assembly = struct {
         return .{
             .allocator = allocator,
             .strings = std.heap.ArenaAllocator.init(allocator),
+            .sources = null,
             .segments = segments,
             .currentSegment = segments.getPtr("text").?,
             .currentSegmentName = "text",
@@ -149,7 +150,7 @@ pub const Assembly = struct {
                     .bookmark = bookmark,
                 });
 
-                try self.currentSegment.appendNTimes(self.allocator, 0, 4);
+                try self.currentSegment.appendNTimes(self.allocator, 0x77, 4);
             },
 
             .rtype => |r| {
@@ -163,7 +164,7 @@ pub const Assembly = struct {
                             .addr = labelLoc,
                             .name = label,
                             .section = self.currentSegmentName,
-                            .kind = .rtype,
+                            .kind = .aux,
                             .bookmark = bookmark,
                         });
 
@@ -172,7 +173,7 @@ pub const Assembly = struct {
                 };
 
                 const mangled: u32
-                    = (@as(u32, r.funct.getFunct().code))
+                    = (@as(u32, isa.RType.getRInfo(r.funct).funct))
                     | (@as(u32, imm) <<  7)
                     | (@as(u32, @intFromEnum(r.rd)) << 12)
                     | (@as(u32, @intFromEnum(r.rt)) << 17)
@@ -186,7 +187,7 @@ pub const Assembly = struct {
                 try self.alignSegment(self.currentSegment, 4);
                 labelLoc = self.getOffset();
 
-                const info = i.opcode.getInfo();
+                const info = isa.IType.getInfo(i.opcode);
                 const imm = switch (i.imm) {
                     .static => |x| x,
                     .dynamic => |label| blk: {
@@ -194,7 +195,7 @@ pub const Assembly = struct {
                             .addr = labelLoc,
                             .name = label,
                             .section = self.currentSegmentName,
-                            .kind = info.reltype,
+                            .kind = info.reltype.?,
                             .bookmark = bookmark,
                         });
 
@@ -202,42 +203,24 @@ pub const Assembly = struct {
                     },
                 };
 
-                const mangled: u32
-                    = (@as(u32, info.op) << 27)
-                    | (@as(u32, @intFromEnum(i.rs))   << 22)
-                    | (@as(u32, @intFromEnum(i.rt))   << 17)
-                    |  @as(u32, @intCast(imm));
+                const rt: u32 = switch (i.opcode) {
+                    .jr    => 0,
+                    .jalr  => 1 << 20,
+                    .jalrx => (1 << 21) | (@as(u32, @intFromEnum(i.rt)) << 19),
+                    else   => @as(u32, @intFromEnum(i.rt)) << 17,
+                };
 
-                const view = std.mem.nativeToLittle(u32, mangled);
-                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
-            },
-
-            .ltype => |l| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
-
-                const info = l.opcode.getInfo();
-                const imm = switch (l.imm) {
-                    .static => |x| x,
-                    .dynamic => |label| blk: {
-                        try self.relocations.append(self.allocator, .{
-                            .addr = labelLoc,
-                            .name = label,
-                            .section = self.currentSegmentName,
-                            .kind = info.reltype,
-                            .bookmark = bookmark,
-                        });
-
-                        break :blk 0;
-                    },
+                const high: u32 = switch (i.opcode) {
+                    .lci, .anh, .orh, .xorh => 1 << 16,
+                    else => 0,
                 };
 
                 const mangled: u32
-                    = (@as(u32, info.op) << 27)
-                    | (@as(u32, @intFromEnum(l.rs))   << 22)
-                    | (@as(u32, @intFromEnum(l.rt))   << 17)
-                    | (if (info.high) @as(u32, 1 << 16) else @as(u32, 0))
-                    |  @as(u32, @intCast(imm));
+                    = (@as(u32, info.opcode) << 27)
+                    | (@as(u32, @intFromEnum(i.rs)) << 22)
+                    | rt
+                    | high
+                    | @as(u32, @intCast(imm));
 
                 const view = std.mem.nativeToLittle(u32, mangled);
                 try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
@@ -247,15 +230,15 @@ pub const Assembly = struct {
                 try self.alignSegment(self.currentSegment, 4);
                 labelLoc = self.getOffset();
 
-                const info = j.opcode.getInfo();
+                const info = isa.JType.getInfo(j.opcode);
                 const imm = switch (j.imm) {
-                    .static => |x| x,
+                    .static => |x| try validateImmediate(info.immtype.?, x),
                     .dynamic => |label| blk: {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = label,
                             .section = self.currentSegmentName,
-                            .kind = info.reltype,
+                            .kind = info.reltype.?,
                             .bookmark = bookmark,
                         });
 
@@ -263,9 +246,16 @@ pub const Assembly = struct {
                     },
                 };
 
+                const so: u32 = switch (j.opcode) {
+                    .j    => 0b00,
+                    .jal  => 0b01,
+                    .jalx => 0b10,
+                };
+
                 const mangled: u32
-                    = (@as(u32, info.op) << 27)
-                    |  @as(u32, @intCast(imm));
+                    = (@as(u32, info.opcode) << 27)
+                    | so
+                    | @as(u32, @intCast(imm));
 
                 const view = std.mem.nativeToLittle(u32, mangled);
                 try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
@@ -320,12 +310,26 @@ pub const Assembly = struct {
         }
     }
 
+    fn validateImmediate(target: isa.ImmediateKind, immediate: u25) AssemblyError!u25 {
+        return switch (target) {
+            .elimm => std.math.cast(u25, immediate) orelse return AssemblyError.NumericOverflow,
+            .vlimm => std.math.cast(u24, immediate) orelse return AssemblyError.NumericOverflow,
+            .llimm => std.math.cast(u20, immediate) orelse return AssemblyError.NumericOverflow,
+            .limm  => std.math.cast(u19, immediate) orelse return AssemblyError.NumericOverflow,
+            .imm   => std.math.cast(u17, immediate) orelse return AssemblyError.NumericOverflow,
+            .simm  => std.math.cast(u16, immediate) orelse return AssemblyError.NumericOverflow,
+            .aux   => std.math.cast(u2,  immediate) orelse return AssemblyError.NumericOverflow,
+        };
+    }
+
     pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name: []const u8) !void {
         var parser = try Parser.init(io, self.allocator);
         defer parser.deinit();
 
         try parser.lexer.pushFrame(frame, name);
         const capacity = frame.len / 4;
+
+        self.sources = parser.lexer;
 
         if (self.segments.getPtr("data")) |data| {
             try data.ensureTotalCapacity(self.allocator, capacity);
@@ -336,8 +340,6 @@ pub const Assembly = struct {
         }
 
         while (parser.lexer.frameHead != null) {
-            const mark = parser.lexer.bookmark();
-            
             const statement = parser.parseStatement() catch |err| {
                 if (err == parsing.ParseError.UnexpectedEOF) break;
                 if (parser.lexer.frameHead == null) break;
@@ -347,6 +349,7 @@ pub const Assembly = struct {
                 continue;
             };
 
+            const mark = parser.lexer.bookmark();
             try self.encodeStatement(statement, mark);
         }
     }
@@ -354,6 +357,8 @@ pub const Assembly = struct {
     pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
         var parser = try Parser.init(io, self.allocator);
         defer parser.deinit();
+
+        self.sources = parser.lexer;
 
         try parser.lexer.openFile(filepath);
         if (parser.lexer.frameHead) |head| {
@@ -368,19 +373,27 @@ pub const Assembly = struct {
             }
         }
 
+        var firstErr: ?AssemblyError = null;
         while (parser.lexer.frameHead != null) {
-            const mark = parser.lexer.bookmark();
-
             const statement = parser.parseStatement() catch |err| {
                 if (err == parsing.ParseError.UnexpectedEOF) break;
                 if (parser.lexer.frameHead == null) break;
+
+                if (firstErr == null) {
+                    firstErr = err;
+                }
 
                 parser.lexer.showErrorHere(err);
                 try parser.skipToStatementEnd();
                 continue;
             };
 
+            const mark = parser.lexer.bookmark();
             try self.encodeStatement(statement, mark);
+        }
+
+        if (firstErr) |e| {
+            return e;
         }
     }
 
@@ -514,18 +527,31 @@ pub const Assembly = struct {
             }
 
             const relType = switch (rel.kind) {
-                .rtype => c.R_RTM32_RTYPE,
-                .lo16 => c.R_RTM32_LO16,
-                .hi16 => c.R_RTM32_HI16,
-                .pc16 => c.R_RTM32_PC16,
-                .tail27 => c.R_RTM32_TAIL27,
-                .word => c.R_RTM32_WORD,
+                .word  => c.R_RTM32_WORD,
+                .elimm => c.R_RTM32_ELIMM,
+                .vlimm => c.R_RTM32_VLIMM,
+                .llimm => c.R_RTM32_LLIMM,
+                .limm  => c.R_RTM32_LIMM,
+                .imm   => c.R_RTM32_IMM,
+                .simm  => c.R_RTM32_SIMM,
+                .aux   => c.R_RTM32_AUX,
+            };
+
+            errdefer if (self.sources) |*sources| {
+                std.debug.print("when patching symbol {s}:\n", .{rel.name});
+                sources.restore(rel.bookmark);
+
+                if (sources.frameHead) |head| {
+                    head.pos = @max(0, head.pos - 1);
+                }
+
+                sources.showErrorHere(AssemblyError.UnresolvedSymbol);
             };
 
             try gpr.value_ptr.append(self.allocator, .{
                 .r_offset = @intCast(rel.addr),
                 .r_info = c.ELF32_R_INFO(
-                    symbolIndices.get(rel.name).?,
+                    symbolIndices.get(rel.name) orelse return AssemblyError.UnresolvedSymbol,
                     relType
                 )
             });
@@ -566,7 +592,7 @@ pub const Assembly = struct {
             const secname = entry.key_ptr.*;
             const rels = entry.value_ptr.*;
 
-            const relname = try std.fmt.allocPrint(self.strings.allocator(), ".rel{s}", .{secname});
+            const relname = try std.fmt.allocPrintSentinel(self.strings.allocator(), ".rel{s}", .{secname}, 0);
             try sections.append(self.allocator, .{
                 .name = relname.ptr,
                 .data = @ptrCast(rels.items.ptr),
@@ -679,7 +705,7 @@ test "relocation generation" {
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
 
     const r = as.relocations.items[0];
-    try std.testing.expectEqual(isa.RelocationMode.lo16, r.kind);
+    try std.testing.expectEqual(isa.RelocationMode.imm, r.kind);
     try std.testing.expectEqualStrings("msg", r.name);
     try std.testing.expectEqual(@as(usize, 0), r.addr);
 }
@@ -696,7 +722,7 @@ test "sample program" {
         \\start:
         \\xor $zero, $zero, $zero
         \\lw $a0, msg($zero)
-        \\orih $t0, $zero, 0xFFFF
+        \\orh $t0, $zero, 0xFFFF
         \\ori $t0, $t0, 0xFF00
         \\xor $a1, $a1, $a1
         \\loop:

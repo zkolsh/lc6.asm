@@ -163,13 +163,15 @@ typedef struct __attribute__((packed)) {
 
 typedef uint8_t ElfRelocType;
 enum {
-	R_RTM32_NONE   = 0,
-	R_RTM32_RTYPE  = 1,
-	R_RTM32_LO16   = 2,
-	R_RTM32_HI16   = 3,
-	R_RTM32_PC16   = 4,
-	R_RTM32_TAIL27 = 5,
-	R_RTM32_WORD   = 6,
+	R_RTM32_NONE  = 0,
+	R_RTM32_WORD  = 1,
+	R_RTM32_ELIMM = 2,
+	R_RTM32_VLIMM = 3,
+	R_RTM32_LLIMM = 4,
+	R_RTM32_LIMM  = 5,
+	R_RTM32_IMM   = 6,
+	R_RTM32_SIMM  = 7,
+	R_RTM32_AUX   = 8,
 };
 
 typedef struct {
