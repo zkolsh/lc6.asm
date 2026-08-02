@@ -203,10 +203,18 @@ pub const Assembly = struct {
                     },
                 };
 
+                const lr: u32 = switch (i.linkRegister) {
+                    .lr0 => 0,
+                    .lr1 => 1,
+                    .lr2 => 2,
+                    .lr3 => 3,
+                    else => 0,
+                };
+
                 const rt: u32 = switch (i.opcode) {
                     .jr    => 0,
                     .jalr  => 1 << 20,
-                    .jalrx => (1 << 21) | (@as(u32, @intFromEnum(i.rt)) << 19),
+                    .jalrx => (1 << 21) | (lr << 19),
                     else   => @as(u32, @intFromEnum(i.rt)) << 17,
                 };
 
@@ -252,9 +260,18 @@ pub const Assembly = struct {
                     .jalx => 0b10,
                 };
 
+                const lr: u32 = switch (j.linkRegister) {
+                    .lr0 => 0,
+                    .lr1 => 1,
+                    .lr2 => 2,
+                    .lr3 => 3,
+                    else => 0,
+                };
+
                 const mangled: u32
                     = (@as(u32, info.opcode) << 27)
-                    | so
+                    | (so << 25)
+                    | (lr << 24)
                     | @as(u32, @intCast(imm));
 
                 const view = std.mem.nativeToLittle(u32, mangled);

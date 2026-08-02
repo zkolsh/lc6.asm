@@ -230,6 +230,7 @@ pub const IType = struct {
     rs: Register,
     rt: Register,
     imm: Immediate(u25),
+    linkRegister: Register,
 
     pub inline fn getInfo(kind: ITypeMnemo) InstructionInfo {
         return switch (kind) {
@@ -274,12 +275,13 @@ pub const JTypeMnemo = enum {
 pub const JType = struct {
     opcode: JTypeMnemo,
     imm: Immediate(u25),
+    linkRegister: Register,
 
     pub inline fn getInfo(kind: JTypeMnemo) InstructionInfo {
         return switch (kind) {
             .j    => .{.opcode = 0b00001, .immtype = .elimm, .reltype = .elimm},
             .jal  => .{.opcode = 0b00001, .immtype = .elimm, .reltype = .elimm},
-            .jalx => .{.opcode = 0b00001, .immtype = .vlimm,  .reltype = .vlimm},
+            .jalx => .{.opcode = 0b00001, .immtype = .vlimm, .reltype = .vlimm},
         };
     }
 };

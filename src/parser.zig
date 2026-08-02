@@ -328,7 +328,7 @@ pub const Parser = struct {
         if (i) |mnemo| switch (mnemo) {
             .jr    => return .{.itype = try self.parseJR(mnemo)},
             .jalr  => return .{.itype = try self.parseJR(mnemo)},
-            .jalrx => return .{.itype = try self.parseJR(mnemo)},
+            .jalrx => return .{.itype = try self.parseJALRX(mnemo)},
             .addi  => return .{.itype = try self.parseIALU(mnemo)},
             .andi  => return .{.itype = try self.parseIALU(mnemo)},
             .lci   => return .{.itype = try self.parseIALU(mnemo)},
@@ -359,7 +359,7 @@ pub const Parser = struct {
         if (j) |mnemo| switch (mnemo) {
             .j    => return .{.jtype = try self.parseJ(mnemo)},
             .jal  => return .{.jtype = try self.parseJ(mnemo)},
-            .jalx => return .{.jtype = try self.parseJ(mnemo)},
+            .jalx => return .{.jtype = try self.parseJALX(mnemo)},
         };
 
         return ParseError.InvalidInstruction;
@@ -373,6 +373,27 @@ pub const Parser = struct {
         return .{
             .opcode = mnemo,
             .imm = imm,
+            .linkRegister = .zero,
+        };
+    }
+
+    fn parseJALX(self: *Parser, mnemo: isa.JTypeMnemo) ParseError!isa.JType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        const lr = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(isa.JType.getInfo(mnemo).immtype.?);
+
+        switch (lr) {
+            .lr0, .lr1, .lr2, .lr3 => {},
+            else => return ParseError.InvalidEnumeration,
+        }
+
+        return .{
+            .opcode = mnemo,
+            .imm = imm,
+            .linkRegister = lr,
         };
     }
 
@@ -390,6 +411,7 @@ pub const Parser = struct {
             .rt = rt,
             .rs = rs,
             .imm = imm,
+            .linkRegister = .zero,
         };
     }
 
@@ -407,6 +429,7 @@ pub const Parser = struct {
             .rt = rt,
             .rs = rs,
             .imm = imm,
+            .linkRegister = .zero,
         };
     }
 
@@ -428,6 +451,7 @@ pub const Parser = struct {
             .rt = rt,
             .rs = rs,
             .imm = imm,
+            .linkRegister = .zero,
         };
     }
 
@@ -445,6 +469,7 @@ pub const Parser = struct {
             .rt = rt,
             .rs = rs,
             .imm = imm,
+            .linkRegister = .zero,
         };
     }
 
@@ -461,6 +486,32 @@ pub const Parser = struct {
             .rt = .zero,
             .rs = rs,
             .imm = imm,
+            .linkRegister = .zero,
+        };
+    }
+
+    fn parseJALRX(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
+        const mark = self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+        
+
+        const rs = try self.parseRegisterName();
+        try self.commaSep();
+        const lr = try self.parseRegisterName();
+        try self.commaSep();
+        const imm = try self.parseImmediate(isa.IType.getInfo(mnemo).immtype.?);
+
+        switch (lr) {
+            .lr0, .lr1, .lr2, .lr3 => {},
+            else => return ParseError.InvalidEnumeration,
+        }
+
+        return .{
+            .opcode = mnemo,
+            .rt = .zero,
+            .rs = rs,
+            .imm = imm,
+            .linkRegister = lr,
         };
     }
 
