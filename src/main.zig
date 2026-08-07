@@ -10,14 +10,34 @@ const helpText: []const u8 =
     \\  -v, --version       show program version
     \\  -o <file>           place the output into <file>
     \\  -l:<file>           link against an additional ELF object/library
-    \\  -c                  stop before linking
+    \\  -t <elf|mdbg>       emit using this format (default = mdbg)
+    \\  -c                  stop before linking (ELF-only)
     \\
     ;
 
-const versionString: []const u8 = "0.2";
+const versionString: []const u8 = "1.0";
+
+const OutputType = enum {
+    elf,
+    mdbg,
+};
+
+const DebugFileHeader = extern struct {
+    magic: u32,
+    version: u32,
+    aligned_base_addr: u32,
+    payload_size: u32,
+    real_start_addr: u32,
+    requested_size: u32,
+    alignment_flags: u32,
+    machine_name: [16]u8,
+    segment_name: [16]u8,
+};
 
 pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(init.io, &.{});
+    defer stdout.flush() catch {};
+    
     var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
     const exename = args.next();
@@ -28,7 +48,9 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     var libraries = try std.ArrayList([]const u8).initCapacity(allocator, 1);
 
+    var outputType: OutputType = .mdbg;
     var linkObject = true;
+
     while (args.next()) |arg| {
         if (arg.len == 0) continue;
 
@@ -47,6 +69,19 @@ pub fn main(init: std.process.Init) !void {
             };
         } else if (std.mem.startsWith(u8, arg, "-l:")) {
             try libraries.append(allocator, arg[3..]);
+        } else if (std.mem.eql(u8, arg, "-t")) {
+            const formatStr = args.next() orelse {
+                try stdout.interface.writeAll("error: expected format (elf or mdbg) after -t.\n");
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, formatStr, "elf")) {
+                outputType = .elf;
+            } else if (std.mem.eql(u8, formatStr, "mdbg")) {
+                outputType = .mdbg;
+            } else {
+                try stdout.interface.print("error: unrecognized format \"{s}\". Expected elf or mdbg.\n", .{formatStr});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, arg, "-c")) {
             linkObject = false;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
@@ -72,6 +107,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (outputName == null) {
         try stdout.interface.writeAll("error: no output file.\n");
+        std.process.exit(1);
+    }
+
+    if (!linkObject and outputType == .mdbg) {
+        try stdout.interface.writeAll("error: cannot stop before linking (-c) when emitting an mdbg snapshot.  Remove -c or use -t elf.\n");
         std.process.exit(1);
     }
 
@@ -155,51 +195,99 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    var finalSections = try std.ArrayList(c.ElfRawSection).initCapacity(allocator, layout.section_count);
-    defer finalSections.deinit(allocator);
-
-    var textBase: u32 = 0;
-    for (layout.sections[0..layout.section_count]) |*section| {
-        var flags: c.ElfShFlags = c.SHF_ALLOC;
-
-        if (std.mem.eql(u8, std.mem.sliceTo(&section.name, 0), ".text")) {
-            flags |= c.SHF_EXECINSTR;
-            textBase = @as(u32, @intCast(section.base_vaddr));
-        } else if (std.mem.eql(u8, std.mem.sliceTo(&section.name, 0), ".data")) {
-            flags |= c.SHF_WRITE;
-        }
-
-        try finalSections.append(allocator, .{
-            .name = std.mem.sliceTo(&section.name, 0).ptr,
-            .data = ram.ptr + section.base_vaddr,
-            .size = @as(u32, @intCast(section.size)),
-            .type = c.SHT_PROGBITS,
-            .flags = flags,
-            .addralign = @as(u32, @intCast(section.alignment)),
-            .link = 0,
-            .info = 0,
-            .entsize = 0
-        });
-    }
-
-    const entryPoint = views[0].header.*.e_entry + textBase;
-    const finalSize = c.elf_writer_calculate_size(finalSections.items.ptr, finalSections.items.len);
-    const finalBlob = try allocator.alloc(u8, finalSize);
-    status = c.elf_writer_serialize(
-        finalBlob.ptr,
-        finalBlob.len,
-        c.ET_EXEC,
-        entryPoint,
-        finalSections.items.ptr,
-        finalSections.items.len,
-    );
-
-    if (status != c.ELF_SUCCESS) {
-        try stdout.interface.print("error: final serialization failed: {s}\n", .{c.elf_status_str(status)});
-        std.process.exit(1);
-    }
-
     const outFile = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
     defer outFile.close(init.io);
-    try outFile.writeStreamingAll(init.io, finalBlob);
+
+    switch (outputType) {
+        .mdbg => {
+            var minAddress: u32 = 0xFFFFFFFF;
+            var maxAddress: u32 = 0;
+
+            for (layout.sections[0..layout.section_count]) |*section| {
+                if (section.size == 0) continue;
+                const begin = @as(u32, @intCast(section.base_vaddr));
+                const end = begin + @as(u32, @intCast(section.size));
+                
+                if (begin < minAddress) minAddress = begin;
+                if (end > maxAddress) maxAddress = end;
+            }
+
+            if (minAddress == 0xFFFFFFFF) minAddress = 0;
+            
+            const alignedStart = minAddress & ~@as(u32, 3);
+            const alignedEnd = (maxAddress + 3) & ~@as(u32, 3);
+            const payloadSize = alignedEnd - alignedStart;
+            const reqSize = maxAddress - minAddress;
+
+            var header = std.mem.zeroes(DebugFileHeader);
+            header.magic = 0x4742444D; // "MDBG"
+            header.version = 2;
+            header.aligned_base_addr = alignedStart;
+            header.payload_size = payloadSize;
+            header.real_start_addr = minAddress;
+            header.requested_size = reqSize;
+            header.alignment_flags = 0;
+
+            @memcpy(header.machine_name[0..5], "RTM32");
+            @memcpy(header.segment_name[0..4], "USER");
+
+            try outFile.writeStreamingAll(init.io, std.mem.asBytes(&header));
+            const sliceEnd = @min(alignedEnd, @as(u32, @intCast(ram.len)));
+            if (alignedStart < sliceEnd) {
+                try outFile.writeStreamingAll(init.io, ram[alignedStart..sliceEnd]);
+
+                const len = sliceEnd - alignedStart;
+                const padding = (-%len) & 3;
+                const zeros = [_]u8{0, 0, 0, 0};
+                try outFile.writeStreamingAll(init.io, zeros[0..padding]);
+            }
+        },
+
+        .elf => {
+            var finalSections = try std.ArrayList(c.ElfRawSection).initCapacity(allocator, layout.section_count);
+            defer finalSections.deinit(allocator);
+
+            var textBase: u32 = 0;
+            for (layout.sections[0..layout.section_count]) |*section| {
+                var flags: c.ElfShFlags = c.SHF_ALLOC;
+
+                if (std.mem.eql(u8, std.mem.sliceTo(&section.name, 0), ".text")) {
+                    flags |= c.SHF_EXECINSTR;
+                    textBase = @as(u32, @intCast(section.base_vaddr));
+                } else if (std.mem.eql(u8, std.mem.sliceTo(&section.name, 0), ".data")) {
+                    flags |= c.SHF_WRITE;
+                }
+
+                try finalSections.append(allocator, .{
+                    .name = std.mem.sliceTo(&section.name, 0).ptr,
+                    .data = ram.ptr + section.base_vaddr,
+                    .size = @as(u32, @intCast(section.size)),
+                    .type = c.SHT_PROGBITS,
+                    .flags = flags,
+                    .addralign = @as(u32, @intCast(section.alignment)),
+                    .link = 0,
+                    .info = 0,
+                    .entsize = 0
+                });
+            }
+
+            const entryPoint = views[0].header.*.e_entry + textBase;
+            const finalSize = c.elf_writer_calculate_size(finalSections.items.ptr, finalSections.items.len);
+            const finalBlob = try allocator.alloc(u8, finalSize);
+            status = c.elf_writer_serialize(
+                finalBlob.ptr,
+                finalBlob.len,
+                c.ET_EXEC,
+                entryPoint,
+                finalSections.items.ptr,
+                finalSections.items.len,
+            );
+
+            if (status != c.ELF_SUCCESS) {
+                try stdout.interface.print("error: final serialization failed: {s}\n", .{c.elf_status_str(status)});
+                std.process.exit(1);
+            }
+            try outFile.writeStreamingAll(init.io, finalBlob);
+        },
+    }
 }

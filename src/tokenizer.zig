@@ -732,7 +732,7 @@ pub const Tokenizer = struct {
                         const path = try std.fs.path.join(self.stringArena.allocator(), &[_][]const u8{dirname, filename.data});
                         const stat = try cwd.statFile(self.io, path, .{});
 
-                        var hexes = try self.stringArena.allocator().alloc(u8, stat.size * 5);
+                        var hexes = try self.stringArena.allocator().alloc(u8, @intCast(stat.size * 5));
                         errdefer self.stringArena.allocator().free(hexes);
 
                         const data = try cwd.readFileAlloc(self.io, path, self.stringArena.allocator(), .unlimited);

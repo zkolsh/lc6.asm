@@ -46,16 +46,16 @@ pub const Assembly = struct {
 
     pub fn init(allocator: std.mem.Allocator) !Assembly {
         var segments = std.StringHashMap(Segment).init(allocator);
-        try segments.put("text", std.ArrayList(u8).empty);
-        try segments.put("data", std.ArrayList(u8).empty);
+        try segments.put(".text", std.ArrayList(u8).empty);
+        try segments.put(".data", std.ArrayList(u8).empty);
 
         return .{
             .allocator = allocator,
             .strings = std.heap.ArenaAllocator.init(allocator),
             .sources = null,
             .segments = segments,
-            .currentSegment = segments.getPtr("text").?,
-            .currentSegmentName = "text",
+            .currentSegment = segments.getPtr(".text").?,
+            .currentSegmentName = ".text",
             .symbols = std.StringHashMap(Symbol).init(allocator),
             .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 32),
         };
@@ -472,13 +472,43 @@ pub const Assembly = struct {
         var sections = try std.ArrayList(c.ElfRawSection).initCapacity(self.allocator, 8);
         defer sections.deinit(self.allocator);
 
-        var segit = self.segments.iterator();
-        var nextSectionIndex: u16 = 1;
-        while (segit.next()) |entry| {
-            const name = try self.strings.allocator().dupeZ(u8, entry.key_ptr.*);
-            const seg = entry.value_ptr.*;
+        const SegmentEntry = struct {
+            name: []const u8,
+            seg: *std.ArrayList(u8),
+        };
 
-            try sectionIndices.put(entry.key_ptr.*, nextSectionIndex);
+        var ordered = std.ArrayList(SegmentEntry).empty;
+        defer ordered.deinit(self.allocator);
+
+        var textIndex: usize = 0;
+        var segIndex: usize = 0;
+
+        var segit = self.segments.iterator();
+        while (segit.next()) |entry| : (segIndex += 1) {
+            if (std.mem.eql(u8, entry.key_ptr.*, ".text")) {
+                textIndex = segIndex;
+            }
+
+            try ordered.append(self.allocator, .{
+                .name = entry.key_ptr.*,
+                .seg = entry.value_ptr,
+            });
+        }
+
+        if (textIndex != 0) {
+            std.mem.swap(SegmentEntry, &ordered.items[0], &ordered.items[textIndex]);
+        }
+
+        var nextSectionIndex: u16 = 1;
+        for (ordered.items) |segment| {
+            const name = try self.strings.allocator().dupeZ(u8, segment.name);
+            const seg = segment.seg;
+
+            if (std.mem.eql(u8, name, ".text")) {
+                textIndex = segIndex;
+            }
+
+            try sectionIndices.put(name, nextSectionIndex);
             nextSectionIndex += 1;
 
             const flags: c.ElfShFlags =
