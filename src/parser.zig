@@ -636,9 +636,14 @@ pub const Parser = struct {
         errdefer string.deinit(self.arena.allocator());
 
         while (self.lexer.frameHead != null) {
+            const mark = try self.lexer.bookmark();
             try self.lexer.skipWhitespace();
 
-            const segment = self.expect(.string) catch break;
+            const segment = self.expect(.string) catch {
+                self.lexer.restore(mark);
+                break;
+            };
+
             try string.appendSlice(self.arena.allocator(), segment);
         }
 

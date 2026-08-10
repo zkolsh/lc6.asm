@@ -463,7 +463,7 @@ pub const Tokenizer = struct {
 
                 '\\' => {
                     head.pos += 1;
-                    continue :state .slash;
+                    continue :state .backslash;
                 },
 
                 '%' => {
