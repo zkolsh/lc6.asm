@@ -7,6 +7,7 @@ pub const LexerError = error {
     InvalidCharacter,
     InvalidEscape,
     InvalidPreprocessorDirective,
+    TooManyFrames,
     MacroNotAllowedHere,
     MacroRedefined,
     StrayElse,
@@ -54,6 +55,8 @@ pub const Tokenizer = struct {
     macros: std.StringHashMap(Macro),
 
     frameHead: ?*Frame,
+
+    allowMacroDefinition: bool = true,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator) !Tokenizer {
         return .{
@@ -104,19 +107,24 @@ pub const Tokenizer = struct {
 
     pub const Bookmark = struct {
         frame: ?*Frame,
-        pos: [8]usize,
+        pos: [12]usize,
     };
 
-    pub fn bookmark(self: *Tokenizer) Bookmark {
+    pub fn bookmark(self: *Tokenizer) LexerError!Bookmark {
         var b = Bookmark{
             .frame = self.frameHead,
-            .pos = [_]usize{0} ** 8
+            .pos = [_]usize{0} ** 12,
         };
 
         var it = self.frameHead;
         var i: usize = 0;
         while (it) |f| : (it = f.next) {
-            if (i < b.pos.len) b.pos[i] = f.pos;
+            if (i < b.pos.len) {
+                b.pos[i] = f.pos;
+            } else {
+                return LexerError.TooManyFrames;
+            }
+
             i += 1;
         }
 
@@ -214,6 +222,7 @@ pub const Tokenizer = struct {
         character,
         character_end,
         slash,
+        backslash,
         line_comment,
         block_comment,
         block_comment_star,
@@ -245,6 +254,7 @@ pub const Tokenizer = struct {
 
         frame.pos += 1;
         switch (frame.input[frame.pos - 1]) {
+            '0' => return 0,
             '"' => return '"',
             '\'' => return '\'',
             '\\' => return '\\',
@@ -307,13 +317,17 @@ pub const Tokenizer = struct {
         std.debug.print("{s}:{d}:{d}: error: {s}\n", .{loc.filename, loc.line, loc.column, @errorName(err)});
         std.debug.print("{s}\n", .{snippet});
 
-        for (0..loc.column - 1) |_| std.debug.print(" ", .{});
+        for (snippet[0..loc.column - 1]) |c| switch (c) {
+            '\t' => std.debug.print("\t", .{}),
+            else => std.debug.print(" ",  .{}),
+        };
+
         std.debug.print("^\n", .{});
     }
 
     pub fn skipWhitespace(self: *Tokenizer) LexerError!void {
         while (self.frameHead != null) {
-            const mark = self.bookmark();
+            const mark = try self.bookmark();
             const token = try self.next();
             if (token.kind == .whitespace) continue;
             self.restore(mark);
@@ -447,6 +461,11 @@ pub const Tokenizer = struct {
                     continue :state .slash;
                 },
 
+                '\\' => {
+                    head.pos += 1;
+                    continue :state .slash;
+                },
+
                 '%' => {
                     head.pos += 1;
                     continue :state .pp_directive;
@@ -558,6 +577,16 @@ pub const Tokenizer = struct {
                 else => return LexerError.InvalidCharacter,
             },
 
+            .backslash => switch (self.peek()) {
+                '\n' => {
+                    head.pos += 1;
+                    tokenStart = head.pos;
+                    continue :state .start;
+                },
+
+                else => return LexerError.InvalidCharacter,
+            },
+
             .line_comment => switch (self.peek()) {
                 0 => {
                     continue :state .start;
@@ -648,7 +677,11 @@ pub const Tokenizer = struct {
                     try stringBuilder.appendSlice(self.stringArena.allocator(), head.input[tokenStart..head.pos]);
 
                     head.pos += 1;
-                    try stringBuilder.append(self.stringArena.allocator(), try getEscape(head));
+                    if (self.peek() == '\n') {
+                        head.pos += 1;
+                    } else {
+                        try stringBuilder.append(self.stringArena.allocator(), try getEscape(head));
+                    }
 
                     tokenStart = head.pos;
                     continue :state .string;
@@ -661,308 +694,151 @@ pub const Tokenizer = struct {
             },
 
             .pp_directive => {
-                const directiveStart = head.pos - 1;
+                try self.ppDirective(head);
+
+                head = self.frameHead.?;
+                tokenStart = head.pos;
+                continue :state .start;
+            },
+
+            .pp_expansion => {
+                const frame = try self.ppExpansion(head);
+
+                tokenStart = 0;
+                head = frame;
+                continue :state .start;
+            },
+        };
+    }
+
+    fn ppDirective(self: *Tokenizer, head: *Frame) LexerError!void {
+        var stringBuilder = std.ArrayList(u8).empty;
+
+        const directiveStart = head.pos - 1;
+        var tokenStart = head.pos;
+
+        while (head.pos < head.input.len and std.ascii.isAlphanumeric(head.input[head.pos]))
+            : (head.pos += 1) {}
+
+        const directive = std.meta.stringToEnum(isa.PreprocessorDirective, head.input[tokenStart..head.pos])
+            orelse return LexerError.InvalidPreprocessorDirective;
+
+        while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
+            : (head.pos += 1) {}
+
+        switch (directive) {
+            .define => {
+                if (self.allowMacroDefinition == false) return LexerError.MacroNotAllowedHere;
 
                 tokenStart = head.pos;
                 while (head.pos < head.input.len and std.ascii.isAlphanumeric(head.input[head.pos]))
                     : (head.pos += 1) {}
 
-                const directive = std.meta.stringToEnum(isa.PreprocessorDirective, head.input[tokenStart..head.pos])
-                    orelse return LexerError.InvalidPreprocessorDirective;
+                const name = head.input[tokenStart..head.pos];
+
+                while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
+                    : (head.pos += 1) {}
+                
+                tokenStart = head.pos;
+
+                while (head.pos < head.input.len and (head.input[head.pos] != '\n'))
+                    : (head.pos += 1) {}
+
+                var macro = Macro.init(head.filename);
+                macro.name = name;
+                macro.body = head.input[tokenStart..head.pos];
+
+                const gpr = try self.macros.getOrPut(macro.name);
+                if (gpr.found_existing) {
+                    return LexerError.MacroRedefined;
+                    //gpr.value_ptr.deinit(self.allocator);
+                }
+
+                gpr.value_ptr.* = macro;
+
+                const newInput = try self.stringArena.allocator().dupe(u8, head.input);
+                for (newInput[directiveStart..head.pos]) |*c| {
+                    if (c.* != '\n' and c.* != '\r') c.* = ' ';
+                }
+
+                head.input = newInput;
+                head.pos = directiveStart;
+
+                return;
+            },
+
+            .include => {
+                const filename = try self.nextWord();
+                if (filename.kind != .string) return LexerError.InvalidPreprocessorDirective;
+
+                try self.openFile(filename.data);
+                return;
+            },
+
+            .embed => {
+                const filename = try self.next();
+                if (filename.kind != .string) return LexerError.InvalidPreprocessorDirective;
+
+                const cwd = std.Io.Dir.cwd();
+                const dirname = std.fs.path.dirname(head.filename) orelse ".";
+                const path = try std.fs.path.join(self.stringArena.allocator(), &[_][]const u8{dirname, filename.data});
+                const stat = try cwd.statFile(self.io, path, .{});
+
+                var hexes = try self.stringArena.allocator().alloc(u8, @intCast(stat.size * 5));
+                errdefer self.stringArena.allocator().free(hexes);
+
+                const data = try cwd.readFileAlloc(self.io, path, self.stringArena.allocator(), .unlimited);
+                defer self.stringArena.allocator().free(data);
+
+                var streamPosition: usize = 0;
+                for (data) |byte| {
+                    _ = try std.fmt.bufPrint(hexes[streamPosition..], "0x{x:0>2} ", .{byte});
+                    streamPosition += 5;
+                }
+
+                try self.pushFrame(hexes, path);
+                return;
+            },
+
+            .filename => {
+                try stringBuilder.append(self.stringArena.allocator(), '"');
+                try stringBuilder.appendSlice(self.stringArena.allocator(), head.filename);
+                try stringBuilder.append(self.stringArena.allocator(), '"');
+
+                try self.pushFrame(stringBuilder.items, head.filename);
+                return;
+            },
+
+            .line => {
+                const loc = self.getLocation().?;
+                const line = try std.fmt.allocPrint(self.stringArena.allocator(), "\"{}\"", .{loc.line});
+
+                try self.pushFrame(stringBuilder.items, line);
+                return;
+            },
+
+            .macro => {
+                if (self.allowMacroDefinition == false) return LexerError.MacroNotAllowedHere;
+                self.allowMacroDefinition = false;
+                defer self.allowMacroDefinition = true;
+
+                const macroName = try self.nextWord();
+                if (macroName.kind != .identifier) return LexerError.ExpectedIdentifier;
 
                 while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
                     : (head.pos += 1) {}
 
-                switch (directive) {
-                    .define => {
-                        tokenStart = head.pos;
-                        while (head.pos < head.input.len and std.ascii.isAlphanumeric(head.input[head.pos]))
-                            : (head.pos += 1) {}
-
-                        const name = head.input[tokenStart..head.pos];
-
-                        while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
-                            : (head.pos += 1) {}
-                        
-                        tokenStart = head.pos;
-
-                        while (head.pos < head.input.len and (head.input[head.pos] != '\n'))
-                            : (head.pos += 1) {}
-
-                        var macro = Macro.init(head.filename);
-                        macro.name = name;
-                        macro.body = head.input[tokenStart..head.pos];
-
-                        const gpr = try self.macros.getOrPut(macro.name);
-                        if (gpr.found_existing) {
-                            return LexerError.MacroRedefined;
-                            //gpr.value_ptr.deinit(self.allocator);
-                        }
-
-                        gpr.value_ptr.* = macro;
-
-                        const newInput = try self.stringArena.allocator().dupe(u8, head.input);
-                        for (newInput[directiveStart..head.pos]) |*c| {
-                            if (c.* != '\n' and c.* != '\r') c.* = ' ';
-                        }
-
-                        head.input = newInput;
-                        head.pos = directiveStart;
-
-                        continue :state .start;
-                    },
-
-                    .include => {
-                        const filename = try self.nextWord();
-                        if (filename.kind != .string) return LexerError.InvalidPreprocessorDirective;
-
-                        try self.openFile(filename.data);
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
-
-                        continue :state .start;
-                    },
-
-                    .embed => {
-                        const filename = try self.next();
-                        if (filename.kind != .string) return LexerError.InvalidPreprocessorDirective;
-
-                        const cwd = std.Io.Dir.cwd();
-                        const dirname = std.fs.path.dirname(head.filename) orelse ".";
-                        const path = try std.fs.path.join(self.stringArena.allocator(), &[_][]const u8{dirname, filename.data});
-                        const stat = try cwd.statFile(self.io, path, .{});
-
-                        var hexes = try self.stringArena.allocator().alloc(u8, @intCast(stat.size * 5));
-                        errdefer self.stringArena.allocator().free(hexes);
-
-                        const data = try cwd.readFileAlloc(self.io, path, self.stringArena.allocator(), .unlimited);
-                        defer self.stringArena.allocator().free(data);
-
-                        var streamPosition: usize = 0;
-                        for (data) |byte| {
-                            _ = try std.fmt.bufPrint(hexes[streamPosition..], "0x{x:0>2} ", .{byte});
-                            streamPosition += 5;
-                        }
-
-                        try self.pushFrame(hexes, path);
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
-
-                        continue :state .start;
-                    },
-
-                    .filename => {
-                        try stringBuilder.append(self.stringArena.allocator(), '"');
-                        try stringBuilder.appendSlice(self.stringArena.allocator(), head.filename);
-                        try stringBuilder.append(self.stringArena.allocator(), '"');
-
-                        try self.pushFrame(stringBuilder.items, head.filename);
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
-
-                        continue :state .start;
-                    },
-
-                    .line => {
-                        const loc = self.getLocation().?;
-                        const line = try std.fmt.allocPrint(self.stringArena.allocator(), "\"{}\"", .{loc.line});
-
-                        try self.pushFrame(stringBuilder.items, line);
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
-
-                        continue :state .start;
-                    },
-
-                    .macro => {
-                        const macroName = try self.nextWord();
-                        if (macroName.kind != .identifier) return LexerError.ExpectedIdentifier;
-
-                        while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
-                            : (head.pos += 1) {}
-
-                        var macro = Macro.init(head.filename);
-                        errdefer macro.deinit(self.allocator);
-                        macro.name = macroName.data;
-                        macro.filename = head.filename;
-
-                        argparse: switch (ArgpState.lparen) {
-                            .lparen => {
-                                const lparen = try self.next();
-                                if (lparen.kind != .lparen) return LexerError.InvalidPreprocessorDirective;
-
-                                const mark = self.bookmark();
-                                const future = try self.nextWord();
-                                if (future.kind == .rparen) {
-                                    break :argparse;
-                                } else {
-                                    self.restore(mark);
-                                    continue :argparse .argname;
-                                }
-                            },
-
-                            .argname => {
-                                const argName = try self.nextWord();
-                                if (argName.kind != .identifier) return LexerError.ExpectedIdentifier;
-
-                                try macro.args.append(self.allocator, argName.data);
-                                continue :argparse .argsep;
-                            },
-
-                            .argsep => {
-                                const sep = try self.nextWord();
-                                switch (sep.kind) {
-                                    .comma => continue :argparse .argname,
-                                    .rparen => break :argparse,
-                                    else => return LexerError.InvalidCharacter,
-                                }
-                            },
-                        }
-
-                        var lastError = self.bookmark();
-
-                        while (head.pos < head.input.len and (head.input[head.pos] == '\n'))
-                            : (head.pos += 1) {}
-
-                        tokenStart = head.pos;
-                        while (self.frameHead != null and self.frameHead.?.pos < self.frameHead.?.input.len) {
-                            _ = self.next() catch |err| switch (err) {
-                                LexerError.StrayEndmacro => break,
-
-                                LexerError.UnexpectedEOF => return LexerError.UnterminatedPreprocessorDirective,
-
-                                LexerError.InvalidCharacter => {
-                                    self.frameHead.?.pos += 1;
-                                    continue;
-                                },
-
-                                else => {
-                                    if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
-                                        self.frameHead.?.pos += 1;
-                                    }
-
-                                    lastError = self.bookmark();
-                                    continue;
-                                },
-                            };
-                        }
-
-                        const tokenEnd = head.pos - "%endmacro".len;
-                        macro.body = head.input[tokenStart..tokenEnd];
-
-                        const gpr = try self.macros.getOrPut(macro.name);
-                        if (gpr.found_existing) {
-                            return LexerError.MacroRedefined;
-                            //gpr.value_ptr.deinit(self.allocator);
-                        }
-
-                        gpr.value_ptr.* = macro;
-
-                        const newInput = try self.stringArena.allocator().dupe(u8, head.input);
-                        for (newInput[directiveStart..head.pos]) |*c| {
-                            if (c.* != '\n' and c.* != '\r') c.* = ' ';
-                        }
-
-                        head.input = newInput;
-                        head.pos = directiveStart;
-
-                        continue :state .start;
-                    },
-
-                    .ifdef, .ifndef => |yn| {
-                        const name = try self.nextWord();
-                        if (name.kind != .identifier) return LexerError.ExpectedIdentifier;
-
-                        const enabled = self.macros.contains(name.data) == (yn == .ifdef);
-                        var assigned: bool = false;
-                        var correctScope: bool = enabled;
-
-                        var lastError = self.bookmark();
-
-                        tokenStart = head.pos;
-                        var tokenEnd = head.pos;
-                        while (head.pos < head.input.len) {
-                            _ = self.next() catch |err| switch (err) {
-                                LexerError.StrayEndif => {
-                                    if (!assigned) {
-                                        if (correctScope) {
-                                            tokenEnd = head.pos - "%endif".len;
-                                            assigned = true;
-                                        }
-                                    }
-
-                                    break;
-                                },
-
-                                LexerError.StrayElse => {
-                                    if (!assigned) {
-                                        if (correctScope) {
-                                            tokenEnd = head.pos - "%else".len;
-                                            correctScope = false;
-                                            assigned = true;
-                                        } else {
-                                            tokenStart = head.pos;
-                                            correctScope = true;
-                                        }
-                                    }
-
-                                    continue;
-                                },
-
-                                LexerError.UnexpectedEOF => return LexerError.UnterminatedPreprocessorDirective,
-
-                                LexerError.InvalidCharacter => {
-                                    self.frameHead.?.pos += 1;
-                                    continue;
-                                },
-
-                                else => {
-                                    if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
-                                        self.frameHead.?.pos += 1;
-                                    }
-
-                                    lastError = self.bookmark();
-                                    continue;
-                                },
-                            };
-                        }
-
-                        std.debug.assert(assigned);
-                        std.debug.assert(tokenStart < tokenEnd);
-
-                        try self.pushFrame(head.input[tokenStart..tokenEnd], head.filename);
-                        head = self.frameHead.?;
-                        tokenStart = head.pos;
-
-                        continue :state .start;
-                    },
-
-                    .@"else" => return LexerError.StrayElse,
-                    .endif => return LexerError.StrayEndif,
-                    .endmacro => return LexerError.StrayEndmacro,
-                }
-            },
-
-            .pp_expansion => {
-                tokenStart = head.pos;
-
-                const name = try self.nextWord();
-                if (name.kind != .identifier) return LexerError.ExpectedIdentifier;
-
-                const macro = self.macros.get(name.data) orelse {
-                    head.pos = tokenStart; // rewind for injection
-                    return LexerError.UnknownMacro;
-                };
-
-                var args = std.StringHashMap([]const u8).init(self.allocator);
-                defer args.deinit();
+                var macro = Macro.init(head.filename);
+                errdefer macro.deinit(self.allocator);
+                macro.name = macroName.data;
+                macro.filename = head.filename;
 
                 argparse: switch (ArgpState.lparen) {
                     .lparen => {
                         const lparen = try self.next();
                         if (lparen.kind != .lparen) return LexerError.InvalidPreprocessorDirective;
 
-                        const mark = self.bookmark();
+                        const mark = try self.bookmark();
                         const future = try self.nextWord();
                         if (future.kind == .rparen) {
                             break :argparse;
@@ -976,14 +852,7 @@ pub const Tokenizer = struct {
                         const argName = try self.nextWord();
                         if (argName.kind != .identifier) return LexerError.ExpectedIdentifier;
 
-                        const argc = args.count();
-                        if (argc >= macro.args.items.len) {
-                            return LexerError.ArityMismatch;
-                        }
-
-                        const gpr = try args.getOrPut(macro.args.items[argc]);
-                        gpr.value_ptr.* = argName.data;
-
+                        try macro.args.append(self.allocator, argName.data);
                         continue :argparse .argsep;
                     },
 
@@ -997,96 +866,258 @@ pub const Tokenizer = struct {
                     },
                 }
 
-                if (args.count() != macro.args.items.len) {
-                    return LexerError.ArityMismatch;
-                }
+                var lastError = try self.bookmark();
 
-                const frame = try self.frameArena.allocator().create(Frame);
-                self.frameHead = frame;
-                frame.next = head;
-                frame.filename = head.filename;
-                frame.pos = 0;
+                while (head.pos < head.input.len and (head.input[head.pos] == '\n'))
+                    : (head.pos += 1) {}
 
-                frame.input = macro.body;
+                tokenStart = head.pos;
+                while (self.frameHead != null and self.frameHead.?.pos < self.frameHead.?.input.len) {
+                    _ = self.next() catch |err| switch (err) {
+                        LexerError.StrayEndmacro => break,
 
-                if (args.count() == 0) {
-                    frame.input = macro.body;
-                    tokenStart = 0;
-                    head = frame;
-                    continue :state .start;
-                }
+                        LexerError.UnexpectedEOF => return LexerError.UnterminatedPreprocessorDirective,
 
-                const KV = std.StringHashMap(Macro).KV;
-                var stash = try std.ArrayList(KV).initCapacity(self.allocator, args.count());
-                defer stash.deinit(self.allocator);
-
-                for (macro.args.items) |key| {
-                    if (self.macros.fetchRemove(key)) |kv| {
-                        stash.appendAssumeCapacity(kv);
-                    }
-                }
-
-                defer {
-                    for (stash.items) |kv| {
-                        self.macros.putAssumeCapacity(kv.key, kv.value);
-                    }
-                }
-
-                try stringBuilder.ensureTotalCapacity(self.stringArena.allocator(), 5 * macro.body.len / 4);
-                var lastError = self.bookmark();
-                while (self.frameHead != null and self.frameHead.?.pos < self.frameHead.?.input.len) subst: {
-                    // std.debug.print("input.ptr={*} len={} pos={}\n", .{self.frameHead.?.input.ptr, self.frameHead.?.input.len, self.frameHead.?.pos});
-                    const token: Token = self.next() catch |err| blk: switch (err) {
-                        LexerError.UnknownMacro => {
-                            const id = try self.nextWord();
-                            if (id.kind != .identifier) return LexerError.ExpectedIdentifier;
-
-                            if (args.get(id.data)) |value| {
-                                break :blk .{.kind = .identifier, .data = value};
-                            } else {
-                                return err;
-                            }
+                        LexerError.InvalidCharacter => {
+                            self.frameHead.?.pos += 1;
+                            continue;
                         },
-
-                        LexerError.UnexpectedEOF => break :subst,
 
                         else => {
                             if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
                                 self.frameHead.?.pos += 1;
                             }
 
-                            lastError = self.bookmark();
+                            lastError = try self.bookmark();
                             continue;
                         },
                     };
-
-                    switch (token.kind) {
-                        .string => {
-                            try stringBuilder.append(self.stringArena.allocator(), '"');
-                            try stringBuilder.appendSlice(self.stringArena.allocator(), token.data);
-                            try stringBuilder.append(self.stringArena.allocator(), '"');
-                        },
-
-                        .char => {
-                            try stringBuilder.appendSlice(self.stringArena.allocator(), "'\\x");
-                            try stringBuilder.append(self.stringArena.allocator(), (token.data[0] >> 4) & 0xF);
-                            try stringBuilder.append(self.stringArena.allocator(), (token.data[0] >> 0) & 0xF);
-                            try stringBuilder.append(self.stringArena.allocator(), '\'');
-                        },
-
-                        else => try stringBuilder.appendSlice(self.stringArena.allocator(), token.data),
-                    }
                 }
 
-                frame.input = stringBuilder.items;
-                frame.pos = 0;
-                tokenStart = 0;
-                stringBuilder = std.ArrayList(u8).empty;
-                head = frame;
+                const tokenEnd = head.pos - "%endmacro".len;
+                macro.body = head.input[tokenStart..tokenEnd];
 
-                continue :state .start;
+                const gpr = try self.macros.getOrPut(macro.name);
+                if (gpr.found_existing) {
+                    return LexerError.MacroRedefined;
+                    //gpr.value_ptr.deinit(self.allocator);
+                }
+
+                gpr.value_ptr.* = macro;
+
+                const newInput = try self.stringArena.allocator().dupe(u8, head.input);
+                for (newInput[directiveStart..head.pos]) |*c| {
+                    if (c.* != '\n' and c.* != '\r') c.* = ' ';
+                }
+
+                head.input = newInput;
+                head.pos = directiveStart;
+                return;
             },
+
+            .ifdef, .ifndef => |yn| {
+                const name = try self.nextWord();
+                if (name.kind != .identifier) return LexerError.ExpectedIdentifier;
+
+                const enabled = self.macros.contains(name.data) == (yn == .ifdef);
+                var assigned: bool = false;
+                var correctScope: bool = enabled;
+
+                var lastError = try self.bookmark();
+
+                tokenStart = head.pos;
+                var tokenEnd = head.pos;
+                while (head.pos < head.input.len) {
+                    _ = self.next() catch |err| switch (err) {
+                        LexerError.StrayEndif => {
+                            if (!assigned) {
+                                if (correctScope) {
+                                    tokenEnd = head.pos - "%endif".len;
+                                    assigned = true;
+                                }
+                            }
+
+                            break;
+                        },
+
+                        LexerError.StrayElse => {
+                            if (!assigned) {
+                                if (correctScope) {
+                                    tokenEnd = head.pos - "%else".len;
+                                    correctScope = false;
+                                    assigned = true;
+                                } else {
+                                    tokenStart = head.pos;
+                                    correctScope = true;
+                                }
+                            }
+
+                            continue;
+                        },
+
+                        LexerError.UnexpectedEOF => return LexerError.UnterminatedPreprocessorDirective,
+
+                        LexerError.InvalidCharacter => {
+                            self.frameHead.?.pos += 1;
+                            continue;
+                        },
+
+                        else => {
+                            if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
+                                self.frameHead.?.pos += 1;
+                            }
+
+                            lastError = try self.bookmark();
+                            continue;
+                        },
+                    };
+                }
+
+                std.debug.assert(assigned);
+                std.debug.assert(tokenStart < tokenEnd);
+
+                try self.pushFrame(head.input[tokenStart..tokenEnd], head.filename);
+                return;
+            },
+
+            .@"else" => return LexerError.StrayElse,
+            .endif => return LexerError.StrayEndif,
+            .endmacro => return LexerError.StrayEndmacro,
+        }
+    }
+
+    fn ppExpansion(self: *Tokenizer, head: *Frame) LexerError!*Frame {
+        const tokenStart = head.pos;
+        const name = try self.nextWord();
+        if (name.kind != .identifier) return LexerError.ExpectedIdentifier;
+
+        const macro = self.macros.get(name.data) orelse {
+            head.pos = tokenStart; // rewind for injection
+            return LexerError.UnknownMacro;
         };
+
+        var args = std.StringHashMap([]const u8).init(self.allocator);
+        defer args.deinit();
+
+        argparse: switch (ArgpState.lparen) {
+            .lparen => {
+                const lparen = try self.next();
+                if (lparen.kind != .lparen) return LexerError.InvalidPreprocessorDirective;
+
+                const mark = try self.bookmark();
+                const future = try self.nextWord();
+                if (future.kind == .rparen) {
+                    break :argparse;
+                } else {
+                    self.restore(mark);
+                    continue :argparse .argname;
+                }
+            },
+
+            .argname => {
+                const argName = try self.nextWord();
+                if (argName.kind != .identifier) return LexerError.ExpectedIdentifier;
+
+                const argc = args.count();
+                if (argc >= macro.args.items.len) {
+                    return LexerError.ArityMismatch;
+                }
+
+                const gpr = try args.getOrPut(macro.args.items[argc]);
+                gpr.value_ptr.* = argName.data;
+
+                continue :argparse .argsep;
+            },
+
+            .argsep => {
+                const sep = try self.nextWord();
+                switch (sep.kind) {
+                    .comma => continue :argparse .argname,
+                    .rparen => break :argparse,
+                    else => return LexerError.InvalidCharacter,
+                }
+            },
+        }
+
+        if (args.count() != macro.args.items.len) {
+            return LexerError.ArityMismatch;
+        }
+
+        const frame = try self.frameArena.allocator().create(Frame);
+        self.frameHead = frame;
+        frame.next = head;
+        frame.filename = head.filename;
+        frame.pos = 0;
+
+        frame.input = macro.body;
+
+        if (args.count() == 0) {
+            return frame;
+        }
+
+        const KV = std.StringHashMap(Macro).KV;
+        var stash = try std.ArrayList(KV).initCapacity(self.allocator, args.count());
+        defer stash.deinit(self.allocator);
+
+        for (macro.args.items) |key| {
+            if (self.macros.fetchRemove(key)) |kv| {
+                stash.appendAssumeCapacity(kv);
+            }
+        }
+
+        defer for (stash.items) |kv| {
+            self.macros.putAssumeCapacity(kv.key, kv.value);
+        };
+
+        var stringBuilder = try std.ArrayList(u8).initCapacity(self.stringArena.allocator(), 5 * macro.body.len / 4);
+        var lastError = try self.bookmark();
+        while (self.frameHead != null and self.frameHead.?.pos < self.frameHead.?.input.len) subst: {
+            // std.debug.print("input.ptr={*} len={} pos={}\n", .{self.frameHead.?.input.ptr, self.frameHead.?.input.len, self.frameHead.?.pos});
+            const token: Token = self.next() catch |err| blk: switch (err) {
+                LexerError.UnknownMacro => {
+                    const id = try self.nextWord();
+                    if (id.kind != .identifier) return LexerError.ExpectedIdentifier;
+
+                    if (args.get(id.data)) |value| {
+                        break :blk .{.kind = .identifier, .data = value};
+                    } else {
+                        return err;
+                    }
+                },
+
+                LexerError.UnexpectedEOF => break :subst,
+
+                else => {
+                    if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
+                        self.frameHead.?.pos += 1;
+                    }
+
+                    lastError = try self.bookmark();
+                    continue;
+                },
+            };
+
+            switch (token.kind) {
+                .string => {
+                    try stringBuilder.append(self.stringArena.allocator(), '"');
+                    try stringBuilder.appendSlice(self.stringArena.allocator(), token.data);
+                    try stringBuilder.append(self.stringArena.allocator(), '"');
+                },
+
+                .char => {
+                    try stringBuilder.appendSlice(self.stringArena.allocator(), "'\\x");
+                    try stringBuilder.append(self.stringArena.allocator(), (token.data[0] >> 4) & 0xF);
+                    try stringBuilder.append(self.stringArena.allocator(), (token.data[0] >> 0) & 0xF);
+                    try stringBuilder.append(self.stringArena.allocator(), '\'');
+                },
+
+                else => try stringBuilder.appendSlice(self.stringArena.allocator(), token.data),
+            }
+        }
+
+        frame.input = stringBuilder.items;
+        frame.pos = 0;
+        return frame;
     }
 };
 

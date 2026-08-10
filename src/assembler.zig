@@ -366,7 +366,7 @@ pub const Assembly = struct {
                 continue;
             };
 
-            const mark = parser.lexer.bookmark();
+            const mark = try parser.lexer.bookmark();
             try self.encodeStatement(statement, mark);
         }
     }
@@ -405,7 +405,7 @@ pub const Assembly = struct {
                 continue;
             };
 
-            const mark = parser.lexer.bookmark();
+            const mark = try parser.lexer.bookmark();
             try self.encodeStatement(statement, mark);
         }
 
@@ -687,10 +687,10 @@ test "assembly initializes default segments" {
     var as = try Assembly.init(std.testing.allocator);
     defer as.deinit();
 
-    try std.testing.expect(as.segments.contains("text"));
-    try std.testing.expect(as.segments.contains("data"));
+    try std.testing.expect(as.segments.contains(".text"));
+    try std.testing.expect(as.segments.contains(".data"));
 
-    try std.testing.expectEqualStrings("text", as.currentSegmentName);
+    try std.testing.expectEqualStrings(".text", as.currentSegmentName);
     try std.testing.expectEqual(@as(usize, 0), as.currentSegment.items.len);
 }
 

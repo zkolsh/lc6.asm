@@ -60,7 +60,7 @@ pub const Parser = struct {
     }
 
     pub fn statementEnd(self: *Parser) ParseError!bool {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         try self.lexer.skipWhitespace();
@@ -128,7 +128,7 @@ pub const Parser = struct {
     }
 
     pub fn parseInteger(self: *Parser, comptime T: type) ParseError!T {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const signToken: Token = self.lexer.next() catch blk: {
@@ -160,7 +160,7 @@ pub const Parser = struct {
     }
 
     pub fn parseImmediate(self: *Parser, kind: isa.ImmediateKind) ParseError!isa.Immediate(u25) {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const token = try self.expectOneOf(.{.number, .identifier, .char, .minus, .plus});
@@ -186,7 +186,7 @@ pub const Parser = struct {
     }
 
     pub fn parseRegisterName(self: *Parser) ParseError!isa.Register {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         _ = try self.expect(.dollar);
@@ -201,7 +201,7 @@ pub const Parser = struct {
     }
 
     pub fn parseSpecialRegisterName(self: *Parser) ParseError!isa.SpecialRegister {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         _ = try self.expect(.dollar);
@@ -216,7 +216,7 @@ pub const Parser = struct {
     }
 
     pub fn parseLabel(self: *Parser) ParseError![]const u8 {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const name = try self.expectWord(.identifier);
@@ -226,14 +226,14 @@ pub const Parser = struct {
     }
 
     pub fn parseStatement(self: *Parser) ParseError!isa.Statement {
-        var start = self.lexer.bookmark();
+        var start = try self.lexer.bookmark();
         errdefer self.lexer.restore(start);
 
         var statement: isa.Statement = undefined;
         statement.label = self.parseLabel() catch &[_]u8{};
 
         const token = try self.lexer.nextWord();
-        start = self.lexer.bookmark();
+        start = try self.lexer.bookmark();
         switch (token.kind) {
             .identifier => {
                 const instr = try self.parseInstruction(token);
@@ -366,7 +366,7 @@ pub const Parser = struct {
     }
 
     fn parseJ(self: *Parser, mnemo: isa.JTypeMnemo) ParseError!isa.JType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const imm = try self.parseImmediate(isa.JType.getInfo(mnemo).immtype.?);
@@ -378,7 +378,7 @@ pub const Parser = struct {
     }
 
     fn parseJALX(self: *Parser, mnemo: isa.JTypeMnemo) ParseError!isa.JType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const lr = try self.parseRegisterName();
@@ -398,7 +398,7 @@ pub const Parser = struct {
     }
 
     fn parseI(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rt = try self.parseRegisterName();
@@ -416,7 +416,7 @@ pub const Parser = struct {
     }
 
     fn parseIALU(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rt = try self.parseRegisterName();
@@ -434,7 +434,7 @@ pub const Parser = struct {
     }
 
     fn parseIMem(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rt = try self.parseRegisterName();
@@ -456,7 +456,7 @@ pub const Parser = struct {
     }
 
     fn parseBranch(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rs = try self.parseRegisterName();
@@ -474,7 +474,7 @@ pub const Parser = struct {
     }
 
     fn parseJR(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
         
         const rs = try self.parseRegisterName();
@@ -491,9 +491,8 @@ pub const Parser = struct {
     }
 
     fn parseJALRX(self: *Parser, mnemo: isa.ITypeMnemo) ParseError!isa.IType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
-        
 
         const rs = try self.parseRegisterName();
         try self.commaSep();
@@ -516,7 +515,7 @@ pub const Parser = struct {
     }
 
     fn parseRShift(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
         
         const rd = try self.parseRegisterName();
@@ -540,7 +539,7 @@ pub const Parser = struct {
     }
 
     fn parseRShiftV(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rd = try self.parseRegisterName();
@@ -559,7 +558,7 @@ pub const Parser = struct {
     }
 
     fn parseRAux(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rs = try self.parseRegisterName();
@@ -576,7 +575,7 @@ pub const Parser = struct {
     }
 
     fn parseR3(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const rd = try self.parseRegisterName();
@@ -595,7 +594,7 @@ pub const Parser = struct {
     }
 
     fn parseTRAP(self: *Parser, mnemo: isa.RTypeMnemo) ParseError!isa.RType {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         const evilImmediate = try self.parseImmediate(.aux);
@@ -655,7 +654,7 @@ pub const Parser = struct {
         errdefer numbers.deinit(self.arena.allocator());
 
         while (self.lexer.frameHead != null) {
-            const mark = self.lexer.bookmark();
+            const mark = try self.lexer.bookmark();
             try self.lexer.skipWhitespace();
 
             const x = self.parseInteger(T) catch {
@@ -684,7 +683,7 @@ pub const Parser = struct {
         errdefer bytes.deinit(self.arena.allocator());
 
         while (self.lexer.frameHead != null) {
-            const mark = self.lexer.bookmark();
+            const mark = try self.lexer.bookmark();
             try self.lexer.skipWhitespace();
 
             const x = self.parseByte() catch {
@@ -703,7 +702,7 @@ pub const Parser = struct {
     }
 
     fn parsePaddingAlignment(self: *Parser) ParseError!usize {
-        const mark = self.lexer.bookmark();
+        const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
         _ = try self.expectWord(.lparen);
