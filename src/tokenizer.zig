@@ -3,16 +3,17 @@ const isa = @import("isa.zig");
 
 pub const LexerError = error {
     ArityMismatch,
+    BuiltinPreprocessorOverride,
     ExpectedIdentifier,
     InvalidCharacter,
     InvalidEscape,
     InvalidPreprocessorDirective,
-    TooManyFrames,
     MacroNotAllowedHere,
     MacroRedefined,
     StrayElse,
     StrayEndif,
     StrayEndmacro,
+    TooManyFrames,
     UnexpectedEOF,
     UnknownMacro,
     UnterminatedComment,
@@ -706,6 +707,7 @@ pub const Tokenizer = struct {
 
                 tokenStart = 0;
                 head = frame;
+                self.frameHead = frame;
                 continue :state .start;
             },
         };
@@ -735,6 +737,9 @@ pub const Tokenizer = struct {
                     : (head.pos += 1) {}
 
                 const name = head.input[tokenStart..head.pos];
+                if (std.meta.stringToEnum(isa.PreprocessorBuiltin, name)) |_| {
+                    return LexerError.BuiltinPreprocessorOverride;
+                }
 
                 while (head.pos < head.input.len and (head.input[head.pos] == ' ' or head.input[head.pos] == '\t'))
                     : (head.pos += 1) {}
@@ -986,16 +991,164 @@ pub const Tokenizer = struct {
         }
     }
 
-    fn ppExpansion(self: *Tokenizer, head: *Frame) LexerError!*Frame {
+    inline fn ppExpansion(self: *Tokenizer, head: *Frame) LexerError!*Frame {
         const tokenStart = head.pos;
         const name = try self.nextWord();
         if (name.kind != .identifier) return LexerError.ExpectedIdentifier;
 
-        const macro = self.macros.get(name.data) orelse {
+        if (std.meta.stringToEnum(isa.PreprocessorBuiltin, name.data)) |builtin| {
+            return ppBuiltinExpansion(self, head, builtin);
+        } else if (self.macros.get(name.data)) |macro| {
+            return ppMacroExpansion(self, head, macro);
+        } else {
             head.pos = tokenStart; // rewind for injection
             return LexerError.UnknownMacro;
-        };
+        }
+    }
 
+    fn ppBuiltinExpansion(self: *Tokenizer, head: *Frame, builtin: isa.PreprocessorBuiltin) LexerError!*Frame {
+        var stringBuilder = std.ArrayList(u8).empty;
+        errdefer stringBuilder.deinit(self.stringArena.allocator());
+
+        switch (builtin) {
+            .alignOf => {
+                const lparen = try self.next();
+                if (lparen.kind != .lparen) return LexerError.InvalidPreprocessorDirective;
+
+                const dot = try self.next();
+                if (dot.kind != .dot) return LexerError.InvalidPreprocessorDirective;
+
+                const directiveToken = try self.next();
+                if (directiveToken.kind != .identifier) return LexerError.InvalidPreprocessorDirective;
+
+                const directive = std.meta.stringToEnum(isa.DataDirective, directiveToken.data)
+                    orelse return LexerError.InvalidPreprocessorDirective;
+
+                const rparen = try self.next();
+                if (rparen.kind != .rparen) return LexerError.InvalidPreprocessorDirective;
+
+                const alignment: []const u8 = switch (directive) {
+                    .asciiz  => "1",
+                    .byte    => "1",
+                    .nascii  => "4",
+                    .pad     => "1",
+                    .ptr     => "4",
+                    .section => return LexerError.InvalidPreprocessorDirective,
+                    .short   => "2",
+                    .word    => "4",
+                };
+
+                const frame = try self.frameArena.allocator().create(Frame);
+                frame.pos = 0;
+                frame.input = alignment;
+                frame.filename = head.filename;
+                frame.next = head;
+
+                return frame;
+            },
+
+            .sizeOf => {
+                const lparen = try self.next();
+                if (lparen.kind != .lparen) return LexerError.InvalidPreprocessorDirective;
+
+                const dot = try self.next();
+                if (dot.kind != .dot) return LexerError.InvalidPreprocessorDirective;
+
+                const directiveToken = try self.next();
+                if (directiveToken.kind != .identifier) return LexerError.InvalidPreprocessorDirective;
+
+                const directive = std.meta.stringToEnum(isa.DataDirective, directiveToken.data)
+                    orelse return LexerError.InvalidPreprocessorDirective;
+
+                const rparen = try self.next();
+                if (rparen.kind != .rparen) return LexerError.InvalidPreprocessorDirective;
+
+                const size: []const u8 = switch (directive) {
+                    .asciiz  => "0",
+                    .byte    => "1",
+                    .nascii  => "4",
+                    .pad     => "0",
+                    .ptr     => "4",
+                    .section => return LexerError.InvalidPreprocessorDirective,
+                    .short   => "2",
+                    .word    => "4",
+                };
+
+                const frame = try self.frameArena.allocator().create(Frame);
+                frame.pos = 0;
+                frame.input = size;
+                frame.filename = head.filename;
+                frame.next = head;
+
+                return frame;
+            },
+
+            .stringify => {
+                const lparen = try self.next();
+                if (lparen.kind != .lparen) return LexerError.InvalidPreprocessorDirective;
+
+                var depth: usize = 0;
+                var lastError = try self.bookmark();
+                while (self.frameHead != null and self.frameHead.?.pos < self.frameHead.?.input.len) expand: {
+                    // std.debug.print("input.ptr={*} len={} pos={}\n", .{self.frameHead.?.input.ptr, self.frameHead.?.input.len, self.frameHead.?.pos});
+                    const token: Token = self.next() catch |err| switch (err) {
+                        LexerError.UnexpectedEOF => break :expand,
+                        else => {
+                            if (lastError.frame == self.frameHead and lastError.pos[0] == self.frameHead.?.pos) {
+                                self.frameHead.?.pos += 1;
+                            }
+
+                            lastError = try self.bookmark();
+                            continue;
+                        },
+                    };
+
+                    switch (token.kind) {
+                        .string => {
+                            try stringBuilder.append(self.stringArena.allocator(), '"');
+                            try stringBuilder.appendSlice(self.stringArena.allocator(), token.data);
+                            try stringBuilder.append(self.stringArena.allocator(), '"');
+                        },
+
+                        .char => {
+                            try stringBuilder.appendSlice(self.stringArena.allocator(), "'\\x");
+                            try stringBuilder.append(self.stringArena.allocator(), (token.data[0] >> 4) & 0xF);
+                            try stringBuilder.append(self.stringArena.allocator(), (token.data[0] >> 0) & 0xF);
+                            try stringBuilder.append(self.stringArena.allocator(), '\'');
+                        },
+
+                        .lparen => {
+                            depth += 1;
+                            try stringBuilder.appendSlice(self.stringArena.allocator(), token.data);
+                        },
+
+                        .rparen => {
+                            depth -= 1;
+                            if (depth == 0) {
+                                break :expand;
+                            } else {
+                                try stringBuilder.appendSlice(self.stringArena.allocator(), token.data);
+                            }
+                        },
+
+                        else => try stringBuilder.appendSlice(self.stringArena.allocator(), token.data),
+                    }
+                }
+
+                const frame = try self.frameArena.allocator().create(Frame);
+                frame.pos = 0;
+                frame.input = stringBuilder.items;
+                frame.filename = head.filename;
+                frame.next = head;
+
+                return frame;
+            },
+        }
+
+        unreachable;
+    }
+
+    fn ppMacroExpansion(self: *Tokenizer, head: *Frame, macro: Macro) LexerError!*Frame {
         var args = std.StringHashMap([]const u8).init(self.allocator);
         defer args.deinit();
 
@@ -1239,4 +1392,18 @@ test "macros" {
         \\ 123
         \\
     , &.{.string, .identifier, .string, .number, .number, .identifier, .number});
+}
+
+test "sizeOf" {
+    try testTokens("@sizeOf(.word)", &.{.number});
+    try testTokens("@sizeOf(.ptr)", &.{.number});
+    try testTokens("@sizeOf(.short)", &.{.number});
+    try testTokens("@sizeOf(.byte)", &.{.number});
+}
+
+test "alignOf" {
+    try testTokens("@alignOf(.word)", &.{.number});
+    try testTokens("@alignOf(.ptr)", &.{.number});
+    try testTokens("@alignOf(.short)", &.{.number});
+    try testTokens("@alignOf(.byte)", &.{.number});
 }

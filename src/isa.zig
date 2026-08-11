@@ -57,6 +57,12 @@ pub const PreprocessorDirective = enum {
     macro,
 };
 
+pub const PreprocessorBuiltin = enum {
+    alignOf,
+    sizeOf,
+    stringify,
+};
+
 pub const DataDirective = enum {
     asciiz,
     byte,
