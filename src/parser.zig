@@ -77,6 +77,21 @@ pub const Parser = struct {
         }
     }
 
+    pub fn skipToStatementStart(self: *Parser) ParseError!void {
+        while (self.lexer.frameHead != null) {
+            const mark = try self.lexer.bookmark();
+
+            _ = self.expectOneOf(.{.whitespace, .newline}) catch |err| switch (err) {
+                ParseError.NoMatch => {
+                    self.lexer.restore(mark);
+                    return;
+                },
+
+                else => return err,
+            };
+        }
+    }
+
     pub fn skipToStatementEnd(self: *Parser) ParseError!void {
         while (self.lexer.frameHead != null) {
             try self.lexer.skipWhitespace();

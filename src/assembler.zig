@@ -357,6 +357,9 @@ pub const Assembly = struct {
         }
 
         while (parser.lexer.frameHead != null) {
+            try parser.skipToStatementStart();
+            const mark = try parser.lexer.bookmark();
+
             const statement = parser.parseStatement() catch |err| {
                 if (err == parsing.ParseError.UnexpectedEOF) break;
                 if (parser.lexer.frameHead == null) break;
@@ -366,8 +369,14 @@ pub const Assembly = struct {
                 continue;
             };
 
-            const mark = try parser.lexer.bookmark();
-            try self.encodeStatement(statement, mark);
+            const cursor = try parser.lexer.bookmark();
+            self.encodeStatement(statement, mark) catch |err| {
+                parser.lexer.restore(mark);
+                parser.lexer.showErrorHere(err);
+                parser.lexer.restore(cursor);
+
+                return err;
+            };
         }
     }
 
@@ -392,6 +401,9 @@ pub const Assembly = struct {
 
         var firstErr: ?AssemblyError = null;
         while (parser.lexer.frameHead != null) {
+            try parser.skipToStatementStart();
+            const mark = try parser.lexer.bookmark();
+
             const statement = parser.parseStatement() catch |err| {
                 if (err == parsing.ParseError.UnexpectedEOF) break;
                 if (parser.lexer.frameHead == null) break;
@@ -405,8 +417,16 @@ pub const Assembly = struct {
                 continue;
             };
 
-            const mark = try parser.lexer.bookmark();
-            try self.encodeStatement(statement, mark);
+            const cursor = try parser.lexer.bookmark();
+            self.encodeStatement(statement, mark) catch |err| {
+                parser.lexer.restore(mark);
+                parser.lexer.showErrorHere(err);
+                parser.lexer.restore(cursor);
+
+                if (firstErr == null) {
+                    firstErr = err;
+                }
+            };
         }
 
         if (firstErr) |e| {
