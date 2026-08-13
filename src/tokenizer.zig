@@ -594,7 +594,6 @@ pub const Tokenizer = struct {
                 },
 
                 '\n' => {
-                    head.pos += 1;
                     tokenStart = head.pos;
                     continue :state .start;
                 },
@@ -1106,7 +1105,14 @@ pub const Tokenizer = struct {
                     switch (token.kind) {
                         .string => {
                             try stringBuilder.append(self.stringArena.allocator(), '"');
-                            try stringBuilder.appendSlice(self.stringArena.allocator(), token.data);
+
+                            // don't even risk it
+                            for (token.data) |c| {
+                                try stringBuilder.appendSlice(self.stringArena.allocator(), "'\\x");
+                                try stringBuilder.append(self.stringArena.allocator(), (c >> 4) & 0xF);
+                                try stringBuilder.append(self.stringArena.allocator(), (c >> 0) & 0xF);
+                            }
+
                             try stringBuilder.append(self.stringArena.allocator(), '"');
                         },
 

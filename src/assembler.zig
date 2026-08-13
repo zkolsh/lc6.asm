@@ -587,6 +587,7 @@ pub const Assembly = struct {
             relocsBySection.deinit();
         }
 
+        var relocationError: ?AssemblyError = null;
         for (self.relocations.items) |rel| {
             const gpr = try relocsBySection.getOrPut(rel.section);
             if (!gpr.found_existing) {
@@ -604,7 +605,15 @@ pub const Assembly = struct {
                 .aux   => c.R_RTM32_AUX,
             };
 
-            errdefer if (self.sources) |*sources| {
+            if (symbolIndices.get(rel.name)) |symbolIndex| {
+                try gpr.value_ptr.append(self.allocator, .{
+                    .r_offset = @intCast(rel.addr),
+                    .r_info = c.ELF32_R_INFO(
+                        symbolIndex,
+                        relType
+                    )
+                });
+            } else if (self.sources) |*sources| {
                 std.debug.print("when patching symbol {s}:\n", .{rel.name});
                 sources.restore(rel.bookmark);
 
@@ -613,15 +622,15 @@ pub const Assembly = struct {
                 }
 
                 sources.showErrorHere(AssemblyError.UnresolvedSymbol);
-            };
+                relocationError = relocationError orelse AssemblyError.UnresolvedSymbol;
+            } else {
+                std.debug.print("obtuse error patching symbol {s}:  {s}\n", .{rel.name, @errorName(AssemblyError.UnresolvedSymbol)});
+                relocationError = relocationError orelse AssemblyError.UnresolvedSymbol;
+            }
+        }
 
-            try gpr.value_ptr.append(self.allocator, .{
-                .r_offset = @intCast(rel.addr),
-                .r_info = c.ELF32_R_INFO(
-                    symbolIndices.get(rel.name) orelse return AssemblyError.UnresolvedSymbol,
-                    relType
-                )
-            });
+        if (relocationError) |err| {
+            return err;
         }
 
         const strtabIndex: u16 = nextSectionIndex;
