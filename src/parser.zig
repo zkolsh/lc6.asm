@@ -178,7 +178,7 @@ pub const Parser = struct {
         const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
 
-        const token = try self.expectOneOf(.{.number, .identifier, .char, .minus, .plus});
+        const token = try self.expectOneOf(.{.number, .identifier, .char, .minus, .plus, .dot});
         switch (token.kind) {
             .number, .minus, .plus => {
                 self.lexer.restore(mark);
@@ -196,6 +196,17 @@ pub const Parser = struct {
             },
             .char => return .{.static = @intCast(token.data[0])},
             .identifier => return .{.dynamic = token.data},
+            .dot => {
+                const kindStr = try self.expect(.identifier);
+                const ptrKind = std.meta.stringToEnum(isa.DataDirective, kindStr) orelse return ParseError.InvalidEnumeration;
+                if (ptrKind != .lo16 and ptrKind != .hi16) return ParseError.InvalidEnumeration;
+
+                const label = try self.expectWord(.identifier);
+                return .{.pointer = .{
+                    .high = ptrKind == .hi16,
+                    .label = label,
+                }};
+            },
             else => unreachable,
         }
     }
@@ -270,6 +281,8 @@ pub const Parser = struct {
                     .nascii  => |x| statement.value = .{.nascii = x},
                     .padding => |x| statement.value = .{.padding = x},
                     .ptr     => |x| statement.value = .{.ptr = x},
+                    .lo16    => |x| statement.value = .{.lo16 = x},
+                    .hi16    => |x| statement.value = .{.hi16 = x},
                 }
             },
 
@@ -542,6 +555,7 @@ pub const Parser = struct {
             .dynamic => |x| .{.dynamic = x},
             .static  => |x| .{.static = std.math.cast(u5, x)
                 orelse return ParseError.NumericOverflow},
+            .pointer  => |x| .{.dynamic = x.label},
         };
 
         return .{
@@ -617,6 +631,7 @@ pub const Parser = struct {
             .dynamic => |x| .{.dynamic = x},
             .static  => |x| .{.static = std.math.cast(u5, x)
                 orelse return ParseError.NumericOverflow},
+            .pointer  => |x| .{.dynamic = x.label},
         };
 
         return .{
@@ -643,6 +658,8 @@ pub const Parser = struct {
             .section => return .{.section = try self.parseSectionLabel()},
             .short   => return .{.shorts = try self.parseIntegerList(u16)},
             .word    => return .{.words = try self.parseIntegerList(u32)},
+            .lo16    => return .{.lo16 = try self.parseSymbolLabel()},
+            .hi16    => return .{.hi16 = try self.parseSymbolLabel()},
         }
     }
 

@@ -72,6 +72,8 @@ pub const DataDirective = enum {
     section,
     short,
     word,
+    lo16,
+    hi16,
 };
 
 pub const RelocationMode = enum {
@@ -83,6 +85,8 @@ pub const RelocationMode = enum {
     imm,
     simm,
     aux,
+    ptrlo, // .lo16
+    ptrhi, // .hi16 
 };
 
 pub const ImmediateKind = enum {
@@ -99,6 +103,10 @@ pub fn Immediate(comptime T: type) type {
     return union(enum) {
         static: T,
         dynamic: []const u8,
+        pointer: struct {
+            high: bool,
+            label: []const u8,
+        }
     };
 }
 
@@ -312,6 +320,8 @@ pub const Directive = union(enum) {
     nascii: []const u8,
     padding: Padding,
     ptr: []const u8,
+    lo16: []const u8,
+    hi16: []const u8,
 };
 
 pub const Statement = struct {
@@ -325,6 +335,8 @@ pub const Statement = struct {
         nascii: []const u8,
         padding: Padding,
         ptr: []const u8,
+        lo16: []const u8,
+        hi16: []const u8,
         rtype: RType,
         itype: IType,
         jtype: JType,

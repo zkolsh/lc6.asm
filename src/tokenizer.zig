@@ -1035,6 +1035,8 @@ pub const Tokenizer = struct {
                     .section => return LexerError.InvalidPreprocessorDirective,
                     .short   => "2",
                     .word    => "4",
+                    .lo16    => "2",
+                    .hi16    => "2",
                 };
 
                 const frame = try self.frameArena.allocator().create(Frame);
@@ -1071,6 +1073,8 @@ pub const Tokenizer = struct {
                     .section => return LexerError.InvalidPreprocessorDirective,
                     .short   => "2",
                     .word    => "4",
+                    .lo16    => "2",
+                    .hi16    => "2",
                 };
 
                 const frame = try self.frameArena.allocator().create(Frame);

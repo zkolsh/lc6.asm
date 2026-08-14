@@ -487,6 +487,16 @@ ElfStatus elf_view_patch_relocations(
 			break;
 		};
 
+		case R_RTM32_PTRLO: {
+			instruction |= (absolute_addr >>  0) & 0xFFFF;
+			break;
+		};
+
+		case R_RTM32_PTRHI: {
+			instruction |= (absolute_addr >> 16) & 0xFFFF;
+			break;
+		};
+
 		default:
 #if defined(DEBUG)
 			fprintf(stderr, "hit default branch, relocation was type %zu\n", (size_t)reloc_type);
