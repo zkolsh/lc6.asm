@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "strip debug symbols from the binary");
 
     const exe = b.addExecutable(.{
         .name = "rtm32.asm",
@@ -13,6 +14,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    exe.root_module.strip = strip;
+    exe.link_gc_sections = true;
+
     const translate_elf = b.addTranslateC(.{
         .root_source_file = b.path("cbits/elf_io.h"),
         .target = target,
@@ -21,6 +25,8 @@ pub fn build(b: *std.Build) void {
 
     const elf = translate_elf.createModule();
     elf.link_libc = true;
+    elf.strip = strip;
+
     exe.root_module.addImport("elf_io", elf);
     exe.root_module.addCSourceFile(.{
         .file = b.path("cbits/elf_io.c"),
