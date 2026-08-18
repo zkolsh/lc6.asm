@@ -24,8 +24,8 @@ pub const Relocation = struct {
 pub const AssemblyError = error {
     InvalidAlignment,
     InvalidLabel,
+    InvalidRelocation,
     LabelNotAllowedHere,
-    NoData,
     SerializationFailed,
     SymbolRedefined,
     UnresolvedSymbol,
@@ -153,6 +153,36 @@ pub const Assembly = struct {
                 try self.currentSegment.appendNTimes(self.allocator, 0x77, 4);
             },
 
+            .lo16 => |label| {
+                try self.alignSegment(self.currentSegment, 2);
+                labelLoc = self.getOffset();
+
+                try self.relocations.append(self.allocator, .{
+                    .addr = labelLoc,
+                    .name = label,
+                    .section = self.currentSegmentName,
+                    .kind = .ptrlo,
+                    .bookmark = bookmark,
+                });
+
+                try self.currentSegment.appendNTimes(self.allocator, 0x47, 2);
+            },
+
+            .hi16 => |label| {
+                try self.alignSegment(self.currentSegment, 2);
+                labelLoc = self.getOffset();
+
+                try self.relocations.append(self.allocator, .{
+                    .addr = labelLoc,
+                    .name = label,
+                    .section = self.currentSegmentName,
+                    .kind = .ptrhi,
+                    .bookmark = bookmark,
+                });
+
+                try self.currentSegment.appendNTimes(self.allocator, 0x74, 2);
+            },
+
             .rtype => |r| {
                 try self.alignSegment(self.currentSegment, 4);
                 labelLoc = self.getOffset();
@@ -170,6 +200,7 @@ pub const Assembly = struct {
 
                         break :blk 0;
                     },
+                    .pointer => return AssemblyError.InvalidRelocation,
                 };
 
                 const mangled: u32
@@ -196,6 +227,18 @@ pub const Assembly = struct {
                             .name = label,
                             .section = self.currentSegmentName,
                             .kind = info.reltype.?,
+                            .bookmark = bookmark,
+                        });
+
+                        break :blk 0;
+                    },
+
+                    .pointer => |x| blk: {
+                        try self.relocations.append(self.allocator, .{
+                            .addr = labelLoc,
+                            .name = x.label,
+                            .section = self.currentSegmentName,
+                            .kind = if (x.high) .ptrhi else .ptrlo,
                             .bookmark = bookmark,
                         });
 
@@ -247,6 +290,18 @@ pub const Assembly = struct {
                             .name = label,
                             .section = self.currentSegmentName,
                             .kind = info.reltype.?,
+                            .bookmark = bookmark,
+                        });
+
+                        break :blk 0;
+                    },
+
+                    .pointer => |x| blk: {
+                        try self.relocations.append(self.allocator, .{
+                            .addr = labelLoc,
+                            .name = x.label,
+                            .section = self.currentSegmentName,
+                            .kind = if (x.high) .ptrhi else .ptrlo,
                             .bookmark = bookmark,
                         });
 
@@ -595,6 +650,8 @@ pub const Assembly = struct {
             }
 
             const relType = switch (rel.kind) {
+                .ptrlo  => c.R_RTM32_PTRLO,
+                .ptrhi  => c.R_RTM32_PTRHI,
                 .word  => c.R_RTM32_WORD,
                 .elimm => c.R_RTM32_ELIMM,
                 .vlimm => c.R_RTM32_VLIMM,

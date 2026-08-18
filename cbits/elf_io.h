@@ -172,6 +172,8 @@ enum {
 	R_RTM32_IMM   = 6,
 	R_RTM32_SIMM  = 7,
 	R_RTM32_AUX   = 8,
+	R_RTM32_PTRHI = 9,
+	R_RTM32_PTRLO = 10,
 };
 
 typedef struct {

@@ -654,7 +654,8 @@ pub const Tokenizer = struct {
 
                 '\'' => {
                     head.pos += 1;
-                    return .{.kind = .char, .data = &[_]u8{char}};
+                    try stringBuilder.append(self.stringArena.allocator(), char);
+                    return .{.kind = .char, .data = stringBuilder.items};
                 },
 
                 else => {
@@ -1035,6 +1036,8 @@ pub const Tokenizer = struct {
                     .section => return LexerError.InvalidPreprocessorDirective,
                     .short   => "2",
                     .word    => "4",
+                    .lo16    => "2",
+                    .hi16    => "2",
                 };
 
                 const frame = try self.frameArena.allocator().create(Frame);
@@ -1071,6 +1074,8 @@ pub const Tokenizer = struct {
                     .section => return LexerError.InvalidPreprocessorDirective,
                     .short   => "2",
                     .word    => "4",
+                    .lo16    => "2",
+                    .hi16    => "2",
                 };
 
                 const frame = try self.frameArena.allocator().create(Frame);
