@@ -174,6 +174,16 @@ pub const Parser = struct {
         }
     }
 
+    pub fn tryParseLabelOffset(self: *Parser) ParseError!i32 {
+        const mark = try self.lexer.bookmark();
+        errdefer self.lexer.restore(mark);
+
+        _ = try self.expectOneOf(.{.plus, .minus});
+        self.lexer.restore(mark);
+
+        return try self.parseInteger(i32);
+    }
+
     pub fn parseImmediate(self: *Parser, kind: isa.ImmediateKind) ParseError!isa.Immediate(u25) {
         const mark = try self.lexer.bookmark();
         errdefer self.lexer.restore(mark);
@@ -195,7 +205,12 @@ pub const Parser = struct {
                     orelse return ParseError.NumericOverflow};
             },
             .char => return .{.static = @intCast(token.data[0])},
-            .identifier => return .{.dynamic = token.data},
+            .identifier => {
+                return .{.dynamic = .{
+                    .label = token.data,
+                    .offset = self.tryParseLabelOffset() catch 0,
+                }};
+            },
             .dot => {
                 const kindStr = try self.expect(.identifier);
                 const ptrKind = std.meta.stringToEnum(isa.DataDirective, kindStr) orelse return ParseError.InvalidEnumeration;
@@ -555,7 +570,7 @@ pub const Parser = struct {
             .dynamic => |x| .{.dynamic = x},
             .static  => |x| .{.static = std.math.cast(u5, x)
                 orelse return ParseError.NumericOverflow},
-            .pointer  => |x| .{.dynamic = x.label},
+            .pointer  => |x| .{.dynamic = .{.label = x.label, .offset = 0}},
         };
 
         return .{
@@ -631,7 +646,7 @@ pub const Parser = struct {
             .dynamic => |x| .{.dynamic = x},
             .static  => |x| .{.static = std.math.cast(u5, x)
                 orelse return ParseError.NumericOverflow},
-            .pointer  => |x| .{.dynamic = x.label},
+            .pointer  => |x| .{.dynamic = .{.label = x.label, .offset = 0}},
         };
 
         return .{
@@ -844,7 +859,7 @@ test "parseImmediate symbol" {
 
     switch (imm) {
         .dynamic => |name|
-            try std.testing.expectEqualStrings("loop", name),
+            try std.testing.expectEqualStrings("loop", name.label),
         else => try std.testing.expect(false),
     }
 }
@@ -941,7 +956,7 @@ test "parseStatement jump label" {
 
             switch (j.imm) {
                 .dynamic => |name|
-                    try std.testing.expectEqualStrings("loop", name),
+                    try std.testing.expectEqualStrings("loop", name.label),
                 else => try std.testing.expect(false),
             }
         },

@@ -350,15 +350,9 @@ ElfStatus elf_view_patch_relocations(
 		const char* section_name, const ElfSectionAddress* layout, size_t layout_count) {
 	if (!view || !section_data) return ELF_MISSING_PARAMS;
 
-	char relsection_name[40] = ".rel";
-	strcat(relsection_name, section_name);
-
-	uint32_t rel_size = 0;
-	const uint8_t* rel_bytes = elf_view_get_section(view, relsection_name, &rel_size, NULL);
-	if (!rel_bytes || rel_size == 0) {
-		/* no relocations to patch. */
-		return ELF_SUCCESS; 
-	};
+	const ElfSHDR* symtab_shdr = elf_view_get_section_header(view, ".symtab");
+	if (!symtab_shdr) return ELF_INVALID_EHDR;
+	const ElfSym* symtab = (const ElfSym*)(view->buffer_view + symtab_shdr->sh_offset);
 
 	uint32_t current_sec_vaddr = 0;
 	uint8_t current_vaddr_found = 0;
@@ -370,141 +364,286 @@ ElfStatus elf_view_patch_relocations(
 		};
 	};
 
-	if (!current_vaddr_found) {
-		return ELF_INVALID_RELOCATION;
-	};
+	// Process .rel<section_name>
+	char relsection_name[40] = ".rel";
+	strncat(relsection_name, section_name, sizeof(relsection_name) - strlen(relsection_name) - 1);
 
-	const ElfSHDR* symtab_shdr = elf_view_get_section_header(view, ".symtab");
-	if (!symtab_shdr) return ELF_INVALID_EHDR;
-	const ElfSym* symtab = (const ElfSym*)(view->buffer_view + symtab_shdr->sh_offset);
-
-	const size_t rel_count = rel_size / sizeof(ElfRel);
-	const ElfRel* rel_table = (const ElfRel*)rel_bytes;
-
-	for (size_t i = 0; i < rel_count; i++) {
-		ElfRel rel = rel_table[i];
-		if (rel.r_offset + sizeof(uint32_t) > section_data_size) {
-			return ELF_BUFFER_TOO_SMALL;
+	uint32_t rel_size = 0;
+	const uint8_t* rel_bytes = elf_view_get_section(view, relsection_name, &rel_size, NULL);
+	if (rel_bytes && rel_size > 0) {
+		if (!current_vaddr_found) {
+			return ELF_INVALID_RELOCATION;
 		};
 
-		const uint32_t sym_index = ELF32_R_SYM(rel.r_info);
-		const ElfRelocType reloc_type = ELF32_R_TYPE(rel.r_info);
-		const ElfSym sym = symtab[sym_index];
+		const size_t rel_count = rel_size / sizeof(ElfRel);
+		const ElfRel* rel_table = (const ElfRel*)rel_bytes;
 
-		if (sym.st_shndx >= view->section_count) {
-			return ELF_INVALID_EHDR;
-		};
+		for (size_t i = 0; i < rel_count; i++) {
+			ElfRel rel = rel_table[i];
+			if (rel.r_offset + sizeof(uint32_t) > section_data_size) {
+				return ELF_BUFFER_TOO_SMALL;
+			};
 
-		const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
-		const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
+			const uint32_t sym_index = ELF32_R_SYM(rel.r_info);
+			const ElfRelocType reloc_type = ELF32_R_TYPE(rel.r_info);
+			const ElfSym sym = symtab[sym_index];
 
-		uint8_t base_vaddr_found = 0;
-		uint32_t base_vaddr = 0;
+			if (sym.st_shndx >= view->section_count) {
+				return ELF_INVALID_EHDR;
+			};
 
-		for (size_t j = 0; j < layout_count; j++) {
-			if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
-				base_vaddr = layout[j].base_vaddr;
-				base_vaddr_found = 1;
+			const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
+			const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
+
+			uint8_t base_vaddr_found = 0;
+			uint32_t base_vaddr = 0;
+
+			for (size_t j = 0; j < layout_count; j++) {
+				if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+					base_vaddr = layout[j].base_vaddr;
+					base_vaddr_found = 1;
+					break;
+				};
+			};
+
+			if (!base_vaddr_found) {
+#if defined(DEBUG)
+				fprintf(stderr, "base vaddress was not found.\n");
+#endif
+				return ELF_INVALID_RELOCATION;
+			};
+
+			const uint32_t absolute_addr = base_vaddr + sym.st_value;
+			uint32_t instruction;
+			memcpy(&instruction, &section_data[rel.r_offset], sizeof(uint32_t));
+
+			uint32_t ci_vaddr = current_sec_vaddr + rel.r_offset;
+			switch (reloc_type) {
+			case R_RTM32_WORD: {
+				instruction = absolute_addr;
 				break;
 			};
-		};
 
-		if (!base_vaddr_found) {
-#if defined(DEBUG)
-			fprintf(stderr, "base vaddress was not found.\n");
-#endif
-			return ELF_INVALID_RELOCATION;
-		};
-
-		const uint32_t absolute_addr = base_vaddr + sym.st_value;
-		uint32_t instruction;
-		memcpy(&instruction, &section_data[rel.r_offset], sizeof(uint32_t));
-
-		uint32_t ci_vaddr = current_sec_vaddr + rel.r_offset;
-		switch (reloc_type) {
-		case R_RTM32_WORD: {
-			instruction = absolute_addr;
-			break;
-		};
-
-		case R_RTM32_ELIMM: {
-			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
-			uint32_t imm25 = (uint32_t)(offset >> 2) & 0x1FFFFFF;
-			instruction &= ~0x1FFFFFF;
-			instruction |= imm25;
-			break;
-		};
-
-		case R_RTM32_VLIMM: {
-			int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
-			uint32_t imm24 = (uint32_t)(offset >> 2) & 0xFFFFFF;
-			instruction &= ~0xFFFFFF;
-			instruction |= imm24;
-			break;
-		};
-
-		case R_RTM32_LLIMM: {
-			uint32_t imm20 = (absolute_addr >> 2) & 0xFFFFF;
-			instruction &= ~0xFFFFF;
-			instruction |= imm20;
-			break;
-		};
-
-		case R_RTM32_LIMM: {
-			uint32_t imm19 = (absolute_addr >> 2) & 0x7FFFF;
-			instruction &= ~0x7FFFF;
-			instruction |= imm19;
-			break;
-		};
-
-		case R_RTM32_IMM: {
-			uint8_t opcode = instruction >> 27;
-			uint32_t imm17;
-
-			if (opcode >= 16 && opcode <= 21) {
+			case R_RTM32_ELIMM: {
 				int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
-				imm17 = (uint32_t)(offset >> 2) & 0x1FFFF;
-			} else {
-				imm17 = absolute_addr & 0x1FFFF;
+				uint32_t imm25 = (uint32_t)(offset >> 2) & 0x1FFFFFF;
+				instruction &= ~0x1FFFFFF;
+				instruction |= imm25;
+				break;
 			};
 
-			instruction &= ~0x1FFFF;
-			instruction |= imm17;
-			break;
-		};
+			case R_RTM32_VLIMM: {
+				int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+				uint32_t imm24 = (uint32_t)(offset >> 2) & 0xFFFFFF;
+				instruction &= ~0xFFFFFF;
+				instruction |= imm24;
+				break;
+			};
 
-		case R_RTM32_SIMM: {
-			uint32_t imm16 = absolute_addr & 0xFFFF;
-			instruction &= ~0xFFFF;
-			instruction |= imm16;
-			break;
-		};
+			case R_RTM32_LLIMM: {
+				uint32_t imm20 = (absolute_addr >> 2) & 0xFFFFF;
+				instruction &= ~0xFFFFF;
+				instruction |= imm20;
+				break;
+			};
 
-		case R_RTM32_AUX: {
-			uint32_t imm5 = absolute_addr & 0x1F;
-			instruction &= ~(0x1F << 7);
-			instruction |= (imm5 << 7);
-			break;
-		};
+			case R_RTM32_LIMM: {
+				uint32_t imm19 = (absolute_addr >> 2) & 0x7FFFF;
+				instruction &= ~0x7FFFF;
+				instruction |= imm19;
+				break;
+			};
 
-		case R_RTM32_PTRLO: {
-			instruction |= (absolute_addr >>  0) & 0xFFFF;
-			break;
-		};
+			case R_RTM32_IMM: {
+				uint8_t opcode = instruction >> 27;
+				uint32_t imm17;
 
-		case R_RTM32_PTRHI: {
-			instruction |= (absolute_addr >> 16) & 0xFFFF;
-			break;
-		};
+				if (opcode >= 16 && opcode <= 21) {
+					int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+					imm17 = (uint32_t)(offset >> 2) & 0x1FFFF;
+				} else {
+					imm17 = absolute_addr & 0x1FFFF;
+				};
 
-		default:
+				instruction &= ~0x1FFFF;
+				instruction |= imm17;
+				break;
+			};
+
+			case R_RTM32_SIMM: {
+				uint32_t imm16 = absolute_addr & 0xFFFF;
+				instruction &= ~0xFFFF;
+				instruction |= imm16;
+				break;
+			};
+
+			case R_RTM32_AUX: {
+				uint32_t imm5 = absolute_addr & 0x1F;
+				instruction &= ~(0x1F << 7);
+				instruction |= (imm5 << 7);
+				break;
+			};
+
+			case R_RTM32_PTRLO: {
+				instruction |= (absolute_addr >>  0) & 0xFFFF;
+				break;
+			};
+
+			case R_RTM32_PTRHI: {
+				instruction |= (absolute_addr >> 16) & 0xFFFF;
+				break;
+			};
+
+			default:
 #if defined(DEBUG)
-			fprintf(stderr, "hit default branch, relocation was type %zu\n", (size_t)reloc_type);
+				fprintf(stderr, "hit default branch, relocation was type %zu\n", (size_t)reloc_type);
 #endif
+				return ELF_INVALID_RELOCATION;
+			};
+
+			memcpy(&section_data[rel.r_offset], &instruction, sizeof(uint32_t));
+		};
+	};
+
+	// Process .rela<section_name>
+	char relasection_name[40] = ".rela";
+	strncat(relasection_name, section_name, sizeof(relasection_name) - strlen(relasection_name) - 1);
+
+	uint32_t rela_size = 0;
+	const uint8_t* rela_bytes = elf_view_get_section(view, relasection_name, &rela_size, NULL);
+	if (rela_bytes && rela_size > 0) {
+		if (!current_vaddr_found) {
 			return ELF_INVALID_RELOCATION;
 		};
 
-		memcpy(&section_data[rel.r_offset], &instruction, sizeof(uint32_t));
+		const size_t rela_count = rela_size / sizeof(ElfRela);
+		const ElfRela* rela_table = (const ElfRela*)rela_bytes;
+
+		for (size_t i = 0; i < rela_count; i++) {
+			ElfRela rela = rela_table[i];
+			if (rela.r_offset + sizeof(uint32_t) > section_data_size) {
+				return ELF_BUFFER_TOO_SMALL;
+			};
+
+			const uint32_t sym_index = ELF32_R_SYM(rela.r_info);
+			const ElfRelocType reloc_type = ELF32_R_TYPE(rela.r_info);
+			const ElfSym sym = symtab[sym_index];
+
+			if (sym.st_shndx >= view->section_count) {
+				return ELF_INVALID_EHDR;
+			};
+
+			const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
+			const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
+
+			uint8_t base_vaddr_found = 0;
+			uint32_t base_vaddr = 0;
+
+			for (size_t j = 0; j < layout_count; j++) {
+				if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+					base_vaddr = layout[j].base_vaddr;
+					base_vaddr_found = 1;
+					break;
+				};
+			};
+
+			if (!base_vaddr_found) {
+#if defined(DEBUG)
+				fprintf(stderr, "base vaddress was not found.\n");
+#endif
+				return ELF_INVALID_RELOCATION;
+			};
+
+			const uint32_t absolute_addr = (uint32_t)((int32_t)(base_vaddr + sym.st_value) + rela.r_addend);
+			uint32_t instruction;
+			memcpy(&instruction, &section_data[rela.r_offset], sizeof(uint32_t));
+
+			uint32_t ci_vaddr = current_sec_vaddr + rela.r_offset;
+			switch (reloc_type) {
+			case R_RTM32_WORD: {
+				instruction = absolute_addr;
+				break;
+			};
+
+			case R_RTM32_ELIMM: {
+				int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+				uint32_t imm25 = (uint32_t)(offset >> 2) & 0x1FFFFFF;
+				instruction &= ~0x1FFFFFF;
+				instruction |= imm25;
+				break;
+			};
+
+			case R_RTM32_VLIMM: {
+				int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+				uint32_t imm24 = (uint32_t)(offset >> 2) & 0xFFFFFF;
+				instruction &= ~0xFFFFFF;
+				instruction |= imm24;
+				break;
+			};
+
+			case R_RTM32_LLIMM: {
+				uint32_t imm20 = (absolute_addr >> 2) & 0xFFFFF;
+				instruction &= ~0xFFFFF;
+				instruction |= imm20;
+				break;
+			};
+
+			case R_RTM32_LIMM: {
+				uint32_t imm19 = (absolute_addr >> 2) & 0x7FFFF;
+				instruction &= ~0x7FFFF;
+				instruction |= imm19;
+				break;
+			};
+
+			case R_RTM32_IMM: {
+				uint8_t opcode = instruction >> 27;
+				uint32_t imm17;
+
+				if (opcode >= 16 && opcode <= 21) {
+					int32_t offset = (int32_t)absolute_addr - (int32_t)(ci_vaddr + 4);
+					imm17 = (uint32_t)(offset >> 2) & 0x1FFFF;
+				} else {
+					imm17 = absolute_addr & 0x1FFFF;
+				};
+
+				instruction &= ~0x1FFFF;
+				instruction |= imm17;
+				break;
+			};
+
+			case R_RTM32_SIMM: {
+				uint32_t imm16 = absolute_addr & 0xFFFF;
+				instruction &= ~0xFFFF;
+				instruction |= imm16;
+				break;
+			};
+
+			case R_RTM32_AUX: {
+				uint32_t imm5 = absolute_addr & 0x1F;
+				instruction &= ~(0x1F << 7);
+				instruction |= (imm5 << 7);
+				break;
+			};
+
+			case R_RTM32_PTRLO: {
+				instruction |= (absolute_addr >>  0) & 0xFFFF;
+				break;
+			};
+
+			case R_RTM32_PTRHI: {
+				instruction |= (absolute_addr >> 16) & 0xFFFF;
+				break;
+			};
+
+			default:
+#if defined(DEBUG)
+				fprintf(stderr, "hit default branch, relocation was type %zu\n", (size_t)reloc_type);
+#endif
+				return ELF_INVALID_RELOCATION;
+			};
+
+			memcpy(&section_data[rela.r_offset], &instruction, sizeof(uint32_t));
+		};
 	};
 
 	return ELF_SUCCESS;

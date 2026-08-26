@@ -16,6 +16,7 @@ pub const Symbol = struct {
 pub const Relocation = struct {
     addr: usize,
     name: []const u8,
+    offset: i32 = 0,
     section: []const u8,
     kind: isa.RelocationMode,
     bookmark: Tokenizer.Bookmark,
@@ -189,10 +190,11 @@ pub const Assembly = struct {
 
                 const imm = switch (r.aux) {
                     .static => |x| x,
-                    .dynamic => |label| blk: {
+                    .dynamic => |dyn| blk: {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = label,
+                            .name = dyn.label,
+                            .offset = dyn.offset,
                             .section = self.currentSegmentName,
                             .kind = .aux,
                             .bookmark = bookmark,
@@ -221,10 +223,11 @@ pub const Assembly = struct {
                 const info = isa.IType.getInfo(i.opcode);
                 const imm = switch (i.imm) {
                     .static => |x| x,
-                    .dynamic => |label| blk: {
+                    .dynamic => |dyn| blk: {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = label,
+                            .name = dyn.label,
+                            .offset = dyn.offset,
                             .section = self.currentSegmentName,
                             .kind = info.reltype.?,
                             .bookmark = bookmark,
@@ -237,6 +240,7 @@ pub const Assembly = struct {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = x.label,
+                            .offset = 0,
                             .section = self.currentSegmentName,
                             .kind = if (x.high) .ptrhi else .ptrlo,
                             .bookmark = bookmark,
@@ -284,10 +288,11 @@ pub const Assembly = struct {
                 const info = isa.JType.getInfo(j.opcode);
                 const imm = switch (j.imm) {
                     .static => |x| try validateImmediate(info.immtype.?, x),
-                    .dynamic => |label| blk: {
+                    .dynamic => |dyn| blk: {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = label,
+                            .name = dyn.label,
+                            .offset = dyn.offset,
                             .section = self.currentSegmentName,
                             .kind = info.reltype.?,
                             .bookmark = bookmark,
@@ -300,6 +305,7 @@ pub const Assembly = struct {
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
                             .name = x.label,
+                            .offset = 0,
                             .section = self.currentSegmentName,
                             .kind = if (x.high) .ptrhi else .ptrlo,
                             .bookmark = bookmark,
@@ -632,23 +638,28 @@ pub const Assembly = struct {
             });
         }
 
-        var relocsBySection = std.StringHashMap(std.ArrayList(c.ElfRel)).init(self.allocator);
+        var relsBySection = std.StringHashMap(std.ArrayList(c.ElfRel)).init(self.allocator);
         defer {
-            var it = relocsBySection.iterator();
+            var it = relsBySection.iterator();
             while (it.next()) |entry| {
                 entry.value_ptr.deinit(self.allocator);
             }
 
-            relocsBySection.deinit();
+            relsBySection.deinit();
+        }
+
+        var relasBySection = std.StringHashMap(std.ArrayList(c.ElfRela)).init(self.allocator);
+        defer {
+            var it = relasBySection.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+            }
+
+            relasBySection.deinit();
         }
 
         var relocationError: ?AssemblyError = null;
         for (self.relocations.items) |rel| {
-            const gpr = try relocsBySection.getOrPut(rel.section);
-            if (!gpr.found_existing) {
-                gpr.value_ptr.* = std.ArrayList(c.ElfRel).empty;
-            }
-
             const relType = switch (rel.kind) {
                 .ptrlo  => c.R_RTM32_PTRLO,
                 .ptrhi  => c.R_RTM32_PTRHI,
@@ -663,13 +674,34 @@ pub const Assembly = struct {
             };
 
             if (symbolIndices.get(rel.name)) |symbolIndex| {
-                try gpr.value_ptr.append(self.allocator, .{
-                    .r_offset = @intCast(rel.addr),
-                    .r_info = c.ELF32_R_INFO(
-                        symbolIndex,
-                        relType
-                    )
-                });
+                if (rel.offset == 0) {
+                    const gpr = try relsBySection.getOrPut(rel.section);
+                    if (!gpr.found_existing) {
+                        gpr.value_ptr.* = std.ArrayList(c.ElfRel).empty;
+                    }
+
+                    try gpr.value_ptr.append(self.allocator, .{
+                        .r_offset = @intCast(rel.addr),
+                        .r_info = c.ELF32_R_INFO(
+                            symbolIndex,
+                            relType
+                        )
+                    });
+                } else {
+                    const gpr = try relasBySection.getOrPut(rel.section);
+                    if (!gpr.found_existing) {
+                        gpr.value_ptr.* = std.ArrayList(c.ElfRela).empty;
+                    }
+
+                    try gpr.value_ptr.append(self.allocator, .{
+                        .r_offset = @intCast(rel.addr),
+                        .r_info = c.ELF32_R_INFO(
+                            symbolIndex,
+                            relType
+                        ),
+                        .r_addend = rel.offset,
+                    });
+                }
             } else if (self.sources) |*sources| {
                 std.debug.print("when patching symbol {s}:\n", .{rel.name});
                 sources.restore(rel.bookmark);
@@ -720,7 +752,7 @@ pub const Assembly = struct {
             .entsize = @sizeOf(c.ElfSym)
         });
 
-        var relit = relocsBySection.iterator();
+        var relit = relsBySection.iterator();
         while (relit.next()) |entry| {
             const secname = entry.key_ptr.*;
             const rels = entry.value_ptr.*;
@@ -736,6 +768,25 @@ pub const Assembly = struct {
                 .link = symtabIndex,
                 .info = sectionIndices.get(secname).?,
                 .entsize = @sizeOf(c.ElfRel)
+            });
+        }
+
+        var relait = relasBySection.iterator();
+        while (relait.next()) |entry| {
+            const secname = entry.key_ptr.*;
+            const relas = entry.value_ptr.*;
+
+            const relaname = try std.fmt.allocPrintSentinel(self.strings.allocator(), ".rela{s}", .{secname}, 0);
+            try sections.append(self.allocator, .{
+                .name = relaname.ptr,
+                .data = @ptrCast(relas.items.ptr),
+                .size = @intCast(relas.items.len * @sizeOf(c.ElfRela)),
+                .type = c.SHT_RELA,
+                .flags = c.SHF_NONE,
+                .addralign = 4,
+                .link = symtabIndex,
+                .info = sectionIndices.get(secname).?,
+                .entsize = @sizeOf(c.ElfRela)
             });
         }
 

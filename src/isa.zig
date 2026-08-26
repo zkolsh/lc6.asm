@@ -102,7 +102,10 @@ pub const ImmediateKind = enum {
 pub fn Immediate(comptime T: type) type {
     return union(enum) {
         static: T,
-        dynamic: []const u8,
+        dynamic: struct {
+            label: []const u8,
+            offset: i32,
+        },
         pointer: struct {
             high: bool,
             label: []const u8,
