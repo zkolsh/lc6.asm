@@ -291,3 +291,7 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 }
+
+test {
+    std.testing.refAllDecls(A);
+}

@@ -5,7 +5,9 @@
 // [2]: https://gabi.xinuos.com/elf/a-emachine.html
 
 #if !defined(STATIC_ASSERT)
-#define STATIC_ASSERT(COND, MSG) typedef char static_assertion_##MSG[(COND) ? 1 : -1]
+#define STATIC_ASSERT_GLUE(a, b) a##b
+#define STATIC_ASSERT_JOIN(a, b) STATIC_ASSERT_GLUE(a, b)
+#define STATIC_ASSERT(COND, MSG) typedef char STATIC_ASSERT_JOIN(static_assertion_##MSG##_, __LINE__)[(COND) ? 1 : -1]
 #endif
 
 #include <stddef.h>
@@ -86,6 +88,28 @@ typedef struct __attribute__((packed)) {
 	uint32_t sh_entsize;
 } ElfSHDR;
 
+typedef uint8_t ElfSymBinding;
+enum {
+	STB_LOCAL  = 0,
+	STB_GLOBAL = 1,
+	STB_WEAK   = 2,
+};
+
+typedef uint8_t ElfSymType;
+enum {
+	STT_NOTYPE  = 0,
+	STT_OBJECT  = 1,
+	STT_FUNC    = 2,
+	STT_SECTION = 3,
+	STT_FILE    = 4,
+	STT_COMMON  = 5,
+	STT_TLS     = 6,
+};
+
+#define ELF32_ST_BIND(val) (((unsigned char)(val)) >> 4)
+#define ELF32_ST_TYPE(val) ((val) & 0xf)
+#define ELF32_ST_INFO(bind, type) (((bind) << 4) + ((type) & 0xf))
+
 typedef struct __attribute__((packed)) {
 	uint32_t st_name;
 	uint32_t st_value;
@@ -94,6 +118,10 @@ typedef struct __attribute__((packed)) {
 	uint8_t  st_other;
 	uint16_t st_shndx;
 } ElfSym;
+
+#define SHN_UNDEF 0
+#define SHN_ABS   0xfff1
+#define SHN_COMMON 0xfff2
 
 typedef uint32_t ElfShType;
 enum {

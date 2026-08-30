@@ -11,10 +11,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
 
-    exe.root_module.strip = strip;
     exe.link_gc_sections = true;
 
     const translate_elf = b.addTranslateC(.{

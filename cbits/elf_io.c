@@ -364,7 +364,12 @@ ElfStatus elf_view_patch_relocations(
 		};
 	};
 
-	// Process .rel<section_name>
+	const char* strtab = NULL;
+	if (symtab_shdr->sh_link < view->section_count) {
+		const ElfSHDR* strtab_shdr = &view->section_headers[symtab_shdr->sh_link];
+		strtab = (const char*)(view->buffer_view + strtab_shdr->sh_offset);
+	};
+
 	char relsection_name[40] = ".rel";
 	strncat(relsection_name, section_name, sizeof(relsection_name) - strlen(relsection_name) - 1);
 
@@ -388,32 +393,51 @@ ElfStatus elf_view_patch_relocations(
 			const ElfRelocType reloc_type = ELF32_R_TYPE(rel.r_info);
 			const ElfSym sym = symtab[sym_index];
 
-			if (sym.st_shndx >= view->section_count) {
-				return ELF_INVALID_EHDR;
-			};
+			const char* sym_name = (strtab != NULL) ? (strtab + sym.st_name) : "";
+			uint32_t absolute_addr = 0;
 
-			const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
-			const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
-
-			uint8_t base_vaddr_found = 0;
-			uint32_t base_vaddr = 0;
-
-			for (size_t j = 0; j < layout_count; j++) {
-				if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
-					base_vaddr = layout[j].base_vaddr;
-					base_vaddr_found = 1;
-					break;
+			if (strcmp(sym_name, "heap_base") == 0) {
+				uint32_t heap_end = 0;
+				for (size_t j = 0; j < layout_count; j++) {
+					if (strcmp(layout[j].section_name, ".data") == 0 || strcmp(layout[j].section_name, ".text") == 0) {
+						uint32_t sec_size = 0;
+						elf_view_get_section(view, layout[j].section_name, &sec_size, NULL);
+						uint32_t sec_end = layout[j].base_vaddr + sec_size;
+						if (sec_end > heap_end) {
+							heap_end = sec_end;
+						};
+					};
 				};
-			};
+				absolute_addr = (heap_end + 3) & ~3;
+			} else {
+				if (sym.st_shndx >= view->section_count) {
+					return ELF_INVALID_EHDR;
+				};
 
-			if (!base_vaddr_found) {
+				const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
+				const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
+
+				uint8_t base_vaddr_found = 0;
+				uint32_t base_vaddr = 0;
+
+				for (size_t j = 0; j < layout_count; j++) {
+					if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+						base_vaddr = layout[j].base_vaddr;
+						base_vaddr_found = 1;
+						break;
+					};
+				};
+
+				if (!base_vaddr_found) {
 #if defined(DEBUG)
-				fprintf(stderr, "base vaddress was not found.\n");
+					fprintf(stderr, "base vaddress was not found.\n");
 #endif
-				return ELF_INVALID_RELOCATION;
+					return ELF_INVALID_RELOCATION;
+				};
+
+				absolute_addr = base_vaddr + sym.st_value;
 			};
 
-			const uint32_t absolute_addr = base_vaddr + sym.st_value;
 			uint32_t instruction;
 			memcpy(&instruction, &section_data[rel.r_offset], sizeof(uint32_t));
 
@@ -505,7 +529,6 @@ ElfStatus elf_view_patch_relocations(
 		};
 	};
 
-	// Process .rela<section_name>
 	char relasection_name[40] = ".rela";
 	strncat(relasection_name, section_name, sizeof(relasection_name) - strlen(relasection_name) - 1);
 
@@ -529,32 +552,51 @@ ElfStatus elf_view_patch_relocations(
 			const ElfRelocType reloc_type = ELF32_R_TYPE(rela.r_info);
 			const ElfSym sym = symtab[sym_index];
 
-			if (sym.st_shndx >= view->section_count) {
-				return ELF_INVALID_EHDR;
-			};
+			const char* sym_name = (strtab != NULL) ? (strtab + sym.st_name) : "";
+			uint32_t absolute_addr = 0;
 
-			const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
-			const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
-
-			uint8_t base_vaddr_found = 0;
-			uint32_t base_vaddr = 0;
-
-			for (size_t j = 0; j < layout_count; j++) {
-				if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
-					base_vaddr = layout[j].base_vaddr;
-					base_vaddr_found = 1;
-					break;
+			if (strcmp(sym_name, "heap_base") == 0) {
+				uint32_t heap_end = 0;
+				for (size_t j = 0; j < layout_count; j++) {
+					if (strcmp(layout[j].section_name, ".data") == 0 || strcmp(layout[j].section_name, ".text") == 0) {
+						uint32_t sec_size = 0;
+						elf_view_get_section(view, layout[j].section_name, &sec_size, NULL);
+						uint32_t sec_end = layout[j].base_vaddr + sec_size;
+						if (sec_end > heap_end) {
+							heap_end = sec_end;
+						};
+					};
 				};
-			};
+				absolute_addr = (uint32_t)((int32_t)((heap_end + 3) & ~3) + rela.r_addend);
+			} else {
+				if (sym.st_shndx >= view->section_count) {
+					return ELF_INVALID_EHDR;
+				};
 
-			if (!base_vaddr_found) {
+				const ElfSHDR* target_shdr = &view->section_headers[sym.st_shndx];
+				const char* sym_sec_name = view->shstrtab + target_shdr->sh_name;
+
+				uint8_t base_vaddr_found = 0;
+				uint32_t base_vaddr = 0;
+
+				for (size_t j = 0; j < layout_count; j++) {
+					if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+						base_vaddr = layout[j].base_vaddr;
+						base_vaddr_found = 1;
+						break;
+					};
+				};
+
+				if (!base_vaddr_found) {
 #if defined(DEBUG)
-				fprintf(stderr, "base vaddress was not found.\n");
+					fprintf(stderr, "base vaddress was not found.\n");
 #endif
-				return ELF_INVALID_RELOCATION;
+					return ELF_INVALID_RELOCATION;
+				};
+
+				absolute_addr = (uint32_t)((int32_t)(base_vaddr + sym.st_value) + rela.r_addend);
 			};
 
-			const uint32_t absolute_addr = (uint32_t)((int32_t)(base_vaddr + sym.st_value) + rela.r_addend);
 			uint32_t instruction;
 			memcpy(&instruction, &section_data[rela.r_offset], sizeof(uint32_t));
 

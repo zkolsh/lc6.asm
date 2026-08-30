@@ -50,6 +50,9 @@ pub const Assembly = struct {
         try segments.put(".text", std.ArrayList(u8).empty);
         try segments.put(".data", std.ArrayList(u8).empty);
 
+        var symbols = std.StringHashMap(Symbol).init(allocator);
+        try symbols.put("heap_base", .{.offset = 0, .segment="?heap"});
+
         return .{
             .allocator = allocator,
             .strings = std.heap.ArenaAllocator.init(allocator),
@@ -57,7 +60,7 @@ pub const Assembly = struct {
             .segments = segments,
             .currentSegment = segments.getPtr(".text").?,
             .currentSegmentName = ".text",
-            .symbols = std.StringHashMap(Symbol).init(allocator),
+            .symbols = symbols,
             .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 32),
         };
     }
@@ -495,46 +498,6 @@ pub const Assembly = struct {
         }
     }
 
-    pub fn patchStaticRelocations(self: *Assembly) void {
-        var i: usize = 0;
-        while (i < self.relocations.items.len) {
-            const rel = self.relocations.items[i];
-
-            if (rel.kind != .pc16) {
-                i += 1;
-                continue;
-            }
-
-            const symbol = self.symbols.get(rel.name) orelse {
-                i += 1;
-                continue;
-            };
-
-            if (!std.mem.eql(u8, rel.section, symbol.segment)) {
-                i += 1;
-                continue;
-            }
-
-            const segment = self.segments.getPtr(rel.section).?;
-
-            const pc = rel.addr;
-            const target = symbol.offset;
-
-            const delta = @as(i32, @intCast(target)) - @as(i32, @intCast(pc + 4));
-            const imm = @as(i16, @truncate(delta >> 2));
-
-            var word: u32 = undefined;
-            std.mem.copyForwards(u8, std.mem.asBytes(&word), segment.items[pc..][0..4]);
-
-            word &= 0xFFFF0000;
-            word |= @as(u16, @bitCast(imm));
-            std.mem.copyForwards(u8, segment.items[pc..][0..4], std.mem.asBytes(&word));
-
-            self.allocator.free(rel.name);
-            _ = self.relocations.swapRemove(i);
-        }
-    }
-
     pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8 {
         var strtab = try std.ArrayList(u8).initCapacity(self.strings.allocator(), 1);
         defer strtab.deinit(self.strings.allocator());
@@ -622,19 +585,23 @@ pub const Assembly = struct {
 
             const stringOff: u32 = @intCast(strtab.items.len);
 
-            try strtab.appendSlice(self.allocator, name);
-            try strtab.append(self.allocator, 0);
+            try strtab.appendSlice(self.strings.allocator(), name);
+            try strtab.append(self.strings.allocator(), 0);
 
             const index: u32 = @intCast(symtab.items.len);
             try symbolIndices.put(name, index);
 
+            const isHeapBase = std.mem.eql(u8, name, "heap_base");
+            const shndx: u16 = if (isHeapBase) c.SHN_UNDEF else sectionIndices.get(sym.segment).?;
+            const bind: u8 = if (isHeapBase) c.STB_GLOBAL else c.STB_LOCAL;
+            const stInfo: u8 = @intCast(c.ELF32_ST_INFO(bind, c.STT_NOTYPE));
             try symtab.append(self.allocator, .{
                 .st_name = stringOff,
                 .st_value = @intCast(sym.offset),
                 .st_size = 0,
-                .st_info = 0,
+                .st_info = stInfo,
                 .st_other = 0,
-                .st_shndx = sectionIndices.get(sym.segment).?
+                .st_shndx = shndx,
             });
         }
 
@@ -930,4 +897,54 @@ test "sample program" {
 
     // as.patchStaticRelocations();
     // try std.testing.expectEqual(@as(usize, 0), as.relocations.items.len);
+}
+
+test "heap_base symbol and relocation resolution" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\lw $a0, heap_base($zero)
+        \\.section ".data"
+        \\.word 0x11223344
+        \\.word 0x55667788
+    , "<test>");
+
+    const blob = try as.createElfBlob(c.ET_REL, 0);
+    defer std.testing.allocator.free(blob);
+
+    var view: c.ElfView = undefined;
+    const parse_status = c.elf_view_parse(&view, blob.len, blob.ptr);
+    try std.testing.expectEqual(c.ELF_SUCCESS, parse_status);
+
+    var layout: c.ElfLayoutMap = undefined;
+    var views = [_]c.ElfView{view};
+    const layoutOk = c.elf_merge_calculate_layout(&layout, &views, 1);
+    try std.testing.expectEqual(c.ELF_SUCCESS, layoutOk);
+
+    const ram = try std.testing.allocator.alloc(u8, layout.total_memory_needed);
+    defer std.testing.allocator.free(ram);
+
+    const mergeOk = c.elf_merge(ram.ptr, ram.len, &layout, &views, 1);
+    try std.testing.expectEqual(c.ELF_SUCCESS, mergeOk);
+
+    var sectionLayout = try std.testing.allocator.alloc(c.ElfSectionAddress, layout.section_count);
+    defer std.testing.allocator.free(sectionLayout);
+
+    for (layout.sections[0..layout.section_count], 0..) |*section, i| {
+        sectionLayout[i] = .{
+            .section_name = &section.name,
+            .base_vaddr = @as(u32, @intCast(section.base_vaddr)),
+        };
+    }
+
+    const text = &layout.sections[0];
+    const patchOk = c.elf_view_patch_relocations(&view, ram.ptr + text.base_vaddr, text.size, &text.name, sectionLayout.ptr, sectionLayout.len);
+    try std.testing.expectEqual(c.ELF_SUCCESS, patchOk);
+
+    var instruction: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&instruction), ram[0..4]);
+    const imm17 = instruction & 0x1FFFF;
+    try std.testing.expectEqual(@as(u32, 12), imm17);
 }
