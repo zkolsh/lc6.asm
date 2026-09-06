@@ -1,5 +1,6 @@
 const std = @import("std");
 const A = @import("assembler.zig");
+const T = @import("tokenizer.zig");
 const c = @import("elf_io");
 
 const helpText: []const u8 =
@@ -11,6 +12,7 @@ const helpText: []const u8 =
     \\  -o <file>           place the output into <file>
     \\  -l:<file>           link against an additional ELF object/library
     \\  -t <elf|mdbg>       emit using this format (default = mdbg)
+    \\  -E                  stop after preprocessing
     \\  -c                  stop before linking (ELF-only)
     \\
     ;
@@ -51,6 +53,8 @@ pub fn main(init: std.process.Init) !void {
     var outputType: OutputType = .mdbg;
     var linkObject = true;
 
+    var justPreprocess = false;
+
     while (args.next()) |arg| {
         if (arg.len == 0) continue;
 
@@ -82,6 +86,8 @@ pub fn main(init: std.process.Init) !void {
                 try stdout.interface.print("error: unrecognized format \"{s}\". Expected elf or mdbg.\n", .{formatStr});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, arg, "-E")) {
+            justPreprocess = true;
         } else if (std.mem.eql(u8, arg, "-c")) {
             linkObject = false;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
@@ -108,6 +114,22 @@ pub fn main(init: std.process.Init) !void {
     if (outputName == null) {
         try stdout.interface.writeAll("error: no output file.\n");
         std.process.exit(1);
+    }
+
+    if (justPreprocess) {
+        var lexer = try T.Tokenizer.init(init.io, init.arena.allocator());
+        defer lexer.deinit();
+
+        const outFile = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
+        defer outFile.close(init.io);
+
+        const text = lexer.preprocessAll(init.arena.allocator()) catch |err| {
+            lexer.showErrorHere(err);
+            std.process.exit(1);
+        };
+
+        try outFile.writeStreamingAll(init.io, text);
+        std.process.exit(0);
     }
 
     if (!linkObject and outputType == .mdbg) {
