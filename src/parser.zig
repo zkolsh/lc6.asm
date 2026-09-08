@@ -980,3 +980,524 @@ test "parseStatement with label" {
         else => try std.testing.expect(false),
     }
 }
+
+test "parseInteger bases uppercase and explicit sign" {
+    var hex = try makeParser("0X1A");
+    defer hex.deinit();
+    try std.testing.expectEqual(@as(u32, 26), try hex.parseInteger(u32));
+
+    var bin = try makeParser("0B1010");
+    defer bin.deinit();
+    try std.testing.expectEqual(@as(u32, 10), try bin.parseInteger(u32));
+
+    var octal = try makeParser("0O12");
+    defer octal.deinit();
+    try std.testing.expectEqual(@as(u32, 10), try octal.parseInteger(u32));
+
+    var plus = try makeParser("+42");
+    defer plus.deinit();
+    try std.testing.expectEqual(@as(i32, 42), try plus.parseInteger(i32));
+    
+    var minus = try makeParser("-42");
+    defer minus.deinit();
+    try std.testing.expectEqual(@as(i32, -42), try minus.parseInteger(i32));
+}
+
+test "parseImmediate formats" {
+    var charP = try makeParser("'A'");
+    defer charP.deinit();
+    const charImm = try charP.parseImmediate(.imm);
+    switch (charImm) {
+        .static => |v| try std.testing.expectEqual(@as(u25, 'A'), v),
+        else => try std.testing.expect(false),
+    }
+
+    var labelShiftP = try makeParser("target+8");
+    defer labelShiftP.deinit();
+    const labelShiftImm = try labelShiftP.parseImmediate(.imm);
+    switch (labelShiftImm) {
+        .dynamic => |dyn| {
+            try std.testing.expectEqualStrings("target", dyn.label);
+            try std.testing.expectEqual(@as(i32, 8), dyn.offset);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var labelNegativeP = try makeParser("target-4");
+    defer labelNegativeP.deinit();
+    const labelNegativeImm = try labelNegativeP.parseImmediate(.imm);
+    switch (labelNegativeImm) {
+        .dynamic => |dyn| {
+            try std.testing.expectEqualStrings("target", dyn.label);
+            try std.testing.expectEqual(@as(i32, -4), dyn.offset);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var ptrloP = try makeParser(".lo16 symbol");
+    defer ptrloP.deinit();
+    const ptrloImm = try ptrloP.parseImmediate(.imm);
+    switch (ptrloImm) {
+        .pointer => |ptr| {
+            try std.testing.expectEqual(false, ptr.high);
+            try std.testing.expectEqualStrings("symbol", ptr.label);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var ptrhiP = try makeParser(".hi16 symbol");
+    defer ptrhiP.deinit();
+    const ptrhiImm = try ptrhiP.parseImmediate(.imm);
+    switch (ptrhiImm) {
+        .pointer => |ptr| {
+            try std.testing.expectEqual(true, ptr.high);
+            try std.testing.expectEqualStrings("symbol", ptr.label);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var invalidP = try makeParser(".asciiz symbol");
+    defer invalidP.deinit();
+    try std.testing.expectError(ParseError.InvalidEnumeration, invalidP.parseImmediate(.imm));
+}
+
+test "parseSpecialRegisterName" {
+    var psw = try makeParser("$psw");
+    defer psw.deinit();
+    try std.testing.expectEqual(isa.SpecialRegister.psw, try psw.parseSpecialRegisterName());
+
+    var num = try makeParser("$0");
+    defer num.deinit();
+    try std.testing.expectEqual(isa.SpecialRegister.psw, try num.parseSpecialRegisterName());
+
+    var pir = try makeParser("$pir");
+    defer pir.deinit();
+    try std.testing.expectEqual(isa.SpecialRegister.pir, try pir.parseSpecialRegisterName());
+
+    var invalid = try makeParser("$t0");
+    defer invalid.deinit();
+    try std.testing.expectError(ParseError.InvalidEnumeration, invalid.parseSpecialRegisterName());
+}
+
+test "parseStatement RType" {
+    // RShift
+    var p1 = try makeParser("sll $t0, $t1, 5\n");
+    defer p1.deinit();
+    const s1 = try p1.parseStatement();
+    switch (s1.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RTypeMnemo.sll, r.funct);
+            try std.testing.expectEqual(isa.Register.t0, r.rd);
+            try std.testing.expectEqual(isa.Register.t1, r.rt);
+            try std.testing.expectEqual(isa.Register.zero, r.rs);
+            try std.testing.expectEqual(isa.Immediate(u5){ .static = 5 }, r.aux);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var p1_err = try makeParser("sll $t0, $t1, 64\n");
+    defer p1_err.deinit();
+    try std.testing.expectError(ParseError.NumericOverflow, p1_err.parseStatement());
+
+    // RShiftV
+    var p2 = try makeParser("sllr $t0, $t1, $t2\n");
+    defer p2.deinit();
+    const s2 = try p2.parseStatement();
+    switch (s2.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RTypeMnemo.sllr, r.funct);
+            try std.testing.expectEqual(isa.Register.t0, r.rd);
+            try std.testing.expectEqual(isa.Register.t1, r.rt);
+            try std.testing.expectEqual(isa.Register.t2, r.rs);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    // RAux
+    var p3 = try makeParser("cfs $a0, $psw\n");
+    defer p3.deinit();
+    const s3 = try p3.parseStatement();
+    switch (s3.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RTypeMnemo.cfs, r.funct);
+            try std.testing.expectEqual(isa.Register.a0, r.rs);
+            try std.testing.expectEqual(isa.Register.zero, r.rd);
+            try std.testing.expectEqual(isa.Register.zero, r.rt);
+            try std.testing.expectEqual(isa.Immediate(u5){ .static = @intFromEnum(isa.SpecialRegister.psw) }, r.aux);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var p3_cts = try makeParser("cts $a1, $ecr\n");
+    defer p3_cts.deinit();
+    const s3_cts = try p3_cts.parseStatement();
+    switch (s3_cts.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RTypeMnemo.cts, r.funct);
+            try std.testing.expectEqual(isa.Register.a1, r.rs);
+            try std.testing.expectEqual(isa.Immediate(u5){ .static = @intFromEnum(isa.SpecialRegister.ecr) }, r.aux);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    // TRAP
+    var p4 = try makeParser("trap 12\n");
+    defer p4.deinit();
+    const s4 = try p4.parseStatement();
+    switch (s4.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RTypeMnemo.trap, r.funct);
+            try std.testing.expectEqual(isa.Immediate(u5){ .static = 12 }, r.aux);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    // RFT
+    var p5 = try makeParser("rft\n");
+    defer p5.deinit();
+    const s5 = try p5.parseStatement();
+    switch (s5.value) {
+        .rtype => |r| {
+            try std.testing.expectEqual(isa.RTypeMnemo.rft, r.funct);
+            try std.testing.expectEqual(isa.Register.zero, r.rs);
+            try std.testing.expectEqual(isa.Register.zero, r.rd);
+            try std.testing.expectEqual(isa.Register.zero, r.rt);
+            try std.testing.expectEqual(isa.Immediate(u5){ .static = 0 }, r.aux);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parseStatement IType" {
+    // IMem
+    var imemP = try makeParser("lw $a0, 16($sp)\n");
+    defer imemP.deinit();
+    const imemS = try imemP.parseStatement();
+    switch (imemS.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.ITypeMnemo.lw, i.opcode);
+            try std.testing.expectEqual(isa.Register.a0, i.rt);
+            try std.testing.expectEqual(isa.Register.sp, i.rs);
+            try std.testing.expectEqual(isa.Immediate(u25){ .static = 16 }, i.imm);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var isymP = try makeParser("sw $t0, data_label($gp)\n");
+    defer isymP.deinit();
+    const isymS = try isymP.parseStatement();
+    switch (isymS.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.ITypeMnemo.sw, i.opcode);
+            try std.testing.expectEqual(isa.Register.t0, i.rt);
+            try std.testing.expectEqual(isa.Register.gp, i.rs);
+            switch (i.imm) {
+                .dynamic => |dyn| try std.testing.expectEqualStrings("data_label", dyn.label),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+
+    // Branch
+    var branchP = try makeParser("beq $t0, $t1, target_label\n");
+    defer branchP.deinit();
+    const branchS = try branchP.parseStatement();
+    switch (branchS.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.ITypeMnemo.beq, i.opcode);
+            try std.testing.expectEqual(isa.Register.t0, i.rs);
+            try std.testing.expectEqual(isa.Register.t1, i.rt);
+            switch (i.imm) {
+                .dynamic => |dyn| try std.testing.expectEqualStrings("target_label", dyn.label),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+
+    // JR
+    var jrP = try makeParser("jr $ra, 0\n");
+    defer jrP.deinit();
+    const jrS = try jrP.parseStatement();
+    switch (jrS.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.ITypeMnemo.jr, i.opcode);
+            try std.testing.expectEqual(isa.Register.ra, i.rs);
+            try std.testing.expectEqual(isa.Register.zero, i.rt);
+            try std.testing.expectEqual(isa.Immediate(u25){ .static = 0 }, i.imm);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    // individuals
+    var jalrxP = try makeParser("jalrx $t0, $lr2, 4\n");
+    defer jalrxP.deinit();
+    const jalrxS = try jalrxP.parseStatement();
+    switch (jalrxS.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.ITypeMnemo.jalrx, i.opcode);
+            try std.testing.expectEqual(isa.Register.t0, i.rs);
+            try std.testing.expectEqual(isa.Register.lr2, i.linkRegister);
+            try std.testing.expectEqual(isa.Immediate(u25){ .static = 4 }, i.imm);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var jalrxBadP = try makeParser("jalrx $t0, $t1, 4\n");
+    defer jalrxBadP.deinit();
+    try std.testing.expectError(ParseError.InvalidEnumeration, jalrxBadP.parseStatement());
+
+    // I
+    var sltiP = try makeParser("slti $t0, $a0, 100\n");
+    defer sltiP.deinit();
+    const sltiS = try sltiP.parseStatement();
+    switch (sltiS.value) {
+        .itype => |i| {
+            try std.testing.expectEqual(isa.ITypeMnemo.slti, i.opcode);
+            try std.testing.expectEqual(isa.Register.t0, i.rt);
+            try std.testing.expectEqual(isa.Register.a0, i.rs);
+            try std.testing.expectEqual(isa.Immediate(u25){ .static = 100 }, i.imm);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "parseStatement JType" {
+    var jalxP = try makeParser("jalx $lr1, func\n");
+    defer jalxP.deinit();
+    const jalxS = try jalxP.parseStatement();
+    switch (jalxS.value) {
+        .jtype => |j| {
+            try std.testing.expectEqual(isa.JTypeMnemo.jalx, j.opcode);
+            try std.testing.expectEqual(isa.Register.lr1, j.linkRegister);
+            switch (j.imm) {
+                .dynamic => |dyn| try std.testing.expectEqualStrings("func", dyn.label),
+                else => try std.testing.expect(false),
+            }
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var jalxBadP = try makeParser("jalx $s0, func\n");
+    defer jalxBadP.deinit();
+    try std.testing.expectError(ParseError.InvalidEnumeration, jalxBadP.parseStatement());
+}
+
+test "parseStatement data directives" {
+    var sec1P = try makeParser(".section text\n");
+    defer sec1P.deinit();
+    const sec1S = try sec1P.parseStatement();
+    switch (sec1S.value) {
+        .section => |sec| try std.testing.expectEqualStrings("text", sec),
+        else => try std.testing.expect(false),
+    }
+
+    var sec2P = try makeParser(".section \".data\"\n");
+    defer sec2P.deinit();
+    const sec2S = try sec2P.parseStatement();
+    switch (sec2S.value) {
+        .section => |sec| try std.testing.expectEqualStrings(".data", sec),
+        else => try std.testing.expect(false),
+    }
+
+    var asciizP = try makeParser(".asciiz \"hello \" \"world\"\n");
+    defer asciizP.deinit();
+    const asciizS = try asciizP.parseStatement();
+    switch (asciizS.value) {
+        .asciiz => |str| try std.testing.expectEqualStrings("hello world", str),
+        else => try std.testing.expect(false),
+    }
+
+    var nasciiP = try makeParser(".nascii \"foo\"\n");
+    defer nasciiP.deinit();
+    const nasciiS = try nasciiP.parseStatement();
+    switch (nasciiS.value) {
+        .nascii => |str| try std.testing.expectEqualStrings("foo", str),
+        else => try std.testing.expect(false),
+    }
+
+    var byteP = try makeParser(".byte 1 2 'a' 'b' 0xFF\n");
+    defer byteP.deinit();
+    const byteS = try byteP.parseStatement();
+    switch (byteS.value) {
+        .bytes => |b| try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 'a', 'b', 255 }, b),
+        else => try std.testing.expect(false),
+    }
+
+    var shortP = try makeParser(".short 10 20 0x1234\n");
+    defer shortP.deinit();
+    const shortS = try shortP.parseStatement();
+    switch (shortS.value) {
+        .shorts => |sh| try std.testing.expectEqualSlices(u16, &[_]u16{ 10, 20, 0x1234 }, sh),
+        else => try std.testing.expect(false),
+    }
+
+    var wordP = try makeParser(".word 100 200 0xdeadbeef\n");
+    defer wordP.deinit();
+    const wordS = try wordP.parseStatement();
+    switch (wordS.value) {
+        .words => |w| try std.testing.expectEqualSlices(u32, &[_]u32{ 100, 200, 0xdeadbeef }, w),
+        else => try std.testing.expect(false),
+    }
+
+    var pad1P = try makeParser(".pad 16\n");
+    defer pad1P.deinit();
+    const pad1S = try pad1P.parseStatement();
+    switch (pad1S.value) {
+        .padding => |pad| {
+            try std.testing.expectEqual(@as(usize, 16), pad.size);
+            try std.testing.expectEqual(@as(usize, 1), pad.alignment);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var pad2P = try makeParser(".pad 8 4 (16)\n");
+    defer pad2P.deinit();
+    const pad2S = try pad2P.parseStatement();
+    switch (pad2S.value) {
+        .padding => |pad| {
+            try std.testing.expectEqual(@as(usize, 12), pad.size);
+            try std.testing.expectEqual(@as(usize, 16), pad.alignment);
+        },
+        else => try std.testing.expect(false),
+    }
+
+    var ptrP = try makeParser(".ptr my_symbol\n");
+    defer ptrP.deinit();
+    const ptrS = try ptrP.parseStatement();
+    switch (ptrS.value) {
+        .ptr => |sym| try std.testing.expectEqualStrings("my_symbol", sym),
+        else => try std.testing.expect(false),
+    }
+
+    var ptrloP = try makeParser(".lo16 my_symbol\n");
+    defer ptrloP.deinit();
+    const ptrloS = try ptrloP.parseStatement();
+    switch (ptrloS.value) {
+        .lo16 => |sym| try std.testing.expectEqualStrings("my_symbol", sym),
+        else => try std.testing.expect(false),
+    }
+
+    var ptrhiP = try makeParser(".hi16 my_symbol\n");
+    defer ptrhiP.deinit();
+    const ptrhiS = try ptrhiP.parseStatement();
+    switch (ptrhiS.value) {
+        .hi16 => |sym| try std.testing.expectEqualStrings("my_symbol", sym),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "statementEnd and semicolon terminator" {
+    var p = try makeParser("add $t0, $t1, $t2; sub $t0, $t1, $t2\n");
+    defer p.deinit();
+
+    const s1 = try p.parseStatement();
+    switch (s1.value) {
+        .rtype => |r| try std.testing.expectEqual(isa.RTypeMnemo.add, r.funct),
+        else => try std.testing.expect(false),
+    }
+
+    const s2 = try p.parseStatement();
+    switch (s2.value) {
+        .rtype => |r| try std.testing.expectEqual(isa.RTypeMnemo.sub, r.funct),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "intentional syntax errors" {
+    var missingComma = try makeParser("add $t0 $t1, $t2\n");
+    defer missingComma.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, missingComma.parseStatement());
+
+    var invalidInstr = try makeParser("bogus $t0, $t1, $t2\n");
+    defer invalidInstr.deinit();
+    try std.testing.expectError(ParseError.InvalidInstruction, invalidInstr.parseStatement());
+
+    var missingParen = try makeParser("lw $t0, 4 $t1\n");
+    defer missingParen.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, missingParen.parseStatement());
+
+    var invalidDirective = try makeParser(".unknown_directive 123\n");
+    defer invalidDirective.deinit();
+    try std.testing.expectError(ParseError.NoMatch, invalidDirective.parseStatement());
+
+    var noString = try makeParser(".asciiz\n");
+    defer noString.deinit();
+    try std.testing.expectError(ParseError.NoMatch, noString.parseStatement());
+
+    var noBytes = try makeParser(".byte\n");
+    defer noBytes.deinit();
+    try std.testing.expectError(ParseError.NoMatch, noBytes.parseStatement());
+
+    var badRegister = try makeParser("add $t0, $bogus, $t2\n");
+    defer badRegister.deinit();
+    try std.testing.expectError(ParseError.InvalidEnumeration, badRegister.parseStatement());
+
+    var noDollar = try makeParser("add t0, $t1, $t2\n");
+    defer noDollar.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, noDollar.parseStatement());
+
+    var trailing = try makeParser("j loop extra_token\n");
+    defer trailing.deinit();
+    try std.testing.expectError(ParseError.UnexpectedToken, trailing.parseStatement());
+}
+
+test "skipToStatementStart and skipToStatementEnd" {
+    var p = try makeParser("   \n\n  add $t0, $t1, $t2 bad stuff here ; sub $t0, $t1, $t2\n");
+    defer p.deinit();
+
+    try p.skipToStatementStart();
+    const token = try p.lexer.next();
+    try std.testing.expectEqualStrings("add", token.data);
+
+    try p.skipToStatementEnd();
+    try p.skipToStatementStart();
+    const next_stmt = try p.parseStatement();
+    switch (next_stmt.value) {
+        .rtype => |r| try std.testing.expectEqual(isa.RTypeMnemo.sub, r.funct),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "hello world integration parse" {
+    const code =
+        \\.section ".data"
+        \\msg: .nascii "waaa"
+        \\.section ".text"
+        \\start:
+        \\xor $zero, $zero, $zero
+        \\lw $a0, msg($zero)
+        \\orh $t0, $zero, 0xFFFF
+        \\ori $t0, $t0, 0xFF00
+        \\xor $a1, $a1, $a1
+        \\loop:
+        \\bge $a1, $a0, bye
+        \\addi $t1, $a1, 4
+        \\lb $t2, msg($t1)
+        \\sb $t2, 0($t0)
+        \\addi $a1, $a1, 1
+        \\j loop
+        \\bye:
+        \\j bye
+        \\
+    ;
+
+    var p = try makeParser(code);
+    defer p.deinit();
+
+    var count: usize = 0;
+    while (p.lexer.frameHead != null) {
+        try p.skipToStatementStart();
+        const stmt = p.parseStatement() catch |err| {
+            if (err == ParseError.UnexpectedEOF) break;
+            if (p.lexer.frameHead == null) break;
+            try p.skipToStatementEnd();
+            continue;
+        };
+        count += 1;
+        _ = stmt;
+    }
+
+    try std.testing.expectEqual(@as(usize, 15), count);
+}
