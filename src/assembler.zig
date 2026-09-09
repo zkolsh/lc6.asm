@@ -45,7 +45,9 @@ pub const Assembly = struct {
     symbols: std.StringHashMap(Symbol),
     relocations: std.ArrayList(Relocation),
 
-    pub fn init(allocator: std.mem.Allocator) !Assembly {
+    diagnostics: *std.Io.Writer,
+
+    pub fn init(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Assembly {
         var segments = std.StringHashMap(Segment).init(allocator);
         try segments.put(".text", std.ArrayList(u8).empty);
         try segments.put(".data", std.ArrayList(u8).empty);
@@ -62,6 +64,7 @@ pub const Assembly = struct {
             .currentSegmentName = ".text",
             .symbols = symbols,
             .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 32),
+            .diagnostics = stderr,
         };
     }
 
@@ -436,7 +439,7 @@ pub const Assembly = struct {
                 if (err == parsing.ParseError.UnexpectedEOF) break;
                 if (parser.lexer.frameHead == null) break;
 
-                parser.lexer.showErrorHere(err);
+                try parser.lexer.showErrorHere(self.diagnostics, err);
                 try parser.skipToStatementEnd();
                 continue;
             };
@@ -444,12 +447,13 @@ pub const Assembly = struct {
             const cursor = try parser.lexer.bookmark();
             self.encodeStatement(statement, mark) catch |err| {
                 parser.lexer.restore(mark);
-                parser.lexer.showErrorHere(err);
+                try parser.lexer.showErrorHere(self.diagnostics, err);
                 parser.lexer.restore(cursor);
-
                 return err;
             };
         }
+
+        try self.diagnostics.flush();
     }
 
     pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
@@ -484,7 +488,7 @@ pub const Assembly = struct {
                     firstErr = err;
                 }
 
-                parser.lexer.showErrorHere(err);
+                try parser.lexer.showErrorHere(self.diagnostics, err);
                 try parser.skipToStatementEnd();
                 continue;
             };
@@ -492,7 +496,7 @@ pub const Assembly = struct {
             const cursor = try parser.lexer.bookmark();
             self.encodeStatement(statement, mark) catch |err| {
                 parser.lexer.restore(mark);
-                parser.lexer.showErrorHere(err);
+                try parser.lexer.showErrorHere(self.diagnostics, err);
                 parser.lexer.restore(cursor);
 
                 if (firstErr == null) {
@@ -500,6 +504,8 @@ pub const Assembly = struct {
                 }
             };
         }
+
+        try self.diagnostics.flush();
 
         if (firstErr) |e| {
             return e;
@@ -682,18 +688,27 @@ pub const Assembly = struct {
                     });
                 }
             } else if (self.sources) |*sources| {
-                std.debug.print("when patching symbol {s}:\n", .{rel.name});
+                try self.diagnostics.writeAll("when patching symbol ");
+                try self.diagnostics.writeAll(rel.name);
+                try self.diagnostics.writeAll(":\n");
                 sources.restore(rel.bookmark);
 
                 if (sources.frameHead) |head| {
                     head.pos = @max(0, head.pos - 1);
                 }
 
-                sources.showErrorHere(AssemblyError.UnresolvedSymbol);
+                try sources.showErrorHere(self.diagnostics, AssemblyError.UnresolvedSymbol);
                 relocationError = relocationError orelse AssemblyError.UnresolvedSymbol;
+
+                try self.diagnostics.flush();
             } else {
-                std.debug.print("obtuse error patching symbol {s}:  {s}\n", .{rel.name, @errorName(AssemblyError.UnresolvedSymbol)});
+                try self.diagnostics.writeAll("obtuse error patching symbol ");
+                try self.diagnostics.writeAll(rel.name);
+                try self.diagnostics.writeAll(": ");
+                try self.diagnostics.writeAll(@errorName(AssemblyError.UnresolvedSymbol));
                 relocationError = relocationError orelse AssemblyError.UnresolvedSymbol;
+
+                try self.diagnostics.flush();
             }
         }
 
@@ -800,8 +815,11 @@ pub const Assembly = struct {
 };
 
 test "assembly initializes default segments" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
+    try diag.flush();
 
     try std.testing.expect(as.segments.contains(".text"));
     try std.testing.expect(as.segments.contains(".data"));
@@ -811,7 +829,9 @@ test "assembly initializes default segments" {
 }
 
 test "arbitrary sections" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -822,6 +842,7 @@ test "arbitrary sections" {
         \\.section "alpha"
         \\.byte 3
     , "<test>");
+    try diag.flush();
 
     try std.testing.expect(as.segments.contains("alpha"));
     try std.testing.expect(as.segments.contains("beta"));
@@ -831,7 +852,9 @@ test "arbitrary sections" {
 }
 
 test "labels record correct segment and offset" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -843,6 +866,7 @@ test "labels record correct segment and offset" {
         \\second:
         \\.word 0x12345678
     , "<test>");
+    try diag.flush();
 
     const first = as.symbols.get("first").?;
     try std.testing.expectEqual(@as(usize, 0), first.offset);
@@ -854,7 +878,9 @@ test "labels record correct segment and offset" {
 }
 
 test "relocation generation" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -864,6 +890,7 @@ test "relocation generation" {
         \\msg:
         \\.word 42
     , "<test>");
+    try diag.flush();
 
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
 
@@ -874,7 +901,9 @@ test "relocation generation" {
 }
 
 test "sample program" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -898,6 +927,7 @@ test "sample program" {
         \\bye:
         \\j bye
     , "<test>");
+    try diag.flush();
 
     try std.testing.expect(as.symbols.contains("msg"));
     try std.testing.expect(as.symbols.contains("start"));
@@ -909,7 +939,9 @@ test "sample program" {
 }
 
 test "heap_base symbol and relocation resolution" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -919,6 +951,7 @@ test "heap_base symbol and relocation resolution" {
         \\.word 0x11223344
         \\.word 0x55667788
     , "<test>");
+    try diag.flush();
 
     const blob = try as.createElfBlob(c.ET_REL, 0);
     defer std.testing.allocator.free(blob);
@@ -959,17 +992,24 @@ test "heap_base symbol and relocation resolution" {
 }
 
 test "error: label not allowed on section directive" {
-    var as = try Assembly.init(std.testing.allocator);
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+
+    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
     defer as.deinit();
 
     const err = as.assembleEntireFrame(std.testing.io,
         \\bad_label: .section ".text"
     , "<test>");
+    try stderr.writer.flush();
     try std.testing.expectError(AssemblyError.LabelNotAllowedHere, err);
 }
 
 test "error: symbol redefined in same or different section" {
-    var as = try Assembly.init(std.testing.allocator);
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+
+    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
     defer as.deinit();
 
     const err = as.assembleEntireFrame(std.testing.io,
@@ -977,11 +1017,15 @@ test "error: symbol redefined in same or different section" {
         \\my_label: add $zero, $zero, $zero
         \\my_label: addi $t0, $t0, 1
     , "<test>");
+    try stderr.writer.flush();
     try std.testing.expectError(AssemblyError.SymbolRedefined, err);
 }
 
 test "error: unresolved symbol during ELF blob creation" {
-    var as = try Assembly.init(std.testing.allocator);
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+
+    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -989,13 +1033,16 @@ test "error: unresolved symbol during ELF blob creation" {
         \\lw $a0, nonexistent_symbol($zero)
     , "<test>");
 
+    try stderr.writer.flush();
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
     const err = as.createElfBlob(c.ET_REL, 0);
     try std.testing.expectError(AssemblyError.UnresolvedSymbol, err);
 }
 
 test "immediate data directives" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1007,6 +1054,7 @@ test "immediate data directives" {
         \\str2: .nascii "DEF"
         \\pad1: .pad 3 2 (8)
     , "<test>");
+    try diag.flush();
 
     const data = as.segments.get(".data").?.items;
 
@@ -1034,7 +1082,9 @@ test "immediate data directives" {
 }
 
 test "pointer data directives" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1047,6 +1097,7 @@ test "pointer data directives" {
         \\p_hi:  .hi16 target_sym
         \\target_sym: .word 0
     , "<test>");
+    try diag.flush();
 
     const data = as.segments.get(".data").?.items;
 
@@ -1069,7 +1120,9 @@ test "pointer data directives" {
 }
 
 test "RType encoding" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1079,6 +1132,7 @@ test "RType encoding" {
         \\cfs $a0, $psw
         \\rft
     , "<test>");
+    try diag.flush();
 
     const text = as.segments.get(".text").?.items;
     try std.testing.expectEqual(@as(usize, 16), text.len);
@@ -1105,7 +1159,9 @@ test "RType encoding" {
 }
 
 test "IType encoding" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1118,6 +1174,7 @@ test "IType encoding" {
         \\jalr $t0, 0
         \\jalrx $t0, $lr3, 0
     , "<test>");
+    try diag.flush();
 
     const text = as.segments.get(".text").?.items;
     try std.testing.expectEqual(@as(usize, 28), text.len);
@@ -1159,7 +1216,9 @@ test "IType encoding" {
 }
 
 test "JType encoding" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1168,6 +1227,7 @@ test "JType encoding" {
         \\jal 0x200
         \\jalx $lr2, 0x300
     , "<test>");
+    try diag.flush();
 
     const text = as.segments.get(".text").?.items;
     try std.testing.expectEqual(@as(usize, 12), text.len);
@@ -1189,7 +1249,9 @@ test "JType encoding" {
 }
 
 test "pointer relocations on IType and JType" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1199,6 +1261,7 @@ test "pointer relocations on IType and JType" {
         \\j .lo16 target
         \\target: add $zero, $zero, $zero
     , "<test>");
+    try diag.flush();
 
     try std.testing.expectEqual(@as(usize, 3), as.relocations.items.len);
     try std.testing.expectEqual(isa.RelocationMode.ptrhi, as.relocations.items[0].kind);
@@ -1215,7 +1278,9 @@ test "pointer relocations on IType and JType" {
 }
 
 test "relocations with nonzero addends create .rela sections in ELF" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1224,6 +1289,7 @@ test "relocations with nonzero addends create .rela sections in ELF" {
         \\.section ".text"
         \\lw $a0, table+8($zero)
     , "<test>");
+    try diag.flush();
 
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
     try std.testing.expectEqual(@as(i32, 8), as.relocations.items[0].offset);
@@ -1241,7 +1307,9 @@ test "relocations with nonzero addends create .rela sections in ELF" {
 }
 
 test "ELF linking and relocation resolution of multiple reloc types" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1258,6 +1326,7 @@ test "ELF linking and relocation resolution of multiple reloc types" {
         \\target: j done
         \\done: rft
     , "<test>");
+    try diag.flush();
 
     const blob = try as.createElfBlob(c.ET_REL, 0);
     defer std.testing.allocator.free(blob);
@@ -1321,18 +1390,24 @@ test "ELF linking and relocation resolution of multiple reloc types" {
 }
 
 test "invalid alignment in pad directive" {
-    var as = try Assembly.init(std.testing.allocator);
+    var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer stderr.deinit();
+
+    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
     defer as.deinit();
 
     const err = as.assembleEntireFrame(std.testing.io,
         \\.section ".data"
         \\.pad 4 4 (0)
     , "<test>");
+    try stderr.writer.flush();
     try std.testing.expectError(AssemblyError.InvalidAlignment, err);
 }
 
 test "dynamic relocation in rtype aux" {
-    var as = try Assembly.init(std.testing.allocator);
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1340,14 +1415,17 @@ test "dynamic relocation in rtype aux" {
         \\sll $t0, $t1, shift_sym
         \\shift_sym: add $zero, $zero, $zero
     , "<test>");
+    try diag.flush();
 
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
     try std.testing.expectEqual(isa.RelocationMode.aux, as.relocations.items[0].kind);
     try std.testing.expectEqualStrings("shift_sym", as.relocations.items[0].name);
 }
 
-test "comprehensive integration: multi-segment assembly, data structures, and ELF emission" {
-    var as = try Assembly.init(std.testing.allocator);
+test "multi-segment assembly ELF emission" {
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
+    var as = try Assembly.init(std.testing.allocator, &diag.interface);
     defer as.deinit();
 
     try as.assembleEntireFrame(std.testing.io,
@@ -1379,6 +1457,7 @@ test "comprehensive integration: multi-segment assembly, data structures, and EL
         \\subroutine:
         \\  jr $ra, 0
     , "<test>");
+    try diag.flush();
 
     try std.testing.expect(as.symbols.contains("banner"));
     try std.testing.expect(as.symbols.contains("array"));

@@ -27,12 +27,12 @@ pub fn build(b: *std.Build) void {
     elf.link_libc = true;
     elf.strip = strip;
 
-    exe.root_module.addImport("elf_io", elf);
-    exe.root_module.addCSourceFile(.{
+    elf.addCSourceFile(.{
         .file = b.path("cbits/elf_io.c"),
         .flags = &.{"-Wall", "-Wextra", "-std=c99"},
     });
 
+    exe.root_module.addImport("elf_io", elf);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
@@ -49,6 +49,8 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    run_exe_tests.stdio = .zig_test;
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 }

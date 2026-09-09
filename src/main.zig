@@ -17,7 +17,7 @@ const helpText: []const u8 =
     \\
     ;
 
-const versionString: []const u8 = "1.1.0";
+const versionString: []const u8 = "1.2.0";
 
 const OutputType = enum {
     elf,
@@ -37,9 +37,10 @@ const DebugFileHeader = extern struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var stdout = std.Io.File.stdout().writer(init.io, &.{});
-    defer stdout.flush() catch {};
-    
+    const stderr = std.Io.File.stderr();
+    var yell: [256]u8 = undefined;
+    var diagnostics = stderr.writer(init.io, &yell).interface;
+
     var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
     const exename = args.next();
@@ -59,23 +60,23 @@ pub fn main(init: std.process.Init) !void {
         if (arg.len == 0) continue;
 
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try stdout.interface.print(helpText, .{exename.?});
+            try diagnostics.print(helpText, .{exename.?});
             return;
         } else if (std.mem.eql(u8, arg, "-o")) {
             if (outputName != null) {
-                try stdout.interface.print("error: only one output file is supported (found \"{s}\" and \"{s}\")\n", .{outputName.?, arg});
+                try diagnostics.print("error: only one output file is supported (found \"{s}\" and \"{s}\")\n", .{outputName.?, arg});
                 std.process.exit(1);
             }
 
             outputName = args.next() orelse {
-                try stdout.interface.writeAll("error: expected output file name.\n");
+                try diagnostics.writeAll("error: expected output file name.\n");
                 std.process.exit(1);
             };
         } else if (std.mem.startsWith(u8, arg, "-l:")) {
             try libraries.append(allocator, arg[3..]);
         } else if (std.mem.eql(u8, arg, "-t")) {
             const formatStr = args.next() orelse {
-                try stdout.interface.writeAll("error: expected format (elf or mdbg) after -t.\n");
+                try diagnostics.writeAll("error: expected format (elf or mdbg) after -t.\n");
                 std.process.exit(1);
             };
             if (std.mem.eql(u8, formatStr, "elf")) {
@@ -83,7 +84,7 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, formatStr, "mdbg")) {
                 outputType = .mdbg;
             } else {
-                try stdout.interface.print("error: unrecognized format \"{s}\". Expected elf or mdbg.\n", .{formatStr});
+                try diagnostics.print("error: unrecognized format \"{s}\". Expected elf or mdbg.\n", .{formatStr});
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "-E")) {
@@ -91,14 +92,14 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-c")) {
             linkObject = false;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            try stdout.interface.print("{s} version {s}\n", .{exename.?, versionString});
+            try diagnostics.print("{s} version {s}\n", .{exename.?, versionString});
             return;
         } else if (arg[0] == '-') {
-            try stdout.interface.print("error: unrecognized argument \"{s}\"\n", .{arg});
+            try diagnostics.print("error: unrecognized argument \"{s}\"\n", .{arg});
             std.process.exit(1);
         } else {
             if (inputName != null) {
-                try stdout.interface.print("error: only one input file is supported (found \"{s}\" and \"{s}\")\n", .{inputName.?, arg});
+                try diagnostics.print("error: only one input file is supported (found \"{s}\" and \"{s}\")\n", .{inputName.?, arg});
                 std.process.exit(1);
             }
 
@@ -107,12 +108,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (inputName == null) {
-        try stdout.interface.writeAll("error: no input file.\n");
+        try diagnostics.writeAll("error: no input file.\n");
         std.process.exit(1);
     }
 
     if (outputName == null) {
-        try stdout.interface.writeAll("error: no output file.\n");
+        try diagnostics.writeAll("error: no output file.\n");
         std.process.exit(1);
     }
 
@@ -123,23 +124,27 @@ pub fn main(init: std.process.Init) !void {
         const outFile = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
         defer outFile.close(init.io);
 
+
         const text = lexer.preprocessAll(init.arena.allocator()) catch |err| {
-            lexer.showErrorHere(err);
+            try lexer.showErrorHere(&diagnostics, err);
+            try diagnostics.flush();
             std.process.exit(1);
         };
 
         try outFile.writeStreamingAll(init.io, text);
+        try diagnostics.flush();
         std.process.exit(0);
     }
 
     if (!linkObject and outputType == .mdbg) {
-        try stdout.interface.writeAll("error: cannot stop before linking (-c) when emitting an mdbg snapshot.  Remove -c or use -t elf.\n");
+        try diagnostics.writeAll("error: cannot stop before linking (-c) when emitting an mdbg snapshot.  Remove -c or use -t elf.\n");
         std.process.exit(1);
     }
 
-    var assembler: A.Assembly = try A.Assembly.init(allocator);
+    var assembler: A.Assembly = try A.Assembly.init(allocator, &diagnostics);
     defer assembler.deinit();
     try assembler.assembleEntireFile(init.io, inputName.?);
+    try diagnostics.flush();
 
     const mainBlob = try assembler.createElfBlob(c.ET_REL, 0);
     defer init.arena.allocator().free(mainBlob);
@@ -155,7 +160,7 @@ pub fn main(init: std.process.Init) !void {
     var views = try allocator.alloc(c.ElfView, libraries.items.len + 1);
     var status = c.elf_view_parse(&views[0], mainBlob.len, mainBlob.ptr);
     if (status != c.ELF_SUCCESS) {
-        try stdout.interface.print("error: failed to parse assembled object: {s}\n", .{c.elf_status_str(status)});
+        try diagnostics.print("error: failed to parse assembled object: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
     }
 
@@ -164,7 +169,7 @@ pub fn main(init: std.process.Init) !void {
 
         status = c.elf_view_parse(&views[i + 1], libBlob.len, libBlob.ptr);
         if (status != c.ELF_SUCCESS) {
-            try stdout.interface.print("error: failed to parse library {s}: {s}\n", .{libPath, c.elf_status_str(status)});
+            try diagnostics.print("error: failed to parse library {s}: {s}\n", .{libPath, c.elf_status_str(status)});
             std.process.exit(1);
         }
     }
@@ -173,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
     status = c.elf_merge_calculate_layout(&layout, views.ptr, views.len);
 
     if (status != c.ELF_SUCCESS) {
-        try stdout.interface.print("error: linker layout failed: {s}\n", .{c.elf_status_str(status)});
+        try diagnostics.print("error: linker layout failed: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
     }
 
@@ -181,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
     status = c.elf_merge(ram.ptr, ram.len, &layout, views.ptr, views.len);
 
     if (status != c.ELF_SUCCESS) {
-        try stdout.interface.print("error: linker merge failed: {s}\n", .{c.elf_status_str(status)});
+        try diagnostics.print("error: linker merge failed: {s}\n", .{c.elf_status_str(status)});
         std.process.exit(1);
     }
 
@@ -211,7 +216,7 @@ pub fn main(init: std.process.Init) !void {
 
             status = c.elf_view_patch_relocations(&view, ram.ptr + begin, end - begin, &section.name, sectionLayout.ptr, sectionLayout.len);
             if (status != c.ELF_SUCCESS) {
-                try stdout.interface.print("error: relocation of section {s} failed: {s}\n", .{&section.name, c.elf_status_str(status)});
+                try diagnostics.print("error: relocation of section {s} failed: {s}\n", .{&section.name, c.elf_status_str(status)});
                 std.process.exit(1);
             }
         }
@@ -306,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
             );
 
             if (status != c.ELF_SUCCESS) {
-                try stdout.interface.print("error: final serialization failed: {s}\n", .{c.elf_status_str(status)});
+                try diagnostics.print("error: total serialization failed: {s}\n", .{c.elf_status_str(status)});
                 std.process.exit(1);
             }
             try outFile.writeStreamingAll(init.io, finalBlob);
@@ -319,9 +324,11 @@ test {
 }
 
 test "ELF two-object merge" {
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator);
+    var as1 = try A.Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -336,7 +343,7 @@ test "ELF two-object merge" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator);
+    var as2 = try A.Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -417,9 +424,11 @@ test "ELF two-object merge" {
 }
 
 test "ELF three-object merge" {
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator);
+    var as1 = try A.Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -437,7 +446,7 @@ test "ELF three-object merge" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator);
+    var as2 = try A.Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -452,7 +461,7 @@ test "ELF three-object merge" {
     const blob2 = try as2.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob2);
 
-    var as3 = try A.Assembly.init(allocator);
+    var as3 = try A.Assembly.init(allocator, &diag.interface);
     defer as3.deinit();
     try as3.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -522,9 +531,11 @@ test "ELF three-object merge" {
 }
 
 test "ELF four-object root with shared leaf" {
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var asRoot = try A.Assembly.init(allocator);
+    var asRoot = try A.Assembly.init(allocator, &diag.interface);
     defer asRoot.deinit();
     try asRoot.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -543,7 +554,7 @@ test "ELF four-object root with shared leaf" {
     const blobRoot = try asRoot.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blobRoot);
 
-    var asConfig = try A.Assembly.init(allocator);
+    var asConfig = try A.Assembly.init(allocator, &diag.interface);
     defer asConfig.deinit();
     try asConfig.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -554,7 +565,7 @@ test "ELF four-object root with shared leaf" {
     const blobConfig = try asConfig.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blobConfig);
 
-    var asFoo = try A.Assembly.init(allocator);
+    var asFoo = try A.Assembly.init(allocator, &diag.interface);
     defer asFoo.deinit();
     try asFoo.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -570,7 +581,7 @@ test "ELF four-object root with shared leaf" {
     const blobFoo = try asFoo.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blobFoo);
 
-    var asBar = try A.Assembly.init(allocator);
+    var asBar = try A.Assembly.init(allocator, &diag.interface);
     defer asBar.deinit();
     try asBar.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -656,9 +667,10 @@ test "ELF four-object root with shared leaf" {
 }
 
 test "ELF linker error: invalid relocation target section not in layout" {
+    var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     const allocator = std.testing.allocator;
 
-    var as = try A.Assembly.init(allocator);
+    var as = try A.Assembly.init(allocator, &writer);
     defer as.deinit();
     try as.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -683,9 +695,11 @@ test "ELF linker error: invalid relocation target section not in layout" {
 }
 
 test "ELF merge section alignment and padding propagation" {
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator);
+    var as1 = try A.Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -695,7 +709,7 @@ test "ELF merge section alignment and padding propagation" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator);
+    var as2 = try A.Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -733,9 +747,10 @@ test "ELF merge section alignment and padding propagation" {
 }
 
 test "ELF linker errors: invalid magic, wrong machine, truncated buffer, missing params" {
+    var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     const allocator = std.testing.allocator;
 
-    var as = try A.Assembly.init(allocator);
+    var as = try A.Assembly.init(allocator, &writer);
     defer as.deinit();
     try as.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -777,9 +792,10 @@ test "ELF linker errors: invalid magic, wrong machine, truncated buffer, missing
 }
 
 test "ELF linker errors: merge buffer too small and relocation buffer too small" {
+    var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     const allocator = std.testing.allocator;
 
-    var as = try A.Assembly.init(allocator);
+    var as = try A.Assembly.init(allocator, &writer);
     defer as.deinit();
     try as.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -809,9 +825,11 @@ test "ELF linker errors: merge buffer too small and relocation buffer too small"
 }
 
 test "heap_base resolution over ELF merge" {
+    var yell: [64]u8 = undefined;
+    var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator);
+    var as1 = try A.Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -821,7 +839,7 @@ test "heap_base resolution over ELF merge" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator);
+    var as2 = try A.Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".data"

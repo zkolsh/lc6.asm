@@ -19,7 +19,7 @@ pub const LexerError = error {
     UnterminatedComment,
     UnterminatedPreprocessorDirective,
     UnterminatedString,
-} || std.mem.Allocator.Error || std.Io.Dir.ReadFileAllocError || std.Io.Dir.StatFileError;
+} || std.mem.Allocator.Error || std.Io.Dir.ReadFileAllocError || std.Io.Dir.StatFileError || std.Io.Writer.Error;
 
 const Macro = struct {
     name: []const u8,
@@ -278,9 +278,11 @@ pub const Tokenizer = struct {
         unreachable;
     }
 
-    pub fn showErrorHere(self: *const Tokenizer, err: anyerror) void {
+    pub fn showErrorHere(self: *const Tokenizer, writer: *std.Io.Writer, err: anyerror) LexerError!void {
         const loc = self.getLocation() orelse {
-            std.debug.print("error: {s}\n", .{@errorName(err)});
+            try writer.writeAll("error: ");
+            try writer.writeAll(@errorName(err));
+            try writer.writeAll("\n");
             return;
         };
 
@@ -304,26 +306,41 @@ pub const Tokenizer = struct {
         while (i > 1) {
             i -= 1;
             const frame = frames[i];
-            const frame_loc = Tokenizer.getLocationInfo(
+            const frameLoc = Tokenizer.getLocationInfo(
                 frame.input,
                 frame.pos,
                 frame.filename,
             );
 
-            std.debug.print("in buffer expanded from {s}:{d}:{d}\n", .{frame_loc.filename, frame_loc.line, frame_loc.column});
+            try writer.writeAll("in buffer expanded from");
+            try writer.writeAll(frameLoc.filename);
+            try writer.writeAll(":");
+            try writer.printInt(frameLoc.line, 10, .lower, .{});
+            try writer.writeAll(":");
+            try writer.printInt(frameLoc.column, 10, .lower, .{});
+            try writer.writeAll("\n");
         }
 
         const frame = self.frameHead.?;
         const snippet = frame.input[loc.start..loc.end];
-        std.debug.print("{s}:{d}:{d}: error: {s}\n", .{loc.filename, loc.line, loc.column, @errorName(err)});
-        std.debug.print("{s}\n", .{snippet});
+        try writer.writeAll(loc.filename);
+        try writer.writeAll(":");
+        try writer.printInt(loc.line, 10, .lower, .{});
+        try writer.writeAll(":");
+        try writer.printInt(loc.column, 10, .lower, .{});
+        try writer.writeAll(": error: ");
+        try writer.writeAll(@errorName(err));
+        try writer.writeAll("\n");
+
+        try writer.writeAll(snippet);
+        try writer.writeAll("\n");
 
         for (snippet[0..loc.column - 1]) |c| switch (c) {
-            '\t' => std.debug.print("\t", .{}),
-            else => std.debug.print(" ",  .{}),
+            '\t' => try writer.writeAll("\t"),
+            else => try writer.writeAll(" "),
         };
 
-        std.debug.print("^\n", .{});
+        try writer.writeAll("^\n");
     }
 
     pub fn skipWhitespace(self: *Tokenizer) LexerError!void {
@@ -1429,6 +1446,7 @@ pub const Tokenizer = struct {
 
 fn testTokens(input: []const u8, expected: []const Tokenizer.Token.Kind) !void {
     const allocator = std.testing.allocator;
+    var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     
     var tokenizer = try Tokenizer.init(std.testing.io, allocator);
     defer tokenizer.deinit();
@@ -1437,7 +1455,8 @@ fn testTokens(input: []const u8, expected: []const Tokenizer.Token.Kind) !void {
 
     for (expected, 0..) |expectedKind, i| {
         const token = tokenizer.nextWord() catch |err| {
-            tokenizer.showErrorHere(err);
+            try tokenizer.showErrorHere(&writer, err);
+            try writer.flush();
             return err;
         };
 
@@ -1447,14 +1466,16 @@ fn testTokens(input: []const u8, expected: []const Tokenizer.Token.Kind) !void {
                 \\raw slice: "{s}"
                 \\
             , .{i, expectedKind, token.kind, token.data});
-            tokenizer.showErrorHere(error.TestExpectedEqual);
+            try tokenizer.showErrorHere(&writer, error.TestExpectedEqual);
+            try writer.flush();
             return error.TestExpectedEqual;
         }
     }
 
     if (expected.len == 0 or expected[expected.len - 1] != .eof) {
         const finalToken = tokenizer.nextWord() catch |err| {
-            tokenizer.showErrorHere(err);
+            try tokenizer.showErrorHere(&writer, err);
+            try writer.flush();
             return err;
         };
 
@@ -1467,6 +1488,8 @@ fn testTokens(input: []const u8, expected: []const Tokenizer.Token.Kind) !void {
             return error.TestExpectedEOF;
         }
     }
+
+    try writer.flush();
 }
 
 fn testTokenError(input: []const u8, expectedError: anyerror) !void {
