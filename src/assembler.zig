@@ -86,7 +86,7 @@ pub const Assembly = struct {
                 }
 
                 self.currentSegment = try self.getOrPutSegment(name);
-                self.currentSegmentName = name;
+                self.currentSegmentName = try self.strings.allocator().dupe(u8, name);
                 return;
             },
 
@@ -146,9 +146,10 @@ pub const Assembly = struct {
                 try self.alignSegment(self.currentSegment, 4);
                 labelLoc = self.getOffset();
 
+                const savedName = try self.strings.allocator().dupe(u8, label);
                 try self.relocations.append(self.allocator, .{
                     .addr = labelLoc,
-                    .name = label,
+                    .name = savedName,
                     .section = self.currentSegmentName,
                     .kind = .word,
                     .bookmark = bookmark,
@@ -161,9 +162,10 @@ pub const Assembly = struct {
                 try self.alignSegment(self.currentSegment, 2);
                 labelLoc = self.getOffset();
 
+                const savedName = try self.strings.allocator().dupe(u8, label);
                 try self.relocations.append(self.allocator, .{
                     .addr = labelLoc,
-                    .name = label,
+                    .name = savedName,
                     .section = self.currentSegmentName,
                     .kind = .ptrlo,
                     .bookmark = bookmark,
@@ -176,9 +178,10 @@ pub const Assembly = struct {
                 try self.alignSegment(self.currentSegment, 2);
                 labelLoc = self.getOffset();
 
+                const savedName = try self.strings.allocator().dupe(u8, label);
                 try self.relocations.append(self.allocator, .{
                     .addr = labelLoc,
-                    .name = label,
+                    .name = savedName,
                     .section = self.currentSegmentName,
                     .kind = .ptrhi,
                     .bookmark = bookmark,
@@ -194,9 +197,10 @@ pub const Assembly = struct {
                 const imm = switch (r.aux) {
                     .static => |x| x,
                     .dynamic => |dyn| blk: {
+                        const savedName = try self.strings.allocator().dupe(u8, dyn.label);
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = dyn.label,
+                            .name = savedName,
                             .offset = dyn.offset,
                             .section = self.currentSegmentName,
                             .kind = .aux,
@@ -227,9 +231,10 @@ pub const Assembly = struct {
                 const imm = switch (i.imm) {
                     .static => |x| x,
                     .dynamic => |dyn| blk: {
+                        const savedName = try self.strings.allocator().dupe(u8, dyn.label);
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = dyn.label,
+                            .name = savedName,
                             .offset = dyn.offset,
                             .section = self.currentSegmentName,
                             .kind = info.reltype.?,
@@ -240,9 +245,10 @@ pub const Assembly = struct {
                     },
 
                     .pointer => |x| blk: {
+                        const savedName = try self.strings.allocator().dupe(u8, x.label);
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = x.label,
+                            .name = savedName,
                             .offset = 0,
                             .section = self.currentSegmentName,
                             .kind = if (x.high) .ptrhi else .ptrlo,
@@ -292,9 +298,10 @@ pub const Assembly = struct {
                 const imm = switch (j.imm) {
                     .static => |x| try validateImmediate(info.immtype.?, x),
                     .dynamic => |dyn| blk: {
+                        const savedName = try self.strings.allocator().dupe(u8, dyn.label);
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = dyn.label,
+                            .name = savedName,
                             .offset = dyn.offset,
                             .section = self.currentSegmentName,
                             .kind = info.reltype.?,
@@ -305,9 +312,10 @@ pub const Assembly = struct {
                     },
 
                     .pointer => |x| blk: {
+                        const savedName = try self.strings.allocator().dupe(u8, x.label);
                         try self.relocations.append(self.allocator, .{
                             .addr = labelLoc,
-                            .name = x.label,
+                            .name = savedName,
                             .offset = 0,
                             .section = self.currentSegmentName,
                             .kind = if (x.high) .ptrhi else .ptrlo,
@@ -552,7 +560,11 @@ pub const Assembly = struct {
                 textIndex = segIndex;
             }
 
+            try sectionIndices.put(segment.name, nextSectionIndex);
             try sectionIndices.put(name, nextSectionIndex);
+            if (segment.name.len > 0 and segment.name[0] == '.') {
+                try sectionIndices.put(segment.name[1..], nextSectionIndex);
+            }
             nextSectionIndex += 1;
 
             const flags: c.ElfShFlags =
@@ -894,9 +906,6 @@ test "sample program" {
 
     try std.testing.expect(as.segments.get("text").?.items.len > 0);
     try std.testing.expect(as.segments.get("data").?.items.len > 4);
-
-    // as.patchStaticRelocations();
-    // try std.testing.expectEqual(@as(usize, 0), as.relocations.items.len);
 }
 
 test "heap_base symbol and relocation resolution" {
@@ -947,4 +956,455 @@ test "heap_base symbol and relocation resolution" {
     std.mem.copyForwards(u8, std.mem.asBytes(&instruction), ram[0..4]);
     const imm17 = instruction & 0x1FFFF;
     try std.testing.expectEqual(@as(u32, 12), imm17);
+}
+
+test "error: label not allowed on section directive" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    const err = as.assembleEntireFrame(std.testing.io,
+        \\bad_label: .section ".text"
+    , "<test>");
+    try std.testing.expectError(AssemblyError.LabelNotAllowedHere, err);
+}
+
+test "error: symbol redefined in same or different section" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    const err = as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\my_label: add $zero, $zero, $zero
+        \\my_label: addi $t0, $t0, 1
+    , "<test>");
+    try std.testing.expectError(AssemblyError.SymbolRedefined, err);
+}
+
+test "error: unresolved symbol during ELF blob creation" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\lw $a0, nonexistent_symbol($zero)
+    , "<test>");
+
+    try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
+    const err = as.createElfBlob(c.ET_REL, 0);
+    try std.testing.expectError(AssemblyError.UnresolvedSymbol, err);
+}
+
+test "immediate data directives" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".data"
+        \\b1: .byte 0x11 0x22 0x33
+        \\s1: .short 0x4455 0x6677
+        \\w1: .word 0x8899AABB
+        \\str1: .asciiz "ABC"
+        \\str2: .nascii "DEF"
+        \\pad1: .pad 3 2 (8)
+    , "<test>");
+
+    const data = as.segments.get(".data").?.items;
+
+    try std.testing.expectEqual(@as(usize, 0), as.symbols.get("b1").?.offset);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22, 0x33 }, data[0..3]);
+
+    try std.testing.expectEqual(@as(usize, 4), as.symbols.get("s1").?.offset);
+    try std.testing.expectEqual(@as(u8, 0), data[3]);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x55, 0x44, 0x77, 0x66 }, data[4..8]);
+
+    try std.testing.expectEqual(@as(usize, 8), as.symbols.get("w1").?.offset);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xBB, 0xAA, 0x99, 0x88 }, data[8..12]);
+
+    try std.testing.expectEqual(@as(usize, 12), as.symbols.get("str1").?.offset);
+    try std.testing.expectEqualSlices(u8, "ABC\x00", data[12..16]);
+
+    try std.testing.expectEqual(@as(usize, 16), as.symbols.get("str2").?.offset);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 3, 0, 0, 0, 'D', 'E', 'F' }, data[16..23]);
+
+    try std.testing.expectEqual(@as(usize, 24), as.symbols.get("pad1").?.offset);
+    try std.testing.expectEqual(@as(usize, 29), data.len);
+    for (data[23..29]) |byte| {
+        try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "pointer data directives" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".data"
+        \\.byte 0xFF
+        \\p_ptr: .ptr target_sym
+        \\.byte 0xEE
+        \\p_lo:  .lo16 target_sym
+        \\.byte 0xDD
+        \\p_hi:  .hi16 target_sym
+        \\target_sym: .word 0
+    , "<test>");
+
+    const data = as.segments.get(".data").?.items;
+
+    try std.testing.expectEqual(@as(usize, 4), as.symbols.get("p_ptr").?.offset);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x77, 0x77, 0x77, 0x77 }, data[4..8]);
+
+    try std.testing.expectEqual(@as(usize, 10), as.symbols.get("p_lo").?.offset);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x47, 0x47 }, data[10..12]);
+
+    try std.testing.expectEqual(@as(usize, 14), as.symbols.get("p_hi").?.offset);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x74, 0x74 }, data[14..16]);
+
+    try std.testing.expectEqual(@as(usize, 3), as.relocations.items.len);
+    try std.testing.expectEqual(isa.RelocationMode.word, as.relocations.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 4), as.relocations.items[0].addr);
+    try std.testing.expectEqual(isa.RelocationMode.ptrlo, as.relocations.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 10), as.relocations.items[1].addr);
+    try std.testing.expectEqual(isa.RelocationMode.ptrhi, as.relocations.items[2].kind);
+    try std.testing.expectEqual(@as(usize, 14), as.relocations.items[2].addr);
+}
+
+test "RType encoding" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\add $t0, $t1, $t2
+        \\sll $s0, $s1, 5
+        \\cfs $a0, $psw
+        \\rft
+    , "<test>");
+
+    const text = as.segments.get(".text").?.items;
+    try std.testing.expectEqual(@as(usize, 16), text.len);
+
+    const add: u32 = 12 | (0 << 7) | (@as(u32, @intFromEnum(isa.Register.t0)) << 12) | (@as(u32, @intFromEnum(isa.Register.t2)) << 17) | (@as(u32, @intFromEnum(isa.Register.t1)) << 22);
+    var addRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&addRes), text[0..4]);
+    try std.testing.expectEqual(add, std.mem.littleToNative(u32, addRes));
+
+    const sll: u32 = 0 | (5 << 7) | (@as(u32, @intFromEnum(isa.Register.s0)) << 12) | (@as(u32, @intFromEnum(isa.Register.s1)) << 17) | (0 << 22);
+    var sllRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&sllRes), text[4..8]);
+    try std.testing.expectEqual(sll, std.mem.littleToNative(u32, sllRes));
+
+    const cfs: u32 = 32 | (0 << 7) | (0 << 12) | (0 << 17) | (@as(u32, @intFromEnum(isa.Register.a0)) << 22);
+    var cfsRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&cfsRes), text[8..12]);
+    try std.testing.expectEqual(cfs, std.mem.littleToNative(u32, cfsRes));
+
+    const rft: u32 = 35;
+    var rftRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&rftRes), text[12..16]);
+    try std.testing.expectEqual(rft, std.mem.littleToNative(u32, rftRes));
+}
+
+test "IType encoding" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\addi $t0, $a0, 42
+        \\lci  $t1, $zero, 0x1234
+        \\ori  $t2, $t1, 0x5678
+        \\orh  $t2, $t2, 0x9ABC
+        \\jr   $ra, 0
+        \\jalr $t0, 0
+        \\jalrx $t0, $lr3, 0
+    , "<test>");
+
+    const text = as.segments.get(".text").?.items;
+    try std.testing.expectEqual(@as(usize, 28), text.len);
+
+    const addi: u32 = (3 << 27) | (@as(u32, @intFromEnum(isa.Register.a0)) << 22) | (@as(u32, @intFromEnum(isa.Register.t0)) << 17) | 42;
+    var addiRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&addiRes), text[0..4]);
+    try std.testing.expectEqual(addi, std.mem.littleToNative(u32, addiRes));
+
+    const lci: u32 = (4 << 27) | (0 << 22) | (@as(u32, @intFromEnum(isa.Register.t1)) << 17) | (1 << 16) | 0x1234;
+    var lciRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&lciRes), text[4..8]);
+    try std.testing.expectEqual(lci, std.mem.littleToNative(u32, lciRes));
+
+    const ori: u32 = (6 << 27) | (@as(u32, @intFromEnum(isa.Register.t1)) << 22) | (@as(u32, @intFromEnum(isa.Register.t2)) << 17) | (0 << 16) | 0x5678;
+    var oriRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&oriRes), text[8..12]);
+    try std.testing.expectEqual(ori, std.mem.littleToNative(u32, oriRes));
+
+    const orh: u32 = (6 << 27) | (@as(u32, @intFromEnum(isa.Register.t2)) << 22) | (@as(u32, @intFromEnum(isa.Register.t2)) << 17) | (1 << 16) | 0x9ABC;
+    var orhRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&orhRes), text[12..16]);
+    try std.testing.expectEqual(orh, std.mem.littleToNative(u32, orhRes));
+
+    const jr: u32 = (2 << 27) | (@as(u32, @intFromEnum(isa.Register.ra)) << 22);
+    var jrRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&jrRes), text[16..20]);
+    try std.testing.expectEqual(jr, std.mem.littleToNative(u32, jrRes));
+
+    const jalr: u32 = (2 << 27) | (@as(u32, @intFromEnum(isa.Register.t0)) << 22) | (1 << 20);
+    var jalrRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&jalrRes), text[20..24]);
+    try std.testing.expectEqual(jalr, std.mem.littleToNative(u32, jalrRes));
+
+    const jalrx: u32 = (2 << 27) | (@as(u32, @intFromEnum(isa.Register.t0)) << 22) | (1 << 21) | (3 << 19);
+    var jalrxRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&jalrxRes), text[24..28]);
+    try std.testing.expectEqual(jalrx, std.mem.littleToNative(u32, jalrxRes));
+}
+
+test "JType encoding" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\j 0x100
+        \\jal 0x200
+        \\jalx $lr2, 0x300
+    , "<test>");
+
+    const text = as.segments.get(".text").?.items;
+    try std.testing.expectEqual(@as(usize, 12), text.len);
+
+    const j: u32 = (1 << 27) | (0b00 << 25) | (0 << 24) | 0x100;
+    var jRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&jRes), text[0..4]);
+    try std.testing.expectEqual(j, std.mem.littleToNative(u32, jRes));
+
+    const jal: u32 = (1 << 27) | (0b01 << 25) | (0 << 24) | 0x200;
+    var jalRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&jalRes), text[4..8]);
+    try std.testing.expectEqual(jal, std.mem.littleToNative(u32, jalRes));
+
+    const jalx: u32 = (1 << 27) | (0b10 << 25) | (2 << 24) | 0x300;
+    var jalxRes: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&jalxRes), text[8..12]);
+    try std.testing.expectEqual(jalx, std.mem.littleToNative(u32, jalxRes));
+}
+
+test "pointer relocations on IType and JType" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\orh $t0, $zero, .hi16 target
+        \\ori $t0, $t0, .lo16 target
+        \\j .lo16 target
+        \\target: add $zero, $zero, $zero
+    , "<test>");
+
+    try std.testing.expectEqual(@as(usize, 3), as.relocations.items.len);
+    try std.testing.expectEqual(isa.RelocationMode.ptrhi, as.relocations.items[0].kind);
+    try std.testing.expectEqualStrings("target", as.relocations.items[0].name);
+    try std.testing.expectEqual(@as(usize, 0), as.relocations.items[0].addr);
+
+    try std.testing.expectEqual(isa.RelocationMode.ptrlo, as.relocations.items[1].kind);
+    try std.testing.expectEqualStrings("target", as.relocations.items[1].name);
+    try std.testing.expectEqual(@as(usize, 4), as.relocations.items[1].addr);
+
+    try std.testing.expectEqual(isa.RelocationMode.ptrlo, as.relocations.items[2].kind);
+    try std.testing.expectEqualStrings("target", as.relocations.items[2].name);
+    try std.testing.expectEqual(@as(usize, 8), as.relocations.items[2].addr);
+}
+
+test "relocations with nonzero addends create .rela sections in ELF" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".data"
+        \\table: .word 10 20 30 40
+        \\.section ".text"
+        \\lw $a0, table+8($zero)
+    , "<test>");
+
+    try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
+    try std.testing.expectEqual(@as(i32, 8), as.relocations.items[0].offset);
+
+    const blob = try as.createElfBlob(c.ET_REL, 0);
+    defer std.testing.allocator.free(blob);
+
+    var view: c.ElfView = undefined;
+    const status = c.elf_view_parse(&view, blob.len, blob.ptr);
+    try std.testing.expectEqual(c.ELF_SUCCESS, status);
+
+    const relaHeader = c.elf_view_get_section_header(&view, ".rela.text");
+    try std.testing.expect(relaHeader != null);
+    try std.testing.expectEqual(@as(u32, @intCast(@sizeOf(c.ElfRela))), relaHeader.*.sh_size);
+}
+
+test "ELF linking and relocation resolution of multiple reloc types" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".data"
+        \\val: .word 0x12345678
+        \\val_ptr: .ptr val
+        \\val_lo: .lo16 val
+        \\val_hi: .hi16 val
+        \\.word 0
+        \\.section ".text"
+        \\entry: lw $a0, val($zero)
+        \\beq $a0, $zero, target
+        \\add $zero, $zero, $zero
+        \\target: j done
+        \\done: rft
+    , "<test>");
+
+    const blob = try as.createElfBlob(c.ET_REL, 0);
+    defer std.testing.allocator.free(blob);
+
+    var view: c.ElfView = undefined;
+    try std.testing.expectEqual(c.ELF_SUCCESS, c.elf_view_parse(&view, blob.len, blob.ptr));
+
+    var layout: c.ElfLayoutMap = undefined;
+    var views = [_]c.ElfView{view};
+    try std.testing.expectEqual(c.ELF_SUCCESS, c.elf_merge_calculate_layout(&layout, &views, 1));
+
+    const ram = try std.testing.allocator.alloc(u8, layout.total_memory_needed);
+    defer std.testing.allocator.free(ram);
+
+    try std.testing.expectEqual(c.ELF_SUCCESS, c.elf_merge(ram.ptr, ram.len, &layout, &views, 1));
+
+    var sectionLayout = try std.testing.allocator.alloc(c.ElfSectionAddress, layout.section_count);
+    defer std.testing.allocator.free(sectionLayout);
+
+    for (layout.sections[0..layout.section_count], 0..) |*section, i| {
+        sectionLayout[i] = .{
+            .section_name = &section.name,
+            .base_vaddr = @as(u32, @intCast(section.base_vaddr)),
+        };
+    }
+
+    for (layout.sections[0..layout.section_count]) |*section| {
+        const name = std.mem.sliceTo(&section.name, 0);
+        if (!std.mem.eql(u8, name, ".text") and !std.mem.eql(u8, name, ".data")) {
+            continue;
+        }
+
+        const patchOk = c.elf_view_patch_relocations(&view, ram.ptr + section.base_vaddr, section.size, &section.name, sectionLayout.ptr, sectionLayout.len);
+        try std.testing.expectEqual(c.ELF_SUCCESS, patchOk);
+    }
+
+    var dataVaddr: u32 = 0;
+    var textVaddr: u32 = 0;
+    for (layout.sections[0..layout.section_count]) |*section| {
+        const name = std.mem.sliceTo(&section.name, 0);
+        if (std.mem.eql(u8, name, ".data")) dataVaddr = @as(u32, @intCast(section.base_vaddr));
+        if (std.mem.eql(u8, name, ".text")) textVaddr = @as(u32, @intCast(section.base_vaddr));
+    }
+
+    var ptrWord: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&ptrWord), ram[dataVaddr + 4 .. dataVaddr + 8]);
+    try std.testing.expectEqual(dataVaddr, std.mem.littleToNative(u32, ptrWord));
+
+    var loShort: u16 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&loShort), ram[dataVaddr + 8 .. dataVaddr + 10]);
+    try std.testing.expectEqual(@as(u16, 0x4747 | @as(u16, @truncate(dataVaddr))), std.mem.littleToNative(u16, loShort));
+
+    var hiShort: u16 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&hiShort), ram[dataVaddr + 10 .. dataVaddr + 12]);
+    try std.testing.expectEqual(@as(u16, 0x7474 | @as(u16, @truncate(dataVaddr >> 16))), std.mem.littleToNative(u16, hiShort));
+
+    var beqInstr: u32 = undefined;
+    std.mem.copyForwards(u8, std.mem.asBytes(&beqInstr), ram[textVaddr + 4 .. textVaddr + 8]);
+    const beqImm = beqInstr & 0x1FFFF;
+    try std.testing.expectEqual(@as(u32, 1), beqImm);
+}
+
+test "invalid alignment in pad directive" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    const err = as.assembleEntireFrame(std.testing.io,
+        \\.section ".data"
+        \\.pad 4 4 (0)
+    , "<test>");
+    try std.testing.expectError(AssemblyError.InvalidAlignment, err);
+}
+
+test "dynamic relocation in rtype aux" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".text"
+        \\sll $t0, $t1, shift_sym
+        \\shift_sym: add $zero, $zero, $zero
+    , "<test>");
+
+    try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
+    try std.testing.expectEqual(isa.RelocationMode.aux, as.relocations.items[0].kind);
+    try std.testing.expectEqualStrings("shift_sym", as.relocations.items[0].name);
+}
+
+test "comprehensive integration: multi-segment assembly, data structures, and ELF emission" {
+    var as = try Assembly.init(std.testing.allocator);
+    defer as.deinit();
+
+    try as.assembleEntireFrame(std.testing.io,
+        \\.section ".rodata"
+        \\banner: .asciiz "overloaded record update"
+        \\
+        \\.section ".data"
+        \\array: .word 10 20 30 40 50
+        \\array_ptr: .ptr array
+        \\array_len: .short 5
+        \\flags: .byte 0x01 0x02
+        \\
+        \\.section ".text"
+        \\start:
+        \\  xor $zero, $zero, $zero
+        \\  lw $a0, array($zero)
+        \\  lw $a1, array+8($zero)
+        \\  add $t0, $a0, $a1
+        \\  sw $t0, array+16($zero)
+        \\  
+        \\loop_body:
+        \\  addi $t1, $zero, 10
+        \\  bne $t0, $t1, loop_body
+        \\  
+        \\finish:
+        \\  jal subroutine
+        \\  j finish
+        \\
+        \\subroutine:
+        \\  jr $ra, 0
+    , "<test>");
+
+    try std.testing.expect(as.symbols.contains("banner"));
+    try std.testing.expect(as.symbols.contains("array"));
+    try std.testing.expect(as.symbols.contains("array_ptr"));
+    try std.testing.expect(as.symbols.contains("array_len"));
+    try std.testing.expect(as.symbols.contains("flags"));
+    try std.testing.expect(as.symbols.contains("start"));
+    try std.testing.expect(as.symbols.contains("loop_body"));
+    try std.testing.expect(as.symbols.contains("finish"));
+    try std.testing.expect(as.symbols.contains("subroutine"));
+
+    const blob = try as.createElfBlob(c.ET_REL, 0);
+    defer std.testing.allocator.free(blob);
+
+    var view: c.ElfView = undefined;
+    try std.testing.expectEqual(c.ELF_SUCCESS, c.elf_view_parse(&view, blob.len, blob.ptr));
+
+    const textHdr = c.elf_view_get_section_header(&view, ".text");
+    const dataHdr = c.elf_view_get_section_header(&view, ".data");
+    const rodataHdr = c.elf_view_get_section_header(&view, ".rodata");
+
+    try std.testing.expect(textHdr != null);
+    try std.testing.expect(dataHdr != null);
+    try std.testing.expect(rodataHdr != null);
+
+    try std.testing.expectEqual(@as(u32, @bitCast(c.SHF_ALLOC | c.SHF_EXECINSTR)), textHdr.*.sh_flags);
+    try std.testing.expectEqual(@as(u32, @bitCast(c.SHF_ALLOC | c.SHF_WRITE)), dataHdr.*.sh_flags);
+    try std.testing.expectEqual(@as(u32, @bitCast(c.SHF_ALLOC)), rodataHdr.*.sh_flags);
 }
