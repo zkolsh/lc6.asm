@@ -1,7 +1,8 @@
 const std = @import("std");
-const A = @import("assembler.zig");
-const T = @import("tokenizer.zig");
 const c = @import("elf_io");
+
+const Assembly = @import("assembler.zig");
+const Tokenizer = @import("tokenizer.zig");
 
 const helpText: []const u8 =
     \\usage: {s} [options...] <input file> -o <output file>
@@ -118,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (justPreprocess) {
-        var lexer = try T.Tokenizer.init(init.io, init.arena.allocator());
+        var lexer = try Tokenizer.init(init.io, init.arena.allocator());
         defer lexer.deinit();
 
         const outFile = try std.Io.Dir.cwd().createFile(init.io, outputName.?, .{});
@@ -141,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    var assembler: A.Assembly = try A.Assembly.init(allocator, &diagnostics);
+    var assembler: Assembly = try Assembly.init(allocator, &diagnostics);
     defer assembler.deinit();
     try assembler.assembleEntireFile(init.io, inputName.?);
     try diagnostics.flush();
@@ -320,7 +321,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
-    std.testing.refAllDecls(A);
+    std.testing.refAllDecls(Assembly);
 }
 
 test "ELF two-object merge" {
@@ -328,7 +329,7 @@ test "ELF two-object merge" {
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator, &diag.interface);
+    var as1 = try Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -343,7 +344,7 @@ test "ELF two-object merge" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator, &diag.interface);
+    var as2 = try Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -428,7 +429,7 @@ test "ELF three-object merge" {
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator, &diag.interface);
+    var as1 = try Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -446,7 +447,7 @@ test "ELF three-object merge" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator, &diag.interface);
+    var as2 = try Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -461,7 +462,7 @@ test "ELF three-object merge" {
     const blob2 = try as2.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob2);
 
-    var as3 = try A.Assembly.init(allocator, &diag.interface);
+    var as3 = try Assembly.init(allocator, &diag.interface);
     defer as3.deinit();
     try as3.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -535,7 +536,7 @@ test "ELF four-object root with shared leaf" {
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var asRoot = try A.Assembly.init(allocator, &diag.interface);
+    var asRoot = try Assembly.init(allocator, &diag.interface);
     defer asRoot.deinit();
     try asRoot.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -554,7 +555,7 @@ test "ELF four-object root with shared leaf" {
     const blobRoot = try asRoot.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blobRoot);
 
-    var asConfig = try A.Assembly.init(allocator, &diag.interface);
+    var asConfig = try Assembly.init(allocator, &diag.interface);
     defer asConfig.deinit();
     try asConfig.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -565,7 +566,7 @@ test "ELF four-object root with shared leaf" {
     const blobConfig = try asConfig.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blobConfig);
 
-    var asFoo = try A.Assembly.init(allocator, &diag.interface);
+    var asFoo = try Assembly.init(allocator, &diag.interface);
     defer asFoo.deinit();
     try asFoo.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -581,7 +582,7 @@ test "ELF four-object root with shared leaf" {
     const blobFoo = try asFoo.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blobFoo);
 
-    var asBar = try A.Assembly.init(allocator, &diag.interface);
+    var asBar = try Assembly.init(allocator, &diag.interface);
     defer asBar.deinit();
     try asBar.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -670,7 +671,7 @@ test "ELF linker error: invalid relocation target section not in layout" {
     var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     const allocator = std.testing.allocator;
 
-    var as = try A.Assembly.init(allocator, &writer);
+    var as = try Assembly.init(allocator, &writer);
     defer as.deinit();
     try as.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -699,7 +700,7 @@ test "ELF merge section alignment and padding propagation" {
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator, &diag.interface);
+    var as1 = try Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -709,7 +710,7 @@ test "ELF merge section alignment and padding propagation" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator, &diag.interface);
+    var as2 = try Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -750,7 +751,7 @@ test "ELF linker errors: invalid magic, wrong machine, truncated buffer, missing
     var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     const allocator = std.testing.allocator;
 
-    var as = try A.Assembly.init(allocator, &writer);
+    var as = try Assembly.init(allocator, &writer);
     defer as.deinit();
     try as.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -795,7 +796,7 @@ test "ELF linker errors: merge buffer too small and relocation buffer too small"
     var writer = std.Io.Writer.Allocating.init(std.testing.allocator).writer;
     const allocator = std.testing.allocator;
 
-    var as = try A.Assembly.init(allocator, &writer);
+    var as = try Assembly.init(allocator, &writer);
     defer as.deinit();
     try as.assembleEntireFrame(std.testing.io,
         \\.section ".data"
@@ -829,7 +830,7 @@ test "heap_base resolution over ELF merge" {
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
     const allocator = std.testing.allocator;
 
-    var as1 = try A.Assembly.init(allocator, &diag.interface);
+    var as1 = try Assembly.init(allocator, &diag.interface);
     defer as1.deinit();
     try as1.assembleEntireFrame(std.testing.io,
         \\.section ".text"
@@ -839,7 +840,7 @@ test "heap_base resolution over ELF merge" {
     const blob1 = try as1.createElfBlob(c.ET_REL, 0);
     defer allocator.free(blob1);
 
-    var as2 = try A.Assembly.init(allocator, &diag.interface);
+    var as2 = try Assembly.init(allocator, &diag.interface);
     defer as2.deinit();
     try as2.assembleEntireFrame(std.testing.io,
         \\.section ".data"

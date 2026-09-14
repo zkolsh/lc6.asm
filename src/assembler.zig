@@ -1,12 +1,23 @@
 const c = @import("elf_io");
 const std =  @import("std");
-const parsing = @import("parser.zig");
-const lexing = @import("tokenizer.zig");
 const isa =  @import("isa.zig");
 
-const Statement = isa.Statement;
-const Parser = parsing.Parser;
-const Tokenizer = lexing.Tokenizer;
+const Parser = @import("parser.zig");
+const Tokenizer = @import("tokenizer.zig");
+const Assembly = @This();
+
+allocator: std.mem.Allocator,
+strings: std.heap.ArenaAllocator,
+sources: ?Tokenizer,
+
+segments: std.StringHashMap(Segment),
+currentSegment: *Segment,
+currentSegmentName: []const u8,
+
+symbols: std.StringHashMap(Symbol),
+relocations: std.ArrayList(Relocation),
+
+diagnostics: *std.Io.Writer,
 
 pub const Symbol = struct {
     offset: usize,
@@ -22,7 +33,9 @@ pub const Relocation = struct {
     bookmark: Tokenizer.Bookmark,
 };
 
-pub const AssemblyError = error {
+const Segment = std.ArrayList(u8);
+
+pub const Error = error {
     InvalidAlignment,
     InvalidLabel,
     InvalidRelocation,
@@ -30,398 +43,426 @@ pub const AssemblyError = error {
     SerializationFailed,
     SymbolRedefined,
     UnresolvedSymbol,
-} || parsing.ParseError;
+} || Parser.Error;
 
-const Segment = std.ArrayList(u8);
-pub const Assembly = struct {
-    allocator: std.mem.Allocator,
-    strings: std.heap.ArenaAllocator,
-    sources: ?Tokenizer,
+pub fn init(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Assembly {
+    var segments = std.StringHashMap(Segment).init(allocator);
+    try segments.put(".text", std.ArrayList(u8).empty);
+    try segments.put(".data", std.ArrayList(u8).empty);
 
-    segments: std.StringHashMap(Segment),
-    currentSegment: *Segment,
-    currentSegmentName: []const u8,
+    var symbols = std.StringHashMap(Symbol).init(allocator);
+    try symbols.put("heap_base", .{.offset = 0, .segment="?heap"});
 
-    symbols: std.StringHashMap(Symbol),
-    relocations: std.ArrayList(Relocation),
+    return .{
+        .allocator = allocator,
+        .strings = std.heap.ArenaAllocator.init(allocator),
+        .sources = null,
+        .segments = segments,
+        .currentSegment = segments.getPtr(".text").?,
+        .currentSegmentName = ".text",
+        .symbols = symbols,
+        .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 32),
+        .diagnostics = stderr,
+    };
+}
 
-    diagnostics: *std.Io.Writer,
+pub fn deinit(self: *Assembly) void {
+    self.relocations.deinit(self.allocator);
 
-    pub fn init(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Assembly {
-        var segments = std.StringHashMap(Segment).init(allocator);
-        try segments.put(".text", std.ArrayList(u8).empty);
-        try segments.put(".data", std.ArrayList(u8).empty);
-
-        var symbols = std.StringHashMap(Symbol).init(allocator);
-        try symbols.put("heap_base", .{.offset = 0, .segment="?heap"});
-
-        return .{
-            .allocator = allocator,
-            .strings = std.heap.ArenaAllocator.init(allocator),
-            .sources = null,
-            .segments = segments,
-            .currentSegment = segments.getPtr(".text").?,
-            .currentSegmentName = ".text",
-            .symbols = symbols,
-            .relocations = try std.ArrayList(Relocation).initCapacity(allocator, 32),
-            .diagnostics = stderr,
-        };
+    var segment = self.segments.iterator();
+    while (segment.next()) |entry| {
+        entry.value_ptr.deinit(self.allocator);
     }
 
-    pub fn deinit(self: *Assembly) void {
-        self.relocations.deinit(self.allocator);
+    self.segments.deinit();
+    self.symbols.deinit();
+    self.strings.deinit();
+}
 
-        var segment = self.segments.iterator();
-        while (segment.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-        }
+pub fn encodeStatement(self: *Assembly, stmt: isa.Statement, bookmark: Tokenizer.Bookmark) Error!void {
+    switch (stmt.value) {
+        .section => |name| {
+            if (stmt.label.len != 0) {
+                return Error.LabelNotAllowedHere;
+            }
 
-        self.segments.deinit();
-        self.symbols.deinit();
-        self.strings.deinit();
+            self.currentSegment = try self.getOrPutSegment(name);
+            self.currentSegmentName = try self.strings.allocator().dupe(u8, name);
+            return;
+        },
+
+        else => {},
     }
 
-    pub fn encodeStatement(self: *Assembly, stmt: Statement, bookmark: Tokenizer.Bookmark) AssemblyError!void {
-        switch (stmt.value) {
-            .section => |name| {
-                if (stmt.label.len != 0) {
-                    return AssemblyError.LabelNotAllowedHere;
-                }
+    var labelLoc = self.getOffset();
+    switch (stmt.value) {
+        .section => unreachable,
 
-                self.currentSegment = try self.getOrPutSegment(name);
-                self.currentSegmentName = try self.strings.allocator().dupe(u8, name);
-                return;
-            },
+        .bytes => |bytes| {
+            try self.currentSegment.appendSlice(self.allocator, bytes);
+        },
 
-            else => {},
-        }
+        .shorts => |shorts| {
+            try self.alignSegment(self.currentSegment, 2);
+            labelLoc = self.getOffset();
 
-        var labelLoc = self.getOffset();
-        switch (stmt.value) {
-            .section => unreachable,
+            for (shorts) |x| {
+                const le = std.mem.nativeToLittle(u16, x);
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&le));
+            }
+        },
 
-            .bytes => |bytes| {
-                try self.currentSegment.appendSlice(self.allocator, bytes);
-            },
+        .words => |words| {
+            try self.alignSegment(self.currentSegment, 4);
+            labelLoc = self.getOffset();
 
-            .shorts => |shorts| {
-                try self.alignSegment(self.currentSegment, 2);
-                labelLoc = self.getOffset();
+            for (words) |x| {
+                const le = std.mem.nativeToLittle(u32, x);
+                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&le));
+            }
+        },
 
-                for (shorts) |x| {
-                    const le = std.mem.nativeToLittle(u16, x);
-                    try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&le));
-                }
-            },
+        .asciiz => |str| {
+            try self.currentSegment.appendSlice(self.allocator, str);
+            try self.currentSegment.append(self.allocator, 0);
+        },
 
-            .words => |words| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
+        .nascii => |str| {
+            try self.alignSegment(self.currentSegment, 4);
+            labelLoc = self.getOffset();
 
-                for (words) |x| {
-                    const le = std.mem.nativeToLittle(u32, x);
-                    try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&le));
-                }
-            },
+            const len = std.mem.nativeToLittle(u32, @intCast(str.len));
+            try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&len));
+            try self.currentSegment.appendSlice(self.allocator, str);
+        },
 
-            .asciiz => |str| {
-                try self.currentSegment.appendSlice(self.allocator, str);
-                try self.currentSegment.append(self.allocator, 0);
-            },
+        .padding => |padding| {
+            try self.alignSegment(self.currentSegment, padding.alignment);
+            labelLoc = self.getOffset();
 
-            .nascii => |str| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
+            try self.currentSegment.appendNTimes(self.allocator, 0, padding.size);
+        },
 
-                const len = std.mem.nativeToLittle(u32, @intCast(str.len));
-                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&len));
-                try self.currentSegment.appendSlice(self.allocator, str);
-            },
+        .ptr => |label| {
+            try self.alignSegment(self.currentSegment, 4);
+            labelLoc = self.getOffset();
 
-            .padding => |padding| {
-                try self.alignSegment(self.currentSegment, padding.alignment);
-                labelLoc = self.getOffset();
+            const savedName = try self.strings.allocator().dupe(u8, label);
+            try self.relocations.append(self.allocator, .{
+                .addr = labelLoc,
+                .name = savedName,
+                .section = self.currentSegmentName,
+                .kind = .word,
+                .bookmark = bookmark,
+            });
 
-                try self.currentSegment.appendNTimes(self.allocator, 0, padding.size);
-            },
+            try self.currentSegment.appendNTimes(self.allocator, 0x77, 4);
+        },
 
-            .ptr => |label| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
+        .lo16 => |label| {
+            try self.alignSegment(self.currentSegment, 2);
+            labelLoc = self.getOffset();
 
-                const savedName = try self.strings.allocator().dupe(u8, label);
-                try self.relocations.append(self.allocator, .{
-                    .addr = labelLoc,
-                    .name = savedName,
-                    .section = self.currentSegmentName,
-                    .kind = .word,
-                    .bookmark = bookmark,
-                });
+            const savedName = try self.strings.allocator().dupe(u8, label);
+            try self.relocations.append(self.allocator, .{
+                .addr = labelLoc,
+                .name = savedName,
+                .section = self.currentSegmentName,
+                .kind = .ptrlo,
+                .bookmark = bookmark,
+            });
 
-                try self.currentSegment.appendNTimes(self.allocator, 0x77, 4);
-            },
+            try self.currentSegment.appendNTimes(self.allocator, 0x47, 2);
+        },
 
-            .lo16 => |label| {
-                try self.alignSegment(self.currentSegment, 2);
-                labelLoc = self.getOffset();
+        .hi16 => |label| {
+            try self.alignSegment(self.currentSegment, 2);
+            labelLoc = self.getOffset();
 
-                const savedName = try self.strings.allocator().dupe(u8, label);
-                try self.relocations.append(self.allocator, .{
-                    .addr = labelLoc,
-                    .name = savedName,
-                    .section = self.currentSegmentName,
-                    .kind = .ptrlo,
-                    .bookmark = bookmark,
-                });
+            const savedName = try self.strings.allocator().dupe(u8, label);
+            try self.relocations.append(self.allocator, .{
+                .addr = labelLoc,
+                .name = savedName,
+                .section = self.currentSegmentName,
+                .kind = .ptrhi,
+                .bookmark = bookmark,
+            });
 
-                try self.currentSegment.appendNTimes(self.allocator, 0x47, 2);
-            },
+            try self.currentSegment.appendNTimes(self.allocator, 0x74, 2);
+        },
 
-            .hi16 => |label| {
-                try self.alignSegment(self.currentSegment, 2);
-                labelLoc = self.getOffset();
+        .rtype => |r| {
+            try self.alignSegment(self.currentSegment, 4);
+            labelLoc = self.getOffset();
 
-                const savedName = try self.strings.allocator().dupe(u8, label);
-                try self.relocations.append(self.allocator, .{
-                    .addr = labelLoc,
-                    .name = savedName,
-                    .section = self.currentSegmentName,
-                    .kind = .ptrhi,
-                    .bookmark = bookmark,
-                });
+            const imm = switch (r.aux) {
+                .static => |x| x,
+                .dynamic => |dyn| blk: {
+                    const savedName = try self.strings.allocator().dupe(u8, dyn.label);
+                    try self.relocations.append(self.allocator, .{
+                        .addr = labelLoc,
+                        .name = savedName,
+                        .offset = dyn.offset,
+                        .section = self.currentSegmentName,
+                        .kind = .aux,
+                        .bookmark = bookmark,
+                    });
 
-                try self.currentSegment.appendNTimes(self.allocator, 0x74, 2);
-            },
-
-            .rtype => |r| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
-
-                const imm = switch (r.aux) {
-                    .static => |x| x,
-                    .dynamic => |dyn| blk: {
-                        const savedName = try self.strings.allocator().dupe(u8, dyn.label);
-                        try self.relocations.append(self.allocator, .{
-                            .addr = labelLoc,
-                            .name = savedName,
-                            .offset = dyn.offset,
-                            .section = self.currentSegmentName,
-                            .kind = .aux,
-                            .bookmark = bookmark,
-                        });
-
-                        break :blk 0;
-                    },
-                    .pointer => return AssemblyError.InvalidRelocation,
-                };
-
-                const mangled: u32
-                    = (@as(u32, isa.RType.getRInfo(r.funct).funct))
-                    | (@as(u32, imm) <<  7)
-                    | (@as(u32, @intFromEnum(r.rd)) << 12)
-                    | (@as(u32, @intFromEnum(r.rt)) << 17)
-                    | (@as(u32, @intFromEnum(r.rs)) << 22);
-
-                const view = std.mem.nativeToLittle(u32, mangled);
-                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
-            },
-
-            .itype => |i| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
-
-                const info = isa.IType.getInfo(i.opcode);
-                const imm = switch (i.imm) {
-                    .static => |x| x,
-                    .dynamic => |dyn| blk: {
-                        const savedName = try self.strings.allocator().dupe(u8, dyn.label);
-                        try self.relocations.append(self.allocator, .{
-                            .addr = labelLoc,
-                            .name = savedName,
-                            .offset = dyn.offset,
-                            .section = self.currentSegmentName,
-                            .kind = info.reltype.?,
-                            .bookmark = bookmark,
-                        });
-
-                        break :blk 0;
-                    },
-
-                    .pointer => |x| blk: {
-                        const savedName = try self.strings.allocator().dupe(u8, x.label);
-                        try self.relocations.append(self.allocator, .{
-                            .addr = labelLoc,
-                            .name = savedName,
-                            .offset = 0,
-                            .section = self.currentSegmentName,
-                            .kind = if (x.high) .ptrhi else .ptrlo,
-                            .bookmark = bookmark,
-                        });
-
-                        break :blk 0;
-                    },
-                };
-
-                const lr: u32 = switch (i.linkRegister) {
-                    .lr0 => 0,
-                    .lr1 => 1,
-                    .lr2 => 2,
-                    .lr3 => 3,
-                    else => 0,
-                };
-
-                const rt: u32 = switch (i.opcode) {
-                    .jr    => 0,
-                    .jalr  => 1 << 20,
-                    .jalrx => (1 << 21) | (lr << 19),
-                    else   => @as(u32, @intFromEnum(i.rt)) << 17,
-                };
-
-                const high: u32 = switch (i.opcode) {
-                    .lci, .anh, .orh, .xorh => 1 << 16,
-                    else => 0,
-                };
-
-                const mangled: u32
-                    = (@as(u32, info.opcode) << 27)
-                    | (@as(u32, @intFromEnum(i.rs)) << 22)
-                    | rt
-                    | high
-                    | @as(u32, @intCast(imm));
-
-                const view = std.mem.nativeToLittle(u32, mangled);
-                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
-            },
-
-            .jtype => |j| {
-                try self.alignSegment(self.currentSegment, 4);
-                labelLoc = self.getOffset();
-
-                const info = isa.JType.getInfo(j.opcode);
-                const imm = switch (j.imm) {
-                    .static => |x| try validateImmediate(info.immtype.?, x),
-                    .dynamic => |dyn| blk: {
-                        const savedName = try self.strings.allocator().dupe(u8, dyn.label);
-                        try self.relocations.append(self.allocator, .{
-                            .addr = labelLoc,
-                            .name = savedName,
-                            .offset = dyn.offset,
-                            .section = self.currentSegmentName,
-                            .kind = info.reltype.?,
-                            .bookmark = bookmark,
-                        });
-
-                        break :blk 0;
-                    },
-
-                    .pointer => |x| blk: {
-                        const savedName = try self.strings.allocator().dupe(u8, x.label);
-                        try self.relocations.append(self.allocator, .{
-                            .addr = labelLoc,
-                            .name = savedName,
-                            .offset = 0,
-                            .section = self.currentSegmentName,
-                            .kind = if (x.high) .ptrhi else .ptrlo,
-                            .bookmark = bookmark,
-                        });
-
-                        break :blk 0;
-                    },
-                };
-
-                const so: u32 = switch (j.opcode) {
-                    .j    => 0b00,
-                    .jal  => 0b01,
-                    .jalx => 0b10,
-                };
-
-                const lr: u32 = switch (j.linkRegister) {
-                    .lr0 => 0,
-                    .lr1 => 1,
-                    .lr2 => 2,
-                    .lr3 => 3,
-                    else => 0,
-                };
-
-                const mangled: u32
-                    = (@as(u32, info.opcode) << 27)
-                    | (so << 25)
-                    | (lr << 24)
-                    | @as(u32, @intCast(imm));
-
-                const view = std.mem.nativeToLittle(u32, mangled);
-                try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
-            },
-        }
-
-        if (stmt.label.len != 0) {
-            try self.defineLabel(stmt.label, labelLoc);
-        }
-    }
-
-    fn getOrPutSegment(self: *Assembly, name: []const u8) AssemblyError!*Segment {
-        const gpr = try self.segments.getOrPut(name);
-        if (gpr.found_existing) {
-            return gpr.value_ptr;
-        } else {
-            gpr.key_ptr.* = try self.strings.allocator().dupe(u8, name);
-            gpr.value_ptr.* = .empty;
-            return gpr.value_ptr;
-        }
-    }
-
-    fn getOffset(self: *Assembly) usize {
-        return self.currentSegment.items.len;
-    }
-
-    fn alignSegment(self: *Assembly, segment: *Segment, alignment: usize) !void {
-        if (alignment == 0) {
-            return AssemblyError.InvalidAlignment;
-        }
-
-        const remainder = segment.items.len % alignment;
-        if (remainder != 0) {
-            try segment.appendNTimes(self.allocator, 0, alignment - remainder);
-        }
-    }
-
-    fn defineLabel(self: *Assembly, name: []const u8, offset: usize) AssemblyError!void {
-        if (name.len == 0) {
-            return AssemblyError.InvalidLabel;
-        }
-
-        const gpr = try self.symbols.getOrPut(name);
-        if (gpr.found_existing) {
-            return AssemblyError.SymbolRedefined;
-        } else {
-            gpr.key_ptr.* = try self.strings.allocator().dupe(u8, name);
-            gpr.value_ptr.* = .{
-                .offset = offset,
-                .segment = self.currentSegmentName,
+                    break :blk 0;
+                },
+                .pointer => return Error.InvalidRelocation,
             };
-        }
+
+            const mangled: u32
+                = (@as(u32, isa.RType.getRInfo(r.funct).funct))
+                | (@as(u32, imm) <<  7)
+                | (@as(u32, @intFromEnum(r.rd)) << 12)
+                | (@as(u32, @intFromEnum(r.rt)) << 17)
+                | (@as(u32, @intFromEnum(r.rs)) << 22);
+
+            const view = std.mem.nativeToLittle(u32, mangled);
+            try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+        },
+
+        .itype => |i| {
+            try self.alignSegment(self.currentSegment, 4);
+            labelLoc = self.getOffset();
+
+            const info = isa.IType.getInfo(i.opcode);
+            const imm = switch (i.imm) {
+                .static => |x| x,
+                .dynamic => |dyn| blk: {
+                    const savedName = try self.strings.allocator().dupe(u8, dyn.label);
+                    try self.relocations.append(self.allocator, .{
+                        .addr = labelLoc,
+                        .name = savedName,
+                        .offset = dyn.offset,
+                        .section = self.currentSegmentName,
+                        .kind = info.reltype.?,
+                        .bookmark = bookmark,
+                    });
+
+                    break :blk 0;
+                },
+
+                .pointer => |x| blk: {
+                    const savedName = try self.strings.allocator().dupe(u8, x.label);
+                    try self.relocations.append(self.allocator, .{
+                        .addr = labelLoc,
+                        .name = savedName,
+                        .offset = 0,
+                        .section = self.currentSegmentName,
+                        .kind = if (x.high) .ptrhi else .ptrlo,
+                        .bookmark = bookmark,
+                    });
+
+                    break :blk 0;
+                },
+            };
+
+            const lr: u32 = switch (i.linkRegister) {
+                .lr0 => 0,
+                .lr1 => 1,
+                .lr2 => 2,
+                .lr3 => 3,
+                else => 0,
+            };
+
+            const rt: u32 = switch (i.opcode) {
+                .jr    => 0,
+                .jalr  => 1 << 20,
+                .jalrx => (1 << 21) | (lr << 19),
+                else   => @as(u32, @intFromEnum(i.rt)) << 17,
+            };
+
+            const high: u32 = switch (i.opcode) {
+                .lci, .anh, .orh, .xorh => 1 << 16,
+                else => 0,
+            };
+
+            const mangled: u32
+                = (@as(u32, info.opcode) << 27)
+                | (@as(u32, @intFromEnum(i.rs)) << 22)
+                | rt
+                | high
+                | @as(u32, @intCast(imm));
+
+            const view = std.mem.nativeToLittle(u32, mangled);
+            try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+        },
+
+        .jtype => |j| {
+            try self.alignSegment(self.currentSegment, 4);
+            labelLoc = self.getOffset();
+
+            const info = isa.JType.getInfo(j.opcode);
+            const imm = switch (j.imm) {
+                .static => |x| try validateImmediate(info.immtype.?, x),
+                .dynamic => |dyn| blk: {
+                    const savedName = try self.strings.allocator().dupe(u8, dyn.label);
+                    try self.relocations.append(self.allocator, .{
+                        .addr = labelLoc,
+                        .name = savedName,
+                        .offset = dyn.offset,
+                        .section = self.currentSegmentName,
+                        .kind = info.reltype.?,
+                        .bookmark = bookmark,
+                    });
+
+                    break :blk 0;
+                },
+
+                .pointer => |x| blk: {
+                    const savedName = try self.strings.allocator().dupe(u8, x.label);
+                    try self.relocations.append(self.allocator, .{
+                        .addr = labelLoc,
+                        .name = savedName,
+                        .offset = 0,
+                        .section = self.currentSegmentName,
+                        .kind = if (x.high) .ptrhi else .ptrlo,
+                        .bookmark = bookmark,
+                    });
+
+                    break :blk 0;
+                },
+            };
+
+            const so: u32 = switch (j.opcode) {
+                .j    => 0b00,
+                .jal  => 0b01,
+                .jalx => 0b10,
+            };
+
+            const lr: u32 = switch (j.linkRegister) {
+                .lr0 => 0,
+                .lr1 => 1,
+                .lr2 => 2,
+                .lr3 => 3,
+                else => 0,
+            };
+
+            const mangled: u32
+                = (@as(u32, info.opcode) << 27)
+                | (so << 25)
+                | (lr << 24)
+                | @as(u32, @intCast(imm));
+
+            const view = std.mem.nativeToLittle(u32, mangled);
+            try self.currentSegment.appendSlice(self.allocator, std.mem.asBytes(&view));
+        },
     }
 
-    fn validateImmediate(target: isa.ImmediateKind, immediate: u25) AssemblyError!u25 {
-        return switch (target) {
-            .elimm => std.math.cast(u25, immediate) orelse return AssemblyError.NumericOverflow,
-            .vlimm => std.math.cast(u24, immediate) orelse return AssemblyError.NumericOverflow,
-            .llimm => std.math.cast(u20, immediate) orelse return AssemblyError.NumericOverflow,
-            .limm  => std.math.cast(u19, immediate) orelse return AssemblyError.NumericOverflow,
-            .imm   => std.math.cast(u17, immediate) orelse return AssemblyError.NumericOverflow,
-            .simm  => std.math.cast(u16, immediate) orelse return AssemblyError.NumericOverflow,
-            .aux   => std.math.cast(u2,  immediate) orelse return AssemblyError.NumericOverflow,
+    if (stmt.label.len != 0) {
+        try self.defineLabel(stmt.label, labelLoc);
+    }
+}
+
+fn getOrPutSegment(self: *Assembly, name: []const u8) Error!*Segment {
+    const gpr = try self.segments.getOrPut(name);
+    if (gpr.found_existing) {
+        return gpr.value_ptr;
+    } else {
+        gpr.key_ptr.* = try self.strings.allocator().dupe(u8, name);
+        gpr.value_ptr.* = .empty;
+        return gpr.value_ptr;
+    }
+}
+
+fn getOffset(self: *Assembly) usize {
+    return self.currentSegment.items.len;
+}
+
+fn alignSegment(self: *Assembly, segment: *Segment, alignment: usize) !void {
+    if (alignment == 0) {
+        return Error.InvalidAlignment;
+    }
+
+    const remainder = segment.items.len % alignment;
+    if (remainder != 0) {
+        try segment.appendNTimes(self.allocator, 0, alignment - remainder);
+    }
+}
+
+fn defineLabel(self: *Assembly, name: []const u8, offset: usize) Error!void {
+    if (name.len == 0) {
+        return Error.InvalidLabel;
+    }
+
+    const gpr = try self.symbols.getOrPut(name);
+    if (gpr.found_existing) {
+        return Error.SymbolRedefined;
+    } else {
+        gpr.key_ptr.* = try self.strings.allocator().dupe(u8, name);
+        gpr.value_ptr.* = .{
+            .offset = offset,
+            .segment = self.currentSegmentName,
+        };
+    }
+}
+
+fn validateImmediate(target: isa.ImmediateKind, immediate: u25) Error!u25 {
+    return switch (target) {
+        .elimm => std.math.cast(u25, immediate) orelse return Error.NumericOverflow,
+        .vlimm => std.math.cast(u24, immediate) orelse return Error.NumericOverflow,
+        .llimm => std.math.cast(u20, immediate) orelse return Error.NumericOverflow,
+        .limm  => std.math.cast(u19, immediate) orelse return Error.NumericOverflow,
+        .imm   => std.math.cast(u17, immediate) orelse return Error.NumericOverflow,
+        .simm  => std.math.cast(u16, immediate) orelse return Error.NumericOverflow,
+        .aux   => std.math.cast(u2,  immediate) orelse return Error.NumericOverflow,
+    };
+}
+
+pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name: []const u8) !void {
+    var parser = try Parser.init(io, self.allocator);
+    defer parser.deinit();
+
+    try parser.lexer.pushFrame(frame, name);
+    const capacity = frame.len / 4;
+
+    self.sources = parser.lexer;
+
+    if (self.segments.getPtr("data")) |data| {
+        try data.ensureTotalCapacity(self.allocator, capacity);
+    }
+
+    if (self.segments.getPtr("text")) |text| {
+        try text.ensureTotalCapacity(self.allocator, capacity);
+    }
+
+    while (parser.lexer.frameHead != null) {
+        try parser.skipToStatementStart();
+        const mark = try parser.lexer.bookmark();
+
+        const statement = parser.parseStatement() catch |err| {
+            if (err == Parser.Error.UnexpectedEOF) break;
+            if (parser.lexer.frameHead == null) break;
+
+            try parser.lexer.showErrorHere(self.diagnostics, err);
+            try parser.skipToStatementEnd();
+            continue;
+        };
+
+        const cursor = try parser.lexer.bookmark();
+        self.encodeStatement(statement, mark) catch |err| {
+            parser.lexer.restore(mark);
+            try parser.lexer.showErrorHere(self.diagnostics, err);
+            parser.lexer.restore(cursor);
+            return err;
         };
     }
 
-    pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name: []const u8) !void {
-        var parser = try Parser.init(io, self.allocator);
-        defer parser.deinit();
+    try self.diagnostics.flush();
+}
 
-        try parser.lexer.pushFrame(frame, name);
-        const capacity = frame.len / 4;
+pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
+    var parser = try Parser.init(io, self.allocator);
+    defer parser.deinit();
 
-        self.sources = parser.lexer;
+    self.sources = parser.lexer;
+
+    try parser.lexer.openFile(filepath);
+    if (parser.lexer.frameHead) |head| {
+        const capacity = head.input.len / 4;
 
         if (self.segments.getPtr("data")) |data| {
             try data.ensureTotalCapacity(self.allocator, capacity);
@@ -430,389 +471,345 @@ pub const Assembly = struct {
         if (self.segments.getPtr("text")) |text| {
             try text.ensureTotalCapacity(self.allocator, capacity);
         }
-
-        while (parser.lexer.frameHead != null) {
-            try parser.skipToStatementStart();
-            const mark = try parser.lexer.bookmark();
-
-            const statement = parser.parseStatement() catch |err| {
-                if (err == parsing.ParseError.UnexpectedEOF) break;
-                if (parser.lexer.frameHead == null) break;
-
-                try parser.lexer.showErrorHere(self.diagnostics, err);
-                try parser.skipToStatementEnd();
-                continue;
-            };
-
-            const cursor = try parser.lexer.bookmark();
-            self.encodeStatement(statement, mark) catch |err| {
-                parser.lexer.restore(mark);
-                try parser.lexer.showErrorHere(self.diagnostics, err);
-                parser.lexer.restore(cursor);
-                return err;
-            };
-        }
-
-        try self.diagnostics.flush();
     }
 
-    pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
-        var parser = try Parser.init(io, self.allocator);
-        defer parser.deinit();
+    var firstErr: ?Error = null;
+    while (parser.lexer.frameHead != null) {
+        try parser.skipToStatementStart();
+        const mark = try parser.lexer.bookmark();
 
-        self.sources = parser.lexer;
+        const statement = parser.parseStatement() catch |err| {
+            if (err == Parser.Error.UnexpectedEOF) break;
+            if (parser.lexer.frameHead == null) break;
 
-        try parser.lexer.openFile(filepath);
-        if (parser.lexer.frameHead) |head| {
-            const capacity = head.input.len / 4;
-
-            if (self.segments.getPtr("data")) |data| {
-                try data.ensureTotalCapacity(self.allocator, capacity);
+            if (firstErr == null) {
+                firstErr = err;
             }
 
-            if (self.segments.getPtr("text")) |text| {
-                try text.ensureTotalCapacity(self.allocator, capacity);
-            }
-        }
-
-        var firstErr: ?AssemblyError = null;
-        while (parser.lexer.frameHead != null) {
-            try parser.skipToStatementStart();
-            const mark = try parser.lexer.bookmark();
-
-            const statement = parser.parseStatement() catch |err| {
-                if (err == parsing.ParseError.UnexpectedEOF) break;
-                if (parser.lexer.frameHead == null) break;
-
-                if (firstErr == null) {
-                    firstErr = err;
-                }
-
-                try parser.lexer.showErrorHere(self.diagnostics, err);
-                try parser.skipToStatementEnd();
-                continue;
-            };
-
-            const cursor = try parser.lexer.bookmark();
-            self.encodeStatement(statement, mark) catch |err| {
-                parser.lexer.restore(mark);
-                try parser.lexer.showErrorHere(self.diagnostics, err);
-                parser.lexer.restore(cursor);
-
-                if (firstErr == null) {
-                    firstErr = err;
-                }
-            };
-        }
-
-        try self.diagnostics.flush();
-
-        if (firstErr) |e| {
-            return e;
-        }
-    }
-
-    pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8 {
-        var strtab = try std.ArrayList(u8).initCapacity(self.strings.allocator(), 1);
-        defer strtab.deinit(self.strings.allocator());
-        try strtab.append(self.strings.allocator(), 0);
-
-        var symtab = try std.ArrayList(c.ElfSym).initCapacity(self.allocator, 1);
-        defer symtab.deinit(self.allocator);
-        try symtab.append(self.allocator, std.mem.zeroes(c.ElfSym));
-
-        var symbolIndices = std.StringHashMap(u32).init(self.allocator);
-        defer symbolIndices.deinit();
-
-        var sectionIndices = std.StringHashMap(u16).init(self.allocator);
-        defer sectionIndices.deinit();
-
-        var sections = try std.ArrayList(c.ElfRawSection).initCapacity(self.allocator, 8);
-        defer sections.deinit(self.allocator);
-
-        const SegmentEntry = struct {
-            name: []const u8,
-            seg: *std.ArrayList(u8),
+            try parser.lexer.showErrorHere(self.diagnostics, err);
+            try parser.skipToStatementEnd();
+            continue;
         };
 
-        var ordered = std.ArrayList(SegmentEntry).empty;
-        defer ordered.deinit(self.allocator);
+        const cursor = try parser.lexer.bookmark();
+        self.encodeStatement(statement, mark) catch |err| {
+            parser.lexer.restore(mark);
+            try parser.lexer.showErrorHere(self.diagnostics, err);
+            parser.lexer.restore(cursor);
 
-        var textIndex: usize = 0;
-        var segIndex: usize = 0;
-
-        var segit = self.segments.iterator();
-        while (segit.next()) |entry| : (segIndex += 1) {
-            if (std.mem.eql(u8, entry.key_ptr.*, ".text")) {
-                textIndex = segIndex;
+            if (firstErr == null) {
+                firstErr = err;
             }
+        };
+    }
 
-            try ordered.append(self.allocator, .{
-                .name = entry.key_ptr.*,
-                .seg = entry.value_ptr,
-            });
+    try self.diagnostics.flush();
+
+    if (firstErr) |e| {
+        return e;
+    }
+}
+
+pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8 {
+    var strtab = try std.ArrayList(u8).initCapacity(self.strings.allocator(), 1);
+    defer strtab.deinit(self.strings.allocator());
+    try strtab.append(self.strings.allocator(), 0);
+
+    var symtab = try std.ArrayList(c.ElfSym).initCapacity(self.allocator, 1);
+    defer symtab.deinit(self.allocator);
+    try symtab.append(self.allocator, std.mem.zeroes(c.ElfSym));
+
+    var symbolIndices = std.StringHashMap(u32).init(self.allocator);
+    defer symbolIndices.deinit();
+
+    var sectionIndices = std.StringHashMap(u16).init(self.allocator);
+    defer sectionIndices.deinit();
+
+    var sections = try std.ArrayList(c.ElfRawSection).initCapacity(self.allocator, 8);
+    defer sections.deinit(self.allocator);
+
+    const SegmentEntry = struct {
+        name: []const u8,
+        seg: *std.ArrayList(u8),
+    };
+
+    var ordered = std.ArrayList(SegmentEntry).empty;
+    defer ordered.deinit(self.allocator);
+
+    var textIndex: usize = 0;
+    var segIndex: usize = 0;
+
+    var segit = self.segments.iterator();
+    while (segit.next()) |entry| : (segIndex += 1) {
+        if (std.mem.eql(u8, entry.key_ptr.*, ".text")) {
+            textIndex = segIndex;
         }
 
-        if (textIndex != 0) {
-            std.mem.swap(SegmentEntry, &ordered.items[0], &ordered.items[textIndex]);
+        try ordered.append(self.allocator, .{
+            .name = entry.key_ptr.*,
+            .seg = entry.value_ptr,
+        });
+    }
+
+    if (textIndex != 0) {
+        std.mem.swap(SegmentEntry, &ordered.items[0], &ordered.items[textIndex]);
+    }
+
+    var nextSectionIndex: u16 = 1;
+    for (ordered.items) |segment| {
+        const name = try self.strings.allocator().dupeZ(u8, segment.name);
+        const seg = segment.seg;
+
+        if (std.mem.eql(u8, name, ".text")) {
+            textIndex = segIndex;
         }
 
-        var nextSectionIndex: u16 = 1;
-        for (ordered.items) |segment| {
-            const name = try self.strings.allocator().dupeZ(u8, segment.name);
-            const seg = segment.seg;
-
-            if (std.mem.eql(u8, name, ".text")) {
-                textIndex = segIndex;
-            }
-
-            try sectionIndices.put(segment.name, nextSectionIndex);
-            try sectionIndices.put(name, nextSectionIndex);
-            if (segment.name.len > 0 and segment.name[0] == '.') {
-                try sectionIndices.put(segment.name[1..], nextSectionIndex);
-            }
-            nextSectionIndex += 1;
-
-            const flags: c.ElfShFlags =
-                if (std.mem.eql(u8, name, ".text"))
-                    c.SHF_ALLOC | c.SHF_EXECINSTR
-                else if (std.mem.eql(u8, name, ".data"))
-                    c.SHF_ALLOC | c.SHF_WRITE
-                else if (std.mem.eql(u8, name, ".rodata"))
-                    c.SHF_ALLOC
-                else
-                    c.SHF_NONE;
-
-            try sections.append(self.allocator, .{
-                .name = name.ptr,
-                .data = seg.items.ptr,
-                .size = @intCast(seg.items.len),
-                .type = c.SHT_PROGBITS,
-                .flags = flags,
-                .addralign = 4,
-                .link = 0,
-                .info = 0,
-                .entsize = 0
-            });
+        try sectionIndices.put(segment.name, nextSectionIndex);
+        try sectionIndices.put(name, nextSectionIndex);
+        if (segment.name.len > 0 and segment.name[0] == '.') {
+            try sectionIndices.put(segment.name[1..], nextSectionIndex);
         }
-
-        var syms = self.symbols.iterator();
-        while (syms.next()) |entry| {
-            const name = entry.key_ptr.*;
-            const sym = entry.value_ptr.*;
-
-            const stringOff: u32 = @intCast(strtab.items.len);
-
-            try strtab.appendSlice(self.strings.allocator(), name);
-            try strtab.append(self.strings.allocator(), 0);
-
-            const index: u32 = @intCast(symtab.items.len);
-            try symbolIndices.put(name, index);
-
-            const isHeapBase = std.mem.eql(u8, name, "heap_base");
-            const shndx: u16 = if (isHeapBase) c.SHN_UNDEF else sectionIndices.get(sym.segment).?;
-            const bind: u8 = if (isHeapBase) c.STB_GLOBAL else c.STB_LOCAL;
-            const stInfo: u8 = @intCast(c.ELF32_ST_INFO(bind, c.STT_NOTYPE));
-            try symtab.append(self.allocator, .{
-                .st_name = stringOff,
-                .st_value = @intCast(sym.offset),
-                .st_size = 0,
-                .st_info = stInfo,
-                .st_other = 0,
-                .st_shndx = shndx,
-            });
-        }
-
-        var relsBySection = std.StringHashMap(std.ArrayList(c.ElfRel)).init(self.allocator);
-        defer {
-            var it = relsBySection.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit(self.allocator);
-            }
-
-            relsBySection.deinit();
-        }
-
-        var relasBySection = std.StringHashMap(std.ArrayList(c.ElfRela)).init(self.allocator);
-        defer {
-            var it = relasBySection.iterator();
-            while (it.next()) |entry| {
-                entry.value_ptr.deinit(self.allocator);
-            }
-
-            relasBySection.deinit();
-        }
-
-        var relocationError: ?AssemblyError = null;
-        for (self.relocations.items) |rel| {
-            const relType = switch (rel.kind) {
-                .ptrlo  => c.R_RTM32_PTRLO,
-                .ptrhi  => c.R_RTM32_PTRHI,
-                .word  => c.R_RTM32_WORD,
-                .elimm => c.R_RTM32_ELIMM,
-                .vlimm => c.R_RTM32_VLIMM,
-                .llimm => c.R_RTM32_LLIMM,
-                .limm  => c.R_RTM32_LIMM,
-                .imm   => c.R_RTM32_IMM,
-                .simm  => c.R_RTM32_SIMM,
-                .aux   => c.R_RTM32_AUX,
-            };
-
-            if (symbolIndices.get(rel.name)) |symbolIndex| {
-                if (rel.offset == 0) {
-                    const gpr = try relsBySection.getOrPut(rel.section);
-                    if (!gpr.found_existing) {
-                        gpr.value_ptr.* = std.ArrayList(c.ElfRel).empty;
-                    }
-
-                    try gpr.value_ptr.append(self.allocator, .{
-                        .r_offset = @intCast(rel.addr),
-                        .r_info = c.ELF32_R_INFO(
-                            symbolIndex,
-                            relType
-                        )
-                    });
-                } else {
-                    const gpr = try relasBySection.getOrPut(rel.section);
-                    if (!gpr.found_existing) {
-                        gpr.value_ptr.* = std.ArrayList(c.ElfRela).empty;
-                    }
-
-                    try gpr.value_ptr.append(self.allocator, .{
-                        .r_offset = @intCast(rel.addr),
-                        .r_info = c.ELF32_R_INFO(
-                            symbolIndex,
-                            relType
-                        ),
-                        .r_addend = rel.offset,
-                    });
-                }
-            } else if (self.sources) |*sources| {
-                try self.diagnostics.writeAll("when patching symbol ");
-                try self.diagnostics.writeAll(rel.name);
-                try self.diagnostics.writeAll(":\n");
-                sources.restore(rel.bookmark);
-
-                if (sources.frameHead) |head| {
-                    head.pos = @max(0, head.pos - 1);
-                }
-
-                try sources.showErrorHere(self.diagnostics, AssemblyError.UnresolvedSymbol);
-                relocationError = relocationError orelse AssemblyError.UnresolvedSymbol;
-
-                try self.diagnostics.flush();
-            } else {
-                try self.diagnostics.writeAll("obtuse error patching symbol ");
-                try self.diagnostics.writeAll(rel.name);
-                try self.diagnostics.writeAll(": ");
-                try self.diagnostics.writeAll(@errorName(AssemblyError.UnresolvedSymbol));
-                relocationError = relocationError orelse AssemblyError.UnresolvedSymbol;
-
-                try self.diagnostics.flush();
-            }
-        }
-
-        if (relocationError) |err| {
-            return err;
-        }
-
-        const strtabIndex: u16 = nextSectionIndex;
         nextSectionIndex += 1;
 
+        const flags: c.ElfShFlags =
+            if (std.mem.eql(u8, name, ".text"))
+                c.SHF_ALLOC | c.SHF_EXECINSTR
+            else if (std.mem.eql(u8, name, ".data"))
+                c.SHF_ALLOC | c.SHF_WRITE
+            else if (std.mem.eql(u8, name, ".rodata"))
+                c.SHF_ALLOC
+            else
+                c.SHF_NONE;
+
         try sections.append(self.allocator, .{
-            .name = ".strtab",
-            .data = strtab.items.ptr,
-            .size = @intCast(strtab.items.len),
-            .type = c.SHT_STRTAB,
-            .flags = c.SHF_NONE,
-            .addralign = 1,
+            .name = name.ptr,
+            .data = seg.items.ptr,
+            .size = @intCast(seg.items.len),
+            .type = c.SHT_PROGBITS,
+            .flags = flags,
+            .addralign = 4,
             .link = 0,
             .info = 0,
             .entsize = 0
         });
+    }
 
-        const symtabIndex: u16 = nextSectionIndex;
-        nextSectionIndex += 1;
+    var syms = self.symbols.iterator();
+    while (syms.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const sym = entry.value_ptr.*;
 
+        const stringOff: u32 = @intCast(strtab.items.len);
+
+        try strtab.appendSlice(self.strings.allocator(), name);
+        try strtab.append(self.strings.allocator(), 0);
+
+        const index: u32 = @intCast(symtab.items.len);
+        try symbolIndices.put(name, index);
+
+        const isHeapBase = std.mem.eql(u8, name, "heap_base");
+        const shndx: u16 = if (isHeapBase) c.SHN_UNDEF else sectionIndices.get(sym.segment).?;
+        const bind: u8 = if (isHeapBase) c.STB_GLOBAL else c.STB_LOCAL;
+        const stInfo: u8 = @intCast(c.ELF32_ST_INFO(bind, c.STT_NOTYPE));
+        try symtab.append(self.allocator, .{
+            .st_name = stringOff,
+            .st_value = @intCast(sym.offset),
+            .st_size = 0,
+            .st_info = stInfo,
+            .st_other = 0,
+            .st_shndx = shndx,
+        });
+    }
+
+    var relsBySection = std.StringHashMap(std.ArrayList(c.ElfRel)).init(self.allocator);
+    defer {
+        var it = relsBySection.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+
+        relsBySection.deinit();
+    }
+
+    var relasBySection = std.StringHashMap(std.ArrayList(c.ElfRela)).init(self.allocator);
+    defer {
+        var it = relasBySection.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+
+        relasBySection.deinit();
+    }
+
+    var relocationError: ?Error = null;
+    for (self.relocations.items) |rel| {
+        const relType = switch (rel.kind) {
+            .ptrlo  => c.R_RTM32_PTRLO,
+            .ptrhi  => c.R_RTM32_PTRHI,
+            .word  => c.R_RTM32_WORD,
+            .elimm => c.R_RTM32_ELIMM,
+            .vlimm => c.R_RTM32_VLIMM,
+            .llimm => c.R_RTM32_LLIMM,
+            .limm  => c.R_RTM32_LIMM,
+            .imm   => c.R_RTM32_IMM,
+            .simm  => c.R_RTM32_SIMM,
+            .aux   => c.R_RTM32_AUX,
+        };
+
+        if (symbolIndices.get(rel.name)) |symbolIndex| {
+            if (rel.offset == 0) {
+                const gpr = try relsBySection.getOrPut(rel.section);
+                if (!gpr.found_existing) {
+                    gpr.value_ptr.* = std.ArrayList(c.ElfRel).empty;
+                }
+
+                try gpr.value_ptr.append(self.allocator, .{
+                    .r_offset = @intCast(rel.addr),
+                    .r_info = c.ELF32_R_INFO(
+                        symbolIndex,
+                        relType
+                    )
+                });
+            } else {
+                const gpr = try relasBySection.getOrPut(rel.section);
+                if (!gpr.found_existing) {
+                    gpr.value_ptr.* = std.ArrayList(c.ElfRela).empty;
+                }
+
+                try gpr.value_ptr.append(self.allocator, .{
+                    .r_offset = @intCast(rel.addr),
+                    .r_info = c.ELF32_R_INFO(
+                        symbolIndex,
+                        relType
+                    ),
+                    .r_addend = rel.offset,
+                });
+            }
+        } else if (self.sources) |*sources| {
+            try self.diagnostics.writeAll("when patching symbol ");
+            try self.diagnostics.writeAll(rel.name);
+            try self.diagnostics.writeAll(":\n");
+            sources.restore(rel.bookmark);
+
+            if (sources.frameHead) |head| {
+                head.pos = @max(0, head.pos - 1);
+            }
+
+            try sources.showErrorHere(self.diagnostics, Error.UnresolvedSymbol);
+            relocationError = relocationError orelse Error.UnresolvedSymbol;
+
+            try self.diagnostics.flush();
+        } else {
+            try self.diagnostics.writeAll("obtuse error patching symbol ");
+            try self.diagnostics.writeAll(rel.name);
+            try self.diagnostics.writeAll(": ");
+            try self.diagnostics.writeAll(@errorName(Error.UnresolvedSymbol));
+            relocationError = relocationError orelse Error.UnresolvedSymbol;
+
+            try self.diagnostics.flush();
+        }
+    }
+
+    if (relocationError) |err| {
+        return err;
+    }
+
+    const strtabIndex: u16 = nextSectionIndex;
+    nextSectionIndex += 1;
+
+    try sections.append(self.allocator, .{
+        .name = ".strtab",
+        .data = strtab.items.ptr,
+        .size = @intCast(strtab.items.len),
+        .type = c.SHT_STRTAB,
+        .flags = c.SHF_NONE,
+        .addralign = 1,
+        .link = 0,
+        .info = 0,
+        .entsize = 0
+    });
+
+    const symtabIndex: u16 = nextSectionIndex;
+    nextSectionIndex += 1;
+
+    try sections.append(self.allocator, .{
+        .name = ".symtab",
+        .data = @ptrCast(symtab.items.ptr),
+        .size = @intCast(symtab.items.len * @sizeOf(c.ElfSym)),
+        .type = c.SHT_SYMTAB,
+        .flags = c.SHF_NONE,
+        .addralign = 4,
+        .link = strtabIndex,
+        .info = 0,
+        .entsize = @sizeOf(c.ElfSym)
+    });
+
+    var relit = relsBySection.iterator();
+    while (relit.next()) |entry| {
+        const secname = entry.key_ptr.*;
+        const rels = entry.value_ptr.*;
+
+        const relname = try std.fmt.allocPrintSentinel(self.strings.allocator(), ".rel{s}", .{secname}, 0);
         try sections.append(self.allocator, .{
-            .name = ".symtab",
-            .data = @ptrCast(symtab.items.ptr),
-            .size = @intCast(symtab.items.len * @sizeOf(c.ElfSym)),
-            .type = c.SHT_SYMTAB,
+            .name = relname.ptr,
+            .data = @ptrCast(rels.items.ptr),
+            .size = @intCast(rels.items.len * @sizeOf(c.ElfRel)),
+            .type = c.SHT_REL,
             .flags = c.SHF_NONE,
             .addralign = 4,
-            .link = strtabIndex,
-            .info = 0,
-            .entsize = @sizeOf(c.ElfSym)
+            .link = symtabIndex,
+            .info = sectionIndices.get(secname).?,
+            .entsize = @sizeOf(c.ElfRel)
         });
-
-        var relit = relsBySection.iterator();
-        while (relit.next()) |entry| {
-            const secname = entry.key_ptr.*;
-            const rels = entry.value_ptr.*;
-
-            const relname = try std.fmt.allocPrintSentinel(self.strings.allocator(), ".rel{s}", .{secname}, 0);
-            try sections.append(self.allocator, .{
-                .name = relname.ptr,
-                .data = @ptrCast(rels.items.ptr),
-                .size = @intCast(rels.items.len * @sizeOf(c.ElfRel)),
-                .type = c.SHT_REL,
-                .flags = c.SHF_NONE,
-                .addralign = 4,
-                .link = symtabIndex,
-                .info = sectionIndices.get(secname).?,
-                .entsize = @sizeOf(c.ElfRel)
-            });
-        }
-
-        var relait = relasBySection.iterator();
-        while (relait.next()) |entry| {
-            const secname = entry.key_ptr.*;
-            const relas = entry.value_ptr.*;
-
-            const relaname = try std.fmt.allocPrintSentinel(self.strings.allocator(), ".rela{s}", .{secname}, 0);
-            try sections.append(self.allocator, .{
-                .name = relaname.ptr,
-                .data = @ptrCast(relas.items.ptr),
-                .size = @intCast(relas.items.len * @sizeOf(c.ElfRela)),
-                .type = c.SHT_RELA,
-                .flags = c.SHF_NONE,
-                .addralign = 4,
-                .link = symtabIndex,
-                .info = sectionIndices.get(secname).?,
-                .entsize = @sizeOf(c.ElfRela)
-            });
-        }
-
-        const size = c.elf_writer_calculate_size(sections.items.ptr, sections.items.len);
-        const blob = try self.allocator.alloc(u8, size);
-        errdefer self.allocator.free(blob);
-
-        const status = c.elf_writer_serialize(
-            blob.ptr,
-            blob.len,
-            elfType,
-            entryPoint,
-            sections.items.ptr,
-            sections.items.len,
-        );
-
-        if (status != c.ELF_SUCCESS) {
-            return AssemblyError.SerializationFailed;
-        } else {
-            return blob;
-        }
     }
 
-    pub fn writeElf(self: *Assembly, io: std.Io, filepath: []const u8, elfType: c.ElfType, entryPoint: u32) !void {
-        const blob = try self.createElfBlob(elfType, entryPoint);
-        defer self.allocator.free(blob);
+    var relait = relasBySection.iterator();
+    while (relait.next()) |entry| {
+        const secname = entry.key_ptr.*;
+        const relas = entry.value_ptr.*;
 
-        const file = try std.Io.Dir.cwd().createFile(io, filepath, .{});
-        defer file.close(io);
-        try file.writeStreamingAll(io, blob);
+        const relaname = try std.fmt.allocPrintSentinel(self.strings.allocator(), ".rela{s}", .{secname}, 0);
+        try sections.append(self.allocator, .{
+            .name = relaname.ptr,
+            .data = @ptrCast(relas.items.ptr),
+            .size = @intCast(relas.items.len * @sizeOf(c.ElfRela)),
+            .type = c.SHT_RELA,
+            .flags = c.SHF_NONE,
+            .addralign = 4,
+            .link = symtabIndex,
+            .info = sectionIndices.get(secname).?,
+            .entsize = @sizeOf(c.ElfRela)
+        });
     }
-};
+
+    const size = c.elf_writer_calculate_size(sections.items.ptr, sections.items.len);
+    const blob = try self.allocator.alloc(u8, size);
+    errdefer self.allocator.free(blob);
+
+    const status = c.elf_writer_serialize(
+        blob.ptr,
+        blob.len,
+        elfType,
+        entryPoint,
+        sections.items.ptr,
+        sections.items.len,
+    );
+
+    if (status != c.ELF_SUCCESS) {
+        return Error.SerializationFailed;
+    } else {
+        return blob;
+    }
+}
+
+pub fn writeElf(self: *Assembly, io: std.Io, filepath: []const u8, elfType: c.ElfType, entryPoint: u32) !void {
+    const blob = try self.createElfBlob(elfType, entryPoint);
+    defer self.allocator.free(blob);
+
+    const file = try std.Io.Dir.cwd().createFile(io, filepath, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, blob);
+}
 
 test "assembly initializes default segments" {
     var yell: [64]u8 = undefined;
@@ -1002,7 +999,7 @@ test "error: label not allowed on section directive" {
         \\bad_label: .section ".text"
     , "<test>");
     try stderr.writer.flush();
-    try std.testing.expectError(AssemblyError.LabelNotAllowedHere, err);
+    try std.testing.expectError(Error.LabelNotAllowedHere, err);
 }
 
 test "error: symbol redefined in same or different section" {
@@ -1018,7 +1015,7 @@ test "error: symbol redefined in same or different section" {
         \\my_label: addi $t0, $t0, 1
     , "<test>");
     try stderr.writer.flush();
-    try std.testing.expectError(AssemblyError.SymbolRedefined, err);
+    try std.testing.expectError(Error.SymbolRedefined, err);
 }
 
 test "error: unresolved symbol during ELF blob creation" {
@@ -1036,7 +1033,7 @@ test "error: unresolved symbol during ELF blob creation" {
     try stderr.writer.flush();
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
     const err = as.createElfBlob(c.ET_REL, 0);
-    try std.testing.expectError(AssemblyError.UnresolvedSymbol, err);
+    try std.testing.expectError(Error.UnresolvedSymbol, err);
 }
 
 test "immediate data directives" {
@@ -1401,7 +1398,7 @@ test "invalid alignment in pad directive" {
         \\.pad 4 4 (0)
     , "<test>");
     try stderr.writer.flush();
-    try std.testing.expectError(AssemblyError.InvalidAlignment, err);
+    try std.testing.expectError(Error.InvalidAlignment, err);
 }
 
 test "dynamic relocation in rtype aux" {
