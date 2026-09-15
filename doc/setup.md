@@ -25,7 +25,7 @@ Con esto, ya podés usar el assembler.  Podés verificarlo con el siguiente coma
 
 ```
 $ ./rtm32.asm --version
-./rtm32.asm version 1.2.0
+./rtm32.asm version 1.2.1
 ```
 
 ## Recomendado:  Instalarlo en `PATH`.
@@ -66,7 +66,7 @@ Para verificar que sea accesible globalmente, ahora deberías poder correr:
 
 ```
 $ rtm32.asm --version
-rtm32.asm version 1.2.0
+rtm32.asm version 1.2.1
 ```
 
 # Uso de `rtm32.asm`

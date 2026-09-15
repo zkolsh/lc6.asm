@@ -174,6 +174,7 @@ En las siguientes tablas se describen los formatos de cada instrucción.
 El *preprocesador* de `rtm32.asm` es un procesador de macros utilizado automáticamente por el ensamblador para transformar tu código fuente antes de ensamblarlo.  Se llama "preprocesador de macros" porque te permite definir *macros*, que son abreviaciones breves para construcciones más grandes.  Ninguna palabra del preprocesador es una instrucción de código, y El preprocesador de `rtm32.asm` funciona en base a directivas de preprocesador y expansiones de macros.
 
 Todas las directivas de preprocesador comienzan con un `%`.  Se reconocen las siguientes directivas de preprocesador:
+
 * `%filename` inserta una string conteniendo el nombre del archivo donde se encontró esta directiva.
 * `%line` inserta una string conteniendo el número de línea dentro del archivo donde se encontró esta directiva.
 * `%ifdef <nombre>` e `%ifndef <nombre>` deben estar finalizadas por un `%endif` cada una, y pueden contener un `%else` dentro de ellas.  Condicionalmente, dependiendo de si está definido un macro llamado `<nombre>`, dejarán el cuerpo correspondiente y eliminarán el otro.
@@ -183,8 +184,13 @@ Todas las directivas de preprocesador comienzan con un `%`.  Se reconocen las si
 * `%macro <nombre>(<argumentos...>)` comienza a crear un nuevo macro llamado `<nombre>`.  `<argumentos...>` es una lista separada por comas de nombres de macros temporales que podrás usar como argumentos, y se puede dejar vacío para tener un macro de aridad 0.  Todo lo que escribas luego de esta línea hasta `%endmacro` (no inclusive) formará parte del cuerpo del macro.
 
 Además, se proveen dos macros propios del assembler, que no podés redefinir:
+
 * `@sizeOf(<data type>)` toma una directiva de datos y devuelve un número con su tamaño en bytes.
 * `@alignOf(<data type>)` toma una directiva de datos y devuelve un número con su alineación en bytes.
 * `@stringify(...)` toma tokens en crudo y devuelve una string que las representa.
 
-Para consultar cómo termina el archivo únicamente tras haber ejecutado el preprocesador, ejecutá `rtm32.asm -E <entrada.rtm> <entrada preprocesada.rtm>`
+Para consultar cómo termina el archivo únicamente tras haber ejecutado el preprocesador, ejecutá el siguiente comando:
+
+```
+rtm32.asm -E <entrada.rtm> -o <entrada preprocesada.rtm>
+```
