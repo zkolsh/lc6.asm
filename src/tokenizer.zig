@@ -1169,7 +1169,7 @@ fn ppBuiltinExpansion(self: *Tokenizer, head: *Frame, builtin: isa.PreprocessorB
 
             var depth: usize = 1;
             var lastError = try self.bookmark();
-            while (self.frameHead != null and self.frameHead.?.pos < self.frameHead.?.input.len) expand: {
+            expand: while (self.frameHead != null) {
                 const token: Token = self.next() catch |err| switch (err) {
                     Error.UnexpectedEOF => break :expand,
                     else => {
@@ -1232,7 +1232,7 @@ fn ppBuiltinExpansion(self: *Tokenizer, head: *Frame, builtin: isa.PreprocessorB
             frame.pos = 0;
             frame.input = stringBuilder.items;
             frame.filename = head.filename;
-            frame.next = head;
+            frame.next = self.frameHead;
 
             return frame;
         },
@@ -1961,3 +1961,313 @@ test "preprocessAll full input expansion" {
     try std.testing.expect(std.mem.indexOf(u8, preprocessed, "%macro") == null);
     try std.testing.expect(std.mem.indexOf(u8, preprocessed, "%ifdef") == null);
 }
+
+test "%include" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "included.inc",
+        .data = "var_inc: 1234\n",
+    });
+
+    const rootPath = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(rootPath);
+
+    const mainAsmPath = try std.fs.path.join(std.testing.allocator, &.{rootPath, "main.asm"});
+    defer std.testing.allocator.free(mainAsmPath);
+
+    var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+    defer tokenizer.deinit();
+
+    const mainSource =
+        \\start_token
+        \\%include "included.inc"
+        \\end_token 5678
+    ;
+
+    try tokenizer.pushFrame(mainSource, mainAsmPath);
+
+    const t1 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t1.kind);
+    try std.testing.expectEqualStrings("start_token", t1.data);
+
+    const t2 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t2.kind);
+    try std.testing.expectEqualStrings("var_inc", t2.data);
+
+    const t3 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.colon, t3.kind);
+
+    const t4 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t4.kind);
+    try std.testing.expectEqualStrings("1234", t4.data);
+
+    const t5 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t5.kind);
+    try std.testing.expectEqualStrings("end_token", t5.data);
+
+    const t6 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t6.kind);
+    try std.testing.expectEqualStrings("5678", t6.data);
+
+    const t7 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.eof, t7.kind);
+}
+
+test "%embed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "data.bin",
+        .data = &[_]u8{0x12, 0xAB, 0x00, 0xFF},
+    });
+
+    const rootPath = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(rootPath);
+
+    const mainAsmPath = try std.fs.path.join(std.testing.allocator, &.{rootPath, "main.asm"});
+    defer std.testing.allocator.free(mainAsmPath);
+
+    var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+    defer tokenizer.deinit();
+
+    const mainSource =
+        \\before_embed
+        \\%embed "data.bin"
+        \\after_embed 999
+    ;
+
+    try tokenizer.pushFrame(mainSource, mainAsmPath);
+
+    const t1 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t1.kind);
+    try std.testing.expectEqualStrings("before_embed", t1.data);
+
+    const t2 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t2.kind);
+    try std.testing.expectEqualStrings("0x12", t2.data);
+
+    const t3 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t3.kind);
+    try std.testing.expectEqualStrings("0xab", t3.data);
+
+    const t4 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t4.kind);
+    try std.testing.expectEqualStrings("0x00", t4.data);
+
+    const t5 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t5.kind);
+    try std.testing.expectEqualStrings("0xff", t5.data);
+
+    const t6 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t6.kind);
+    try std.testing.expectEqualStrings("after_embed", t6.data);
+
+    const t7 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t7.kind);
+    try std.testing.expectEqualStrings("999", t7.data);
+
+    const t8 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.eof, t8.kind);
+}
+
+test "bookmarks before and after %include are handled properly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "inner.inc",
+        .data = "inner_a inner_b\n",
+    });
+
+    const rootPath = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(rootPath);
+
+    const mainAsmPath = try std.fs.path.join(std.testing.allocator, &.{rootPath, "main.asm"});
+    defer std.testing.allocator.free(mainAsmPath);
+
+    var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+    defer tokenizer.deinit();
+
+    const mainSource =
+        \\outer_1
+        \\%include "inner.inc"
+        \\outer_2
+    ;
+
+    try tokenizer.pushFrame(mainSource, mainAsmPath);
+
+    const bookmarkBefore = try tokenizer.bookmark();
+
+    const tok1 = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("outer_1", tok1.data);
+
+    const tok2 = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("inner_a", tok2.data);
+
+    const bookmarkInside = try tokenizer.bookmark();
+
+    const tok3 = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("inner_b", tok3.data);
+
+    tokenizer.restore(bookmarkInside);
+    const tok3_again = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("inner_b", tok3_again.data);
+
+    const tok4 = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("outer_2", tok4.data);
+
+    const bookmarkAfter = try tokenizer.bookmark();
+
+    const tokEof = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.eof, tokEof.kind);
+
+    tokenizer.restore(bookmarkAfter);
+    const tokEofAgain = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.eof, tokEofAgain.kind);
+
+    tokenizer.restore(bookmarkBefore);
+    const tok1_replay = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("outer_1", tok1_replay.data);
+
+    const tok2_replay = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("inner_a", tok2_replay.data);
+
+    const tok3_replay = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("inner_b", tok3_replay.data);
+
+    const tok4_replay = try tokenizer.nextWord();
+    try std.testing.expectEqualStrings("outer_2", tok4_replay.data);
+}
+
+test "%include and %embed failing cases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const rootPath = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(rootPath);
+
+    const mainAsmPath = try std.fs.path.join(std.testing.allocator, &.{rootPath, "main.asm"});
+    defer std.testing.allocator.free(mainAsmPath);
+
+    {
+        var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+        defer tokenizer.deinit();
+
+        try tokenizer.pushFrame("%include \"does_not_exist.inc\"\n", mainAsmPath);
+        const result = tokenizer.nextWord();
+        try std.testing.expectError(error.FileNotFound, result);
+    }
+
+    {
+        var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+        defer tokenizer.deinit();
+
+        try tokenizer.pushFrame("%embed \"does_not_exist.bin\"\n", mainAsmPath);
+        const result = tokenizer.nextWord();
+        try std.testing.expectError(error.FileNotFound, result);
+    }
+
+    {
+        var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+        defer tokenizer.deinit();
+
+        try tokenizer.pushFrame("%include 12345\n", mainAsmPath);
+        const result = tokenizer.nextWord();
+        try std.testing.expectError(Error.InvalidPreprocessorDirective, result);
+    }
+
+    {
+        var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+        defer tokenizer.deinit();
+
+        try tokenizer.pushFrame("%embed 12345\n", mainAsmPath);
+        const result = tokenizer.nextWord();
+        try std.testing.expectError(Error.InvalidPreprocessorDirective, result);
+    }
+}
+
+test "@stringify" {
+    var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+    defer tokenizer.deinit();
+
+    const input =
+        \\pre_tok:
+        \\@stringify(foo bar 123)
+        \\post_tok 456
+    ;
+    try tokenizer.pushFrame(input, "standalone.asm");
+
+    const t1 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t1.kind);
+    try std.testing.expectEqualStrings("pre_tok", t1.data);
+
+    const t2 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.colon, t2.kind);
+
+    const t3 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.string, t3.kind);
+    try std.testing.expectEqualStrings("foo bar 123", t3.data);
+
+    const t4 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, t4.kind);
+    try std.testing.expectEqualStrings("post_tok", t4.data);
+
+    const t5 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, t5.kind);
+    try std.testing.expectEqualStrings("456", t5.data);
+
+    const tEof = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.eof, tEof.kind);
+}
+
+test "@stringify of %include" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "someotherfile.txt",
+        .data = "hello from included file 1234\n",
+    });
+
+    const rootPath = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(rootPath);
+
+    const mainAsmPath = try std.fs.path.join(std.testing.allocator, &.{rootPath, "main.asm"});
+    defer std.testing.allocator.free(mainAsmPath);
+
+    var tokenizer = try Tokenizer.init(std.testing.io, std.testing.allocator);
+    defer tokenizer.deinit();
+
+    const input =
+        \\before_stringify:
+        \\@stringify(%include "someotherfile.txt")
+        \\after_stringify 777
+    ;
+    try tokenizer.pushFrame(input, mainAsmPath);
+
+    const tok1 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, tok1.kind);
+    try std.testing.expectEqualStrings("before_stringify", tok1.data);
+
+    const tok2 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.colon, tok2.kind);
+
+    const tok3 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.string, tok3.kind);
+    try std.testing.expectEqualStrings("hello from included file 1234\n", tok3.data);
+
+    const tok4 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.identifier, tok4.kind);
+    try std.testing.expectEqualStrings("after_stringify", tok4.data);
+
+    const tok5 = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.number, tok5.kind);
+    try std.testing.expectEqualStrings("777", tok5.data);
+
+    const eofTok = try tokenizer.nextWord();
+    try std.testing.expectEqual(Tokenizer.Token.Kind.eof, eofTok.kind);
+}
+
