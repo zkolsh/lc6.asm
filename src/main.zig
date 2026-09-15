@@ -40,7 +40,8 @@ const DebugFileHeader = extern struct {
 pub fn main(init: std.process.Init) !void {
     const stderr = std.Io.File.stderr();
     var yell: [256]u8 = undefined;
-    var diagnostics = stderr.writer(init.io, &yell).interface;
+    var writer = stderr.writer(init.io, &yell);
+    var diagnostics = &writer.interface;
 
     var args = try init.minimal.args.iterateAllocator(init.gpa);
     defer args.deinit();
@@ -62,15 +63,18 @@ pub fn main(init: std.process.Init) !void {
 
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             try diagnostics.print(helpText, .{exename.?});
+            try diagnostics.flush();
             return;
         } else if (std.mem.eql(u8, arg, "-o")) {
             if (outputName != null) {
                 try diagnostics.print("error: only one output file is supported (found \"{s}\" and \"{s}\")\n", .{outputName.?, arg});
+                try diagnostics.flush();
                 std.process.exit(1);
             }
 
             outputName = args.next() orelse {
                 try diagnostics.writeAll("error: expected output file name.\n");
+                try diagnostics.flush();
                 std.process.exit(1);
             };
         } else if (std.mem.startsWith(u8, arg, "-l:")) {
@@ -78,6 +82,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "-t")) {
             const formatStr = args.next() orelse {
                 try diagnostics.writeAll("error: expected format (elf or mdbg) after -t.\n");
+                try diagnostics.flush();
                 std.process.exit(1);
             };
             if (std.mem.eql(u8, formatStr, "elf")) {
@@ -86,6 +91,7 @@ pub fn main(init: std.process.Init) !void {
                 outputType = .mdbg;
             } else {
                 try diagnostics.print("error: unrecognized format \"{s}\". Expected elf or mdbg.\n", .{formatStr});
+                try diagnostics.flush();
                 std.process.exit(1);
             }
         } else if (std.mem.eql(u8, arg, "-E")) {
@@ -94,13 +100,16 @@ pub fn main(init: std.process.Init) !void {
             linkObject = false;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
             try diagnostics.print("{s} version {s}\n", .{exename.?, versionString});
+            try diagnostics.flush();
             return;
         } else if (arg[0] == '-') {
             try diagnostics.print("error: unrecognized argument \"{s}\"\n", .{arg});
+            try diagnostics.flush();
             std.process.exit(1);
         } else {
             if (inputName != null) {
                 try diagnostics.print("error: only one input file is supported (found \"{s}\" and \"{s}\")\n", .{inputName.?, arg});
+                try diagnostics.flush();
                 std.process.exit(1);
             }
 
@@ -110,11 +119,13 @@ pub fn main(init: std.process.Init) !void {
 
     if (inputName == null) {
         try diagnostics.writeAll("error: no input file.\n");
+        try diagnostics.flush();
         std.process.exit(1);
     }
 
     if (outputName == null) {
         try diagnostics.writeAll("error: no output file.\n");
+        try diagnostics.flush();
         std.process.exit(1);
     }
 
@@ -127,7 +138,7 @@ pub fn main(init: std.process.Init) !void {
 
 
         const text = lexer.preprocessAll(init.arena.allocator()) catch |err| {
-            try lexer.showErrorHere(&diagnostics, err);
+            try lexer.showErrorHere(diagnostics, err);
             try diagnostics.flush();
             std.process.exit(1);
         };
@@ -142,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(1);
     }
 
-    var assembler: Assembly = try Assembly.init(allocator, &diagnostics);
+    var assembler: Assembly = try Assembly.init(allocator, diagnostics);
     defer assembler.deinit();
     try assembler.assembleEntireFile(init.io, inputName.?);
     try diagnostics.flush();
