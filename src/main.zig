@@ -18,7 +18,7 @@ const helpText: []const u8 =
     \\
     ;
 
-const versionString: []const u8 = "1.2.0";
+const versionString: []const u8 = "1.2.1";
 
 const OutputType = enum {
     elf,
