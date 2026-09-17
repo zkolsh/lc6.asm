@@ -4,14 +4,24 @@
 // [1]: https://refspecs.linuxfoundation.org/elf/elf.pdf
 // [2]: https://gabi.xinuos.com/elf/a-emachine.html
 
+#include "elf_io_platform.h"
+
 #if !defined(STATIC_ASSERT)
 #define STATIC_ASSERT_GLUE(a, b) a##b
 #define STATIC_ASSERT_JOIN(a, b) STATIC_ASSERT_GLUE(a, b)
 #define STATIC_ASSERT(COND, MSG) typedef char STATIC_ASSERT_JOIN(static_assertion_##MSG##_, __LINE__)[(COND) ? 1 : -1]
 #endif
 
-#include <stddef.h>
-#include <stdint.h>
+STATIC_ASSERT(sizeof(uint8_t)  == 1, primitive_ints_size_mismatch);
+STATIC_ASSERT(sizeof(uint16_t) == 2, primitive_ints_size_mismatch);
+STATIC_ASSERT(sizeof(uint32_t) == 4, primitive_ints_size_mismatch);
+STATIC_ASSERT(sizeof(int32_t)  == 4, primitive_ints_size_mismatch);
+
+STATIC_ASSERT(_Alignof(uint8_t)  == 1, primitive_ints_alignment_mismatch);
+STATIC_ASSERT(_Alignof(uint16_t) == 2, primitive_ints_alignment_mismatch);
+STATIC_ASSERT(_Alignof(uint32_t) == 4, primitive_ints_alignment_mismatch);
+STATIC_ASSERT(_Alignof(int32_t)  == 4, primitive_ints_alignment_mismatch);
+
 
 typedef uint8_t ElfStatus;
 enum {
@@ -29,16 +39,6 @@ enum {
 };
 
 const char* elf_status_str(const ElfStatus status);
-
-STATIC_ASSERT(sizeof(uint8_t)  == 1, primitive_ints_size_mismatch);
-STATIC_ASSERT(sizeof(uint16_t) == 2, primitive_ints_size_mismatch);
-STATIC_ASSERT(sizeof(uint32_t) == 4, primitive_ints_size_mismatch);
-STATIC_ASSERT(sizeof(int32_t)  == 4, primitive_ints_size_mismatch);
-
-STATIC_ASSERT(_Alignof(uint8_t)  == 1, primitive_ints_alignment_mismatch);
-STATIC_ASSERT(_Alignof(uint16_t) == 2, primitive_ints_alignment_mismatch);
-STATIC_ASSERT(_Alignof(uint32_t) == 4, primitive_ints_alignment_mismatch);
-STATIC_ASSERT(_Alignof(int32_t)  == 4, primitive_ints_alignment_mismatch);
 
 typedef uint16_t ElfType;
 enum {

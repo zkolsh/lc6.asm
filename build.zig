@@ -12,7 +12,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
+            .single_threaded = true,
         }),
+        .linkage = switch (target.result.os.tag) {
+            .macos => .dynamic,
+            else => .static,
+        },
     });
 
     exe.link_gc_sections = true;
@@ -21,18 +26,27 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("cbits/elf_io.h"),
         .target = target,
         .optimize = optimize,
+        .link_libc = target.result.requiresLibC(),
     });
 
+    translate_elf.defineCMacro("ELFIO_AVOID_LIBC", "1");
+
     const elf = translate_elf.createModule();
-    elf.link_libc = true;
+    const cflags: []const []const u8 = &.{"-Wall", "-Wextra", "-std=c99", "-DELFIO_AVOID_LIBC"};
     elf.strip = strip;
+    
+    elf.addCSourceFile(.{
+        .flags = cflags,
+        .file = b.path("cbits/elf_io_platform.c"),
+    });
 
     elf.addCSourceFile(.{
+        .flags = cflags,
         .file = b.path("cbits/elf_io.c"),
-        .flags = &.{"-Wall", "-Wextra", "-std=c99"},
     });
 
     exe.root_module.addImport("elf_io", elf);
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");

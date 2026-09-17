@@ -1,7 +1,5 @@
 #include "elf_io.h" // references defined here
 
-#include <string.h>
-
 #if defined(DEBUG)
 #include <stdio.h>
 #endif
