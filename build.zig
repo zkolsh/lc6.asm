@@ -19,32 +19,6 @@ fn getProgramVersion(gpa: std.mem.Allocator) ![]const u8 {
     return build_zig.version;
 }
 
-fn buildElfio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: ?bool) *std.Build.Step.Compile {
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = false,
-        .strip = strip,
-    });
-
-    mod.addCMacro("ELFIO_AVOID_LIBC", "");
-    mod.addCSourceFiles(.{
-        .root = b.path("cbits"),
-        .language = .c,
-        .files = &.{"elf_io.c"},
-        .flags = cflags,
-    });
-
-    const lib = b.addLibrary(.{
-        .name = "elfio",
-        .root_module = mod,
-        .linkage = .static,
-    });
-
-    lib.installHeader(b.path("cbits/elf_io.h"), "elf_io.h");
-    return lib;
-}
-
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -76,35 +50,15 @@ pub fn build(b: *std.Build) !void {
     exe.root_module.addImport("build_options", options.createModule());
 
     const translate_elf = b.dependency("translate_c", .{});
-    const elfio = buildElfio(b, target, optimize, strip);
     const trans: Translator = .init(translate_elf, .{
-        .c_source_file = b.path("cbits/elf_io.h"),
+        .c_source_file = b.path("cbits/elf_io.c"),
         .target = target,
         .optimize = optimize,
         .link_libc = false,
         .default_init = true,
     });
 
-    trans.linkLibrary(elfio);
     trans.defineCMacro("ELFIO_AVOID_LIBC", "");
-
-    const platform: Translator = .init(translate_elf, .{
-        .c_source_file = b.path("cbits/elf_io_platform.c"),
-        .target = target,
-        .optimize = optimize,
-        .func_bodies = true,
-        .default_init = true,
-        .link_libc = false,
-    });
-
-    platform.defineCMacro("ELFIO_AVOID_LIBC", "");
-
-    const libc = b.addLibrary(.{
-        .name = "elf_io_platform",
-        .root_module = platform.mod,
-    });
-
-    trans.linkLibrary(libc);
     exe.root_module.addImport("elf_io", trans.mod);
     b.installArtifact(exe);
 

@@ -4,7 +4,38 @@
 // [1]: https://refspecs.linuxfoundation.org/elf/elf.pdf
 // [2]: https://gabi.xinuos.com/elf/a-emachine.html
 
-#include "elf_io_platform.h"
+#if !defined(ELFIO_AVOID_LIBC)
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#define elfio_memset 	memset
+#define elfio_memcpy 	memcpy
+#define elfio_strlen 	strlen
+#define elfio_strcmp 	strcmp
+#define elfio_strncmp 	strncmp
+#define elfio_strcat 	strcat
+#define elfio_strncat 	strncat
+#define elfio_strncpy 	strncpy
+#else
+typedef unsigned char  uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int   uint32_t;
+typedef signed int     int32_t;
+typedef __SIZE_TYPE__  size_t;
+
+#define SIZE_MAX ((size_t)-1)
+#define NULL ((void *)0)
+
+extern void* elfio_memset(void* s, int c, size_t n);
+extern void* elfio_memcpy(void* dest, const void* src, size_t n);
+extern size_t elfio_strlen(const char* s); 
+extern int elfio_strcmp(const char* s1, const char* s2);
+extern int elfio_strncmp(const char* s1, const char* s2, size_t n);
+extern char* elfio_strcat(char* dest, const char* src);
+extern char* elfio_strncat(char* dest, const char* src, size_t n);
+extern char* elfio_strncpy(char* dest, const char* src, size_t n);
+#endif /* ELFIO_AVOID_LIBC */
 
 #if !defined(STATIC_ASSERT)
 #define STATIC_ASSERT_GLUE(a, b) a##b

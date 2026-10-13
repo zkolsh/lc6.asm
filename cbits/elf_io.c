@@ -2,7 +2,93 @@
 
 #if defined(DEBUG)
 #include <stdio.h>
-#endif
+#endif /* DEBUG */
+
+#if defined(ELFIO_AVOID_LIBC)
+void* elfio_memset(void* s, int c, size_t n) {
+	unsigned char* p = (unsigned char*)s;
+	while (n--) {
+		*p++ = (unsigned char)c;
+	};
+
+	return s;
+};
+
+void* elfio_memcpy(void* dest, const void* src, size_t n) {
+	unsigned char* d = (unsigned char*)dest;
+	const unsigned char* s = (const unsigned char*)src;
+	while (n--) {
+		*d++ = *s++;
+	};
+
+	return dest;
+};
+
+size_t elfio_strlen(const char* s) {
+	const char* p = s;
+	while (*p) {
+		p++;
+	};
+	return (size_t)(p - s);
+};
+
+int elfio_strcmp(const char* s1, const char* s2) {
+	while (*s1 && (*s1 == *s2)) {
+		s1++;
+		s2++;
+	};
+	return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+};
+
+int elfio_strncmp(const char* s1, const char* s2, size_t n) {
+	if (n == 0) return 0;
+	while (n > 0 && *s1 && (*s1 == *s2)) {
+		s1++;
+		s2++;
+	};
+	return *(const unsigned char*)s1 - *(const unsigned char*)s2;
+};
+
+char* elfio_strcat(char* dest, const char* src) {
+	char* d = dest;
+	while (*d) {
+		d++;
+	};
+	while ((*d++ = *src++));
+	return dest;
+};
+
+char* elfio_strncat(char* dest, const char* src, size_t n) {
+	char* d = dest;
+	while (*d) {
+		d++;
+	}
+	
+	size_t i = 0;
+	while (i < n && src[i] != '\0') {
+		d[i] = src[i];
+		i++;
+	}
+	d[i] = '\0';
+
+	return dest;
+};
+
+char* elfio_strncpy(char* dest, const char* src, size_t n) {
+	char* d = dest;
+	while (n > 0 && *src != '\0') {
+		*d++ = *src++;
+		n--;
+	};
+
+	while (n > 0) {
+		*d++ = '\0';
+		n--;
+	};
+
+	return dest;
+};
+#endif /* ELFIO_AVOID_LIBC */
 
 const char* elf_status_str(const ElfStatus status) {
 	switch (status) {
@@ -90,7 +176,7 @@ size_t elf_writer_calculate_size(const ElfRawSection* sections, size_t count) {
 
 	size_t shstrtab_size = 1 + 10;
 	for (size_t i = 0; i < count; i++) {
-		shstrtab_size += 1 + strlen(sections[i].name);
+		shstrtab_size += 1 + elfio_strlen(sections[i].name);
 	};
 
 	current_offset = (current_offset + 3) & ~3;
@@ -113,7 +199,7 @@ ElfStatus elf_writer_serialize(
 	if (dest_capacity < required_size) return ELF_BUFFER_TOO_SMALL;
 
 	for (size_t i = 0; i < dest_capacity; i++) dest_buffer[i] = 0;
-	memset(dest_buffer, 0, dest_capacity);
+	elfio_memset(dest_buffer, 0, dest_capacity);
 
 	size_t current_payload_offset = sizeof(ElfEHDR);
 	uint32_t file_offsets[32] = {0}; 
@@ -127,7 +213,7 @@ ElfStatus elf_writer_serialize(
 			file_offsets[i] = 0;
 		} else {
 			file_offsets[i] = (uint32_t)current_payload_offset;
-			memcpy(&dest_buffer[current_payload_offset], sections[i].data, sections[i].size);
+			elfio_memcpy(&dest_buffer[current_payload_offset], sections[i].data, sections[i].size);
 			current_payload_offset += sections[i].size;
 		};
 	};
@@ -141,15 +227,15 @@ ElfStatus elf_writer_serialize(
 	uint32_t string_indices[32] = {0};
 	for (size_t i = 0; i < count; i++) {
 		string_indices[i] = (uint32_t)(str_ptr - &dest_buffer[shstrtab_file_offset]);
-		size_t len = strlen(sections[i].name);
-		memcpy(str_ptr, sections[i].name, len + 1);
+		size_t len = elfio_strlen(sections[i].name);
+		elfio_memcpy(str_ptr, sections[i].name, len + 1);
 		str_ptr += len + 1;
 	};
 
 	const uint32_t shstrtab_name_index = (uint32_t)(str_ptr - &dest_buffer[shstrtab_file_offset]);
 	const char* shstr_name = ".shstrtab";
-	strcat((char*)str_ptr, shstr_name);
-	str_ptr += 1 + strlen(shstr_name);
+	elfio_strcat((char*)str_ptr, shstr_name);
+	str_ptr += 1 + elfio_strlen(shstr_name);
 
 	current_payload_offset = (size_t)(str_ptr - dest_buffer);
 	current_payload_offset = (current_payload_offset + 3) & ~3;
@@ -286,7 +372,7 @@ ElfStatus elf_view_peek_symbol_value(const ElfView* view, const char* name, uint
 		const ElfSym* sym = &syms[i];
 		const char* sym_name = strtab + sym->st_name;
 
-		if (strcmp(sym_name, name) == 0) {
+		if (elfio_strcmp(sym_name, name) == 0) {
 			*out_value = sym->st_value;
 			return ELF_SUCCESS;
 		};
@@ -305,7 +391,7 @@ const ElfSHDR* elf_view_get_section_header(const ElfView* view, const char* name
 		const ElfSHDR* shdr = &view->section_headers[i];
 		const char* sec_name = view->shstrtab + shdr->sh_name;
 
-		if (strcmp(sec_name, name) == 0) {
+		if (elfio_strcmp(sec_name, name) == 0) {
 			return shdr;
 		};
 	};
@@ -355,7 +441,7 @@ ElfStatus elf_view_patch_relocations(
 	uint32_t current_sec_vaddr = 0;
 	uint8_t current_vaddr_found = 0;
 	for (size_t j = 0; j < layout_count; j++) {
-		if (strcmp(layout[j].section_name, section_name) == 0) {
+		if (elfio_strcmp(layout[j].section_name, section_name) == 0) {
 			current_sec_vaddr = layout[j].base_vaddr;
 			current_vaddr_found = 1;
 			break;
@@ -369,7 +455,7 @@ ElfStatus elf_view_patch_relocations(
 	};
 
 	char relsection_name[40] = ".rel";
-	strncat(relsection_name, section_name, sizeof(relsection_name) - strlen(relsection_name) - 1);
+	elfio_strncat(relsection_name, section_name, sizeof(relsection_name) - elfio_strlen(relsection_name) - 1);
 
 	uint32_t rel_size = 0;
 	const uint8_t* rel_bytes = elf_view_get_section(view, relsection_name, &rel_size, NULL);
@@ -394,10 +480,10 @@ ElfStatus elf_view_patch_relocations(
 			const char* sym_name = (strtab != NULL) ? (strtab + sym.st_name) : "";
 			uint32_t absolute_addr = 0;
 
-			if (strcmp(sym_name, "heap_base") == 0) {
+			if (elfio_strcmp(sym_name, "heap_base") == 0) {
 				uint32_t heap_end = 0;
 				for (size_t j = 0; j < layout_count; j++) {
-					if (strcmp(layout[j].section_name, ".data") == 0 || strcmp(layout[j].section_name, ".text") == 0) {
+					if (elfio_strcmp(layout[j].section_name, ".data") == 0 || elfio_strcmp(layout[j].section_name, ".text") == 0) {
 						uint32_t sec_size = 0;
 						elf_view_get_section(view, layout[j].section_name, &sec_size, NULL);
 						uint32_t sec_end = layout[j].base_vaddr + sec_size;
@@ -419,7 +505,7 @@ ElfStatus elf_view_patch_relocations(
 				uint32_t base_vaddr = 0;
 
 				for (size_t j = 0; j < layout_count; j++) {
-					if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+					if (elfio_strcmp(layout[j].section_name, sym_sec_name) == 0) {
 						base_vaddr = layout[j].base_vaddr;
 						base_vaddr_found = 1;
 						break;
@@ -437,7 +523,7 @@ ElfStatus elf_view_patch_relocations(
 			};
 
 			uint32_t instruction;
-			memcpy(&instruction, &section_data[rel.r_offset], sizeof(uint32_t));
+			elfio_memcpy(&instruction, &section_data[rel.r_offset], sizeof(uint32_t));
 
 			uint32_t ci_vaddr = current_sec_vaddr + rel.r_offset;
 			switch (reloc_type) {
@@ -523,12 +609,12 @@ ElfStatus elf_view_patch_relocations(
 				return ELF_INVALID_RELOCATION;
 			};
 
-			memcpy(&section_data[rel.r_offset], &instruction, sizeof(uint32_t));
+			elfio_memcpy(&section_data[rel.r_offset], &instruction, sizeof(uint32_t));
 		};
 	};
 
 	char relasection_name[40] = ".rela";
-	strncat(relasection_name, section_name, sizeof(relasection_name) - strlen(relasection_name) - 1);
+	elfio_strncat(relasection_name, section_name, sizeof(relasection_name) - elfio_strlen(relasection_name) - 1);
 
 	uint32_t rela_size = 0;
 	const uint8_t* rela_bytes = elf_view_get_section(view, relasection_name, &rela_size, NULL);
@@ -553,10 +639,10 @@ ElfStatus elf_view_patch_relocations(
 			const char* sym_name = (strtab != NULL) ? (strtab + sym.st_name) : "";
 			uint32_t absolute_addr = 0;
 
-			if (strcmp(sym_name, "heap_base") == 0) {
+			if (elfio_strcmp(sym_name, "heap_base") == 0) {
 				uint32_t heap_end = 0;
 				for (size_t j = 0; j < layout_count; j++) {
-					if (strcmp(layout[j].section_name, ".data") == 0 || strcmp(layout[j].section_name, ".text") == 0) {
+					if (elfio_strcmp(layout[j].section_name, ".data") == 0 || elfio_strcmp(layout[j].section_name, ".text") == 0) {
 						uint32_t sec_size = 0;
 						elf_view_get_section(view, layout[j].section_name, &sec_size, NULL);
 						uint32_t sec_end = layout[j].base_vaddr + sec_size;
@@ -578,7 +664,7 @@ ElfStatus elf_view_patch_relocations(
 				uint32_t base_vaddr = 0;
 
 				for (size_t j = 0; j < layout_count; j++) {
-					if (strcmp(layout[j].section_name, sym_sec_name) == 0) {
+					if (elfio_strcmp(layout[j].section_name, sym_sec_name) == 0) {
 						base_vaddr = layout[j].base_vaddr;
 						base_vaddr_found = 1;
 						break;
@@ -596,7 +682,7 @@ ElfStatus elf_view_patch_relocations(
 			};
 
 			uint32_t instruction;
-			memcpy(&instruction, &section_data[rela.r_offset], sizeof(uint32_t));
+			elfio_memcpy(&instruction, &section_data[rela.r_offset], sizeof(uint32_t));
 
 			uint32_t ci_vaddr = current_sec_vaddr + rela.r_offset;
 			switch (reloc_type) {
@@ -682,7 +768,7 @@ ElfStatus elf_view_patch_relocations(
 				return ELF_INVALID_RELOCATION;
 			};
 
-			memcpy(&section_data[rela.r_offset], &instruction, sizeof(uint32_t));
+			elfio_memcpy(&section_data[rela.r_offset], &instruction, sizeof(uint32_t));
 		};
 	};
 
@@ -694,7 +780,7 @@ ElfStatus elf_merge_calculate_layout(ElfLayoutMap* out_layout, const ElfView* vi
 		return ELF_MISSING_PARAMS;
 	};
 
-	memset(out_layout, 0, sizeof(*out_layout));
+	elfio_memset(out_layout, 0, sizeof(*out_layout));
 	for (size_t v = 0; v < view_count; v++) {
 		const ElfView* view = &views[v];
 
@@ -708,7 +794,7 @@ ElfStatus elf_merge_calculate_layout(ElfLayoutMap* out_layout, const ElfView* vi
 			const char* name = view->shstrtab + shdr->sh_name;
 			size_t slot = SIZE_MAX;
 			for (size_t i = 0; i < out_layout->section_count; ++i) {
-				if (strcmp(out_layout->sections[i].name, name) == 0) {
+				if (elfio_strcmp(out_layout->sections[i].name, name) == 0) {
 					slot = i;
 					break;
 				};
@@ -720,8 +806,8 @@ ElfStatus elf_merge_calculate_layout(ElfLayoutMap* out_layout, const ElfView* vi
 				};
 
 				slot = out_layout->section_count++;
-				memset(&out_layout->sections[slot], 0, sizeof(out_layout->sections[slot]));
-				strncpy(out_layout->sections[slot].name, name, sizeof(out_layout->sections[slot].name) - 1);
+				elfio_memset(&out_layout->sections[slot], 0, sizeof(out_layout->sections[slot]));
+				elfio_strncpy(out_layout->sections[slot].name, name, sizeof(out_layout->sections[slot].name) - 1);
 				out_layout->sections[slot].alignment = 1;
 			};
 
@@ -758,7 +844,7 @@ ElfStatus elf_merge(
 		return ELF_BUFFER_TOO_SMALL;
 	};
 
-	memset(dest, 0, capacity);
+	elfio_memset(dest, 0, capacity);
 	for (size_t l = 0; l < layout->section_count; l++) {
 		const ElfLayoutSection* merged = &layout->sections[l];
 		size_t dst = merged->base_vaddr;
@@ -774,7 +860,7 @@ ElfStatus elf_merge(
 			size_t align = shdr->sh_addralign? shdr->sh_addralign : 1;
 			dst = (dst + align - 1) & ~(align - 1);
 
-			memcpy(dest + dst, src, src_size);
+			elfio_memcpy(dest + dst, src, src_size);
 			dst += src_size;
 		};
 	};
