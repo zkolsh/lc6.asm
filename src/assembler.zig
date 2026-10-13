@@ -420,6 +420,7 @@ pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name:
     const capacity = frame.len / 4;
 
     self.sources = parser.lexer;
+    defer self.sources = null;
 
     if (self.segments.getPtr("data")) |data| {
         try data.ensureTotalCapacity(self.allocator, capacity);
@@ -459,6 +460,7 @@ pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !vo
     defer parser.deinit();
 
     self.sources = parser.lexer;
+    defer self.sources = null;
 
     try parser.lexer.openFile(filepath);
     if (parser.lexer.frameHead) |head| {
@@ -557,7 +559,7 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
 
     var nextSectionIndex: u16 = 1;
     for (ordered.items) |segment| {
-        const name = try self.strings.allocator().dupeZ(u8, segment.name);
+        const name = try self.strings.allocator().dupeSentinel(u8, segment.name, 0);
         const seg = segment.seg;
 
         if (std.mem.eql(u8, name, ".text")) {
@@ -590,7 +592,8 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
             .addralign = 4,
             .link = 0,
             .info = 0,
-            .entsize = 0
+            .entsize = 0,
+            .vaddr = 0,
         });
     }
 
@@ -726,7 +729,8 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
         .addralign = 1,
         .link = 0,
         .info = 0,
-        .entsize = 0
+        .entsize = 0,
+        .vaddr = 0,
     });
 
     const symtabIndex: u16 = nextSectionIndex;
@@ -741,7 +745,8 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
         .addralign = 4,
         .link = strtabIndex,
         .info = 0,
-        .entsize = @sizeOf(c.ElfSym)
+        .entsize = @sizeOf(c.ElfSym),
+        .vaddr = 0,
     });
 
     var relit = relsBySection.iterator();
@@ -759,7 +764,8 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
             .addralign = 4,
             .link = symtabIndex,
             .info = sectionIndices.get(secname).?,
-            .entsize = @sizeOf(c.ElfRel)
+            .entsize = @sizeOf(c.ElfRel),
+            .vaddr = 0,
         });
     }
 
@@ -778,7 +784,8 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
             .addralign = 4,
             .link = symtabIndex,
             .info = sectionIndices.get(secname).?,
-            .entsize = @sizeOf(c.ElfRela)
+            .entsize = @sizeOf(c.ElfRela),
+            .vaddr = 0,
         });
     }
 
@@ -1034,6 +1041,7 @@ test "error: unresolved symbol during ELF blob creation" {
     try std.testing.expectEqual(@as(usize, 1), as.relocations.items.len);
     const err = as.createElfBlob(c.ET_REL, 0);
     try std.testing.expectError(Error.UnresolvedSymbol, err);
+    try stderr.writer.flush();
 }
 
 test "immediate data directives" {

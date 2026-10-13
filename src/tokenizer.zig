@@ -109,13 +109,13 @@ pub const Token = struct {
 
 pub const Bookmark = struct {
     frame: ?*Frame,
-    pos: [12]usize,
+    pos: [16]usize,
 };
 
 pub fn bookmark(self: *Tokenizer) Error!Bookmark {
     var b = Bookmark{
         .frame = self.frameHead,
-        .pos = [_]usize{0} ** 12,
+        .pos = @splat(0),
     };
 
     var it = self.frameHead;
@@ -138,9 +138,17 @@ pub fn restore(self: *Tokenizer, mark: Bookmark) void {
 
     var it = self.frameHead;
     var i: usize = 0;
-    while (it) |f| : (it = f.next) {
-        if (i < mark.pos.len) f.pos = mark.pos[i];
+    while (it) |f| {
+        if (i < mark.pos.len) {
+            f.pos = mark.pos[i];
+        }
+
         i += 1;
+        if (f.next) |n| {
+            it = n;
+        } else {
+            return;
+        }
     }
 }
 

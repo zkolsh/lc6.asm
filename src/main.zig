@@ -18,7 +18,7 @@ const helpText: []const u8 =
     \\
     ;
 
-const versionString: []const u8 = "1.2.1";
+const versionString: []const u8 = @import("build_options").version;
 
 const OutputType = enum {
     elf,
@@ -306,7 +306,8 @@ pub fn main(init: std.process.Init) !void {
                     .addralign = @as(u32, @intCast(section.alignment)),
                     .link = 0,
                     .info = 0,
-                    .entsize = 0
+                    .entsize = 0,
+                    .vaddr = 0,
                 });
             }
 

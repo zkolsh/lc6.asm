@@ -1,9 +1,56 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
-pub fn build(b: *std.Build) void {
+const cflags: []const []const u8 = &.{"-Wall", "-Wextra", "-std=c99"};
+
+fn getProgramVersion(gpa: std.mem.Allocator) ![]const u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    const build_zig_zon = @embedFile("build.zig.zon");
+
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const build_zig = try std.zon.parse.fromSlice(struct {version: []const u8}, .{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = build_zig_zon,
+        .diagnostics = &diagnostics,
+        .ignore_unknown_fields = true,
+    });
+
+    return build_zig.version;
+}
+
+fn buildElfio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, strip: ?bool) *std.Build.Step.Compile {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+        .strip = strip,
+    });
+
+    mod.addCMacro("ELFIO_AVOID_LIBC", "");
+    mod.addCSourceFiles(.{
+        .root = b.path("cbits"),
+        .language = .c,
+        .files = &.{"elf_io.c"},
+        .flags = cflags,
+    });
+
+    const lib = b.addLibrary(.{
+        .name = "elfio",
+        .root_module = mod,
+        .linkage = .static,
+    });
+
+    lib.installHeader(b.path("cbits/elf_io.h"), "elf_io.h");
+    return lib;
+}
+
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "strip debug symbols from the binary");
+
+    const options = b.addOptions();
 
     const exe = b.addExecutable(.{
         .name = "rtm32.asm",
@@ -12,7 +59,9 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
-            .single_threaded = true,
+            .link_libc = false,
+            .error_tracing = true,
+            .sanitize_c = .full,
         }),
         .linkage = switch (target.result.os.tag) {
             .macos => .dynamic,
@@ -22,41 +71,48 @@ pub fn build(b: *std.Build) void {
 
     exe.link_gc_sections = true;
 
-    const translate_elf = b.addTranslateC(.{
-        .root_source_file = b.path("cbits/elf_io.h"),
+    const version = try getProgramVersion(b.allocator);
+    options.addOption([]const u8, "version", version);
+    exe.root_module.addImport("build_options", options.createModule());
+
+    const translate_elf = b.dependency("translate_c", .{});
+    const elfio = buildElfio(b, target, optimize, strip);
+    const trans: Translator = .init(translate_elf, .{
+        .c_source_file = b.path("cbits/elf_io.h"),
         .target = target,
         .optimize = optimize,
-        .link_libc = target.result.requiresLibC(),
+        .link_libc = false,
+        .default_init = true,
     });
 
-    translate_elf.defineCMacro("ELFIO_AVOID_LIBC", "1");
+    trans.linkLibrary(elfio);
+    trans.defineCMacro("ELFIO_AVOID_LIBC", "");
 
-    const elf = translate_elf.createModule();
-    const cflags: []const []const u8 = &.{"-Wall", "-Wextra", "-std=c99", "-DELFIO_AVOID_LIBC"};
-    elf.strip = strip;
-    
-    elf.addCSourceFile(.{
-        .flags = cflags,
-        .file = b.path("cbits/elf_io_platform.c"),
+    const platform: Translator = .init(translate_elf, .{
+        .c_source_file = b.path("cbits/elf_io_platform.c"),
+        .target = target,
+        .optimize = optimize,
+        .func_bodies = true,
+        .default_init = true,
+        .link_libc = false,
     });
 
-    elf.addCSourceFile(.{
-        .flags = cflags,
-        .file = b.path("cbits/elf_io.c"),
+    platform.defineCMacro("ELFIO_AVOID_LIBC", "");
+
+    const libc = b.addLibrary(.{
+        .name = "elf_io_platform",
+        .root_module = platform.mod,
     });
 
-    exe.root_module.addImport("elf_io", elf);
-
+    trans.linkLibrary(libc);
+    exe.root_module.addImport("elf_io", trans.mod);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
@@ -67,4 +123,20 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
+    b.installArtifact(exe_tests);
+
+    const docs_step = b.step("docs", "Generate project documentation");
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = exe.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+
+    docs_step.dependOn(&install_docs.step);
+
+    const lldb = b.addSystemCommand(&.{"lldb", "--"});
+    lldb.addArtifactArg(exe_tests);
+
+    const lldb_step = b.step("debug", "Run tests under lldb");
+    lldb_step.dependOn(&lldb.step);
 }

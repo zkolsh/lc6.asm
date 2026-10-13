@@ -1,7 +1,6 @@
 .zig-cache/
+build/
 rsrc/
 zig-out/
-assembly.c
+zig-pkg/
 todo.md
-build.zig.zon
-build/
