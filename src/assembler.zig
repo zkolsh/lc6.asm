@@ -8,7 +8,7 @@ const Assembly = @This();
 
 allocator: std.mem.Allocator,
 strings: std.heap.ArenaAllocator,
-sources: ?Tokenizer,
+parser: Parser,
 
 segments: std.StringHashMap(Segment),
 currentSegment: *Segment,
@@ -45,7 +45,7 @@ pub const Error = error {
     UnresolvedSymbol,
 } || Parser.Error;
 
-pub fn init(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Assembly {
+pub fn init(allocator: std.mem.Allocator, io: std.Io, stderr: *std.Io.Writer) !Assembly {
     var segments = std.StringHashMap(Segment).init(allocator);
     try segments.put(".text", std.ArrayList(u8).empty);
     try segments.put(".data", std.ArrayList(u8).empty);
@@ -56,7 +56,7 @@ pub fn init(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Assembly {
     return .{
         .allocator = allocator,
         .strings = std.heap.ArenaAllocator.init(allocator),
-        .sources = null,
+        .parser = try Parser.init(io, allocator),
         .segments = segments,
         .currentSegment = segments.getPtr(".text").?,
         .currentSegmentName = ".text",
@@ -67,6 +67,7 @@ pub fn init(allocator: std.mem.Allocator, stderr: *std.Io.Writer) !Assembly {
 }
 
 pub fn deinit(self: *Assembly) void {
+    self.parser.deinit();
     self.relocations.deinit(self.allocator);
 
     var segment = self.segments.iterator();
@@ -412,15 +413,9 @@ fn validateImmediate(target: isa.ImmediateKind, immediate: u25) Error!u25 {
     };
 }
 
-pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name: []const u8) !void {
-    var parser = try Parser.init(io, self.allocator);
-    defer parser.deinit();
-
-    try parser.lexer.pushFrame(frame, name);
+pub fn assembleEntireFrame(self: *Assembly, frame: []const u8, name: []const u8) !void {
+    try self.parser.lexer.pushFrame(frame, name);
     const capacity = frame.len / 4;
-
-    self.sources = parser.lexer;
-    defer self.sources = null;
 
     if (self.segments.getPtr("data")) |data| {
         try data.ensureTotalCapacity(self.allocator, capacity);
@@ -430,24 +425,24 @@ pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name:
         try text.ensureTotalCapacity(self.allocator, capacity);
     }
 
-    while (parser.lexer.frameHead != null) {
-        try parser.skipToStatementStart();
-        const mark = try parser.lexer.bookmark();
+    while (self.parser.lexer.frameHead != null) {
+        try self.parser.skipToStatementStart();
+        const mark = try self.parser.lexer.bookmark();
 
-        const statement = parser.parseStatement() catch |err| {
+        const statement = self.parser.parseStatement() catch |err| {
             if (err == Parser.Error.UnexpectedEOF) break;
-            if (parser.lexer.frameHead == null) break;
+            if (self.parser.lexer.frameHead == null) break;
 
-            try parser.lexer.showErrorHere(self.diagnostics, err);
-            try parser.skipToStatementEnd();
+            try self.parser.lexer.showErrorHere(self.diagnostics, err);
+            try self.parser.skipToStatementEnd();
             continue;
         };
 
-        const cursor = try parser.lexer.bookmark();
+        const cursor = try self.parser.lexer.bookmark();
         self.encodeStatement(statement, mark) catch |err| {
-            parser.lexer.restore(mark);
-            try parser.lexer.showErrorHere(self.diagnostics, err);
-            parser.lexer.restore(cursor);
+            self.parser.lexer.restore(mark);
+            try self.parser.lexer.showErrorHere(self.diagnostics, err);
+            self.parser.lexer.restore(cursor);
             return err;
         };
     }
@@ -455,15 +450,9 @@ pub fn assembleEntireFrame(self: *Assembly, io: std.Io, frame: []const u8, name:
     try self.diagnostics.flush();
 }
 
-pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !void {
-    var parser = try Parser.init(io, self.allocator);
-    defer parser.deinit();
-
-    self.sources = parser.lexer;
-    defer self.sources = null;
-
-    try parser.lexer.openFile(filepath);
-    if (parser.lexer.frameHead) |head| {
+pub fn assembleEntireFile(self: *Assembly, filepath: []const u8) !void {
+    try self.parser.lexer.openFile(filepath);
+    if (self.parser.lexer.frameHead) |head| {
         const capacity = head.input.len / 4;
 
         if (self.segments.getPtr("data")) |data| {
@@ -476,28 +465,28 @@ pub fn assembleEntireFile(self: *Assembly, io: std.Io, filepath: []const u8) !vo
     }
 
     var firstErr: ?Error = null;
-    while (parser.lexer.frameHead != null) {
-        try parser.skipToStatementStart();
-        const mark = try parser.lexer.bookmark();
+    while (self.parser.lexer.frameHead != null) {
+        try self.parser.skipToStatementStart();
+        const mark = try self.parser.lexer.bookmark();
 
-        const statement = parser.parseStatement() catch |err| {
+        const statement = self.parser.parseStatement() catch |err| {
             if (err == Parser.Error.UnexpectedEOF) break;
-            if (parser.lexer.frameHead == null) break;
+            if (self.parser.lexer.frameHead == null) break;
 
             if (firstErr == null) {
                 firstErr = err;
             }
 
-            try parser.lexer.showErrorHere(self.diagnostics, err);
-            try parser.skipToStatementEnd();
+            try self.parser.lexer.showErrorHere(self.diagnostics, err);
+            try self.parser.skipToStatementEnd();
             continue;
         };
 
-        const cursor = try parser.lexer.bookmark();
+        const cursor = try self.parser.lexer.bookmark();
         self.encodeStatement(statement, mark) catch |err| {
-            parser.lexer.restore(mark);
-            try parser.lexer.showErrorHere(self.diagnostics, err);
-            parser.lexer.restore(cursor);
+            self.parser.lexer.restore(mark);
+            try self.parser.lexer.showErrorHere(self.diagnostics, err);
+            self.parser.lexer.restore(cursor);
 
             if (firstErr == null) {
                 firstErr = err;
@@ -688,25 +677,17 @@ pub fn createElfBlob(self: *Assembly, elfType: c.ElfType, entryPoint: u32) ![]u8
                     .r_addend = rel.offset,
                 });
             }
-        } else if (self.sources) |*sources| {
+        } else {
             try self.diagnostics.writeAll("when patching symbol ");
             try self.diagnostics.writeAll(rel.name);
             try self.diagnostics.writeAll(":\n");
-            sources.restore(rel.bookmark);
+            self.parser.lexer.restore(rel.bookmark);
 
-            if (sources.frameHead) |head| {
+            if (self.parser.lexer.frameHead) |head| {
                 head.pos = @max(0, head.pos - 1);
             }
 
-            try sources.showErrorHere(self.diagnostics, Error.UnresolvedSymbol);
-            relocationError = relocationError orelse Error.UnresolvedSymbol;
-
-            try self.diagnostics.flush();
-        } else {
-            try self.diagnostics.writeAll("obtuse error patching symbol ");
-            try self.diagnostics.writeAll(rel.name);
-            try self.diagnostics.writeAll(": ");
-            try self.diagnostics.writeAll(@errorName(Error.UnresolvedSymbol));
+            try self.parser.lexer.showErrorHere(self.diagnostics, Error.UnresolvedSymbol);
             relocationError = relocationError orelse Error.UnresolvedSymbol;
 
             try self.diagnostics.flush();
@@ -821,7 +802,7 @@ pub fn writeElf(self: *Assembly, io: std.Io, filepath: []const u8, elfType: c.El
 test "assembly initializes default segments" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
     try diag.flush();
 
@@ -835,10 +816,10 @@ test "assembly initializes default segments" {
 test "arbitrary sections" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section "alpha"
         \\.byte 1
         \\.section "beta"
@@ -858,10 +839,10 @@ test "arbitrary sections" {
 test "labels record correct segment and offset" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section alpha
         \\first:
         \\.byte 1
@@ -884,10 +865,10 @@ test "labels record correct segment and offset" {
 test "relocation generation" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section text
         \\lw $a0, msg($zero)
         \\.section data
@@ -907,10 +888,10 @@ test "relocation generation" {
 test "sample program" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section data
         \\msg: .nascii "To try (goodbye) (bye, bye, bye, bye, bye, bye, bye, bye)"
         \\
@@ -945,10 +926,10 @@ test "sample program" {
 test "heap_base symbol and relocation resolution" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\lw $a0, heap_base($zero)
         \\.section ".data"
@@ -999,10 +980,10 @@ test "error: label not allowed on section directive" {
     var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer stderr.deinit();
 
-    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &stderr.writer);
     defer as.deinit();
 
-    const err = as.assembleEntireFrame(std.testing.io,
+    const err = as.assembleEntireFrame(
         \\bad_label: .section ".text"
     , "<test>");
     try stderr.writer.flush();
@@ -1013,10 +994,10 @@ test "error: symbol redefined in same or different section" {
     var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer stderr.deinit();
 
-    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &stderr.writer);
     defer as.deinit();
 
-    const err = as.assembleEntireFrame(std.testing.io,
+    const err = as.assembleEntireFrame(
         \\.section ".text"
         \\my_label: add $zero, $zero, $zero
         \\my_label: addi $t0, $t0, 1
@@ -1029,10 +1010,10 @@ test "error: unresolved symbol during ELF blob creation" {
     var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer stderr.deinit();
 
-    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &stderr.writer);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\lw $a0, nonexistent_symbol($zero)
     , "<test>");
@@ -1047,10 +1028,10 @@ test "error: unresolved symbol during ELF blob creation" {
 test "immediate data directives" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".data"
         \\b1: .byte 0x11 0x22 0x33
         \\s1: .short 0x4455 0x6677
@@ -1089,10 +1070,10 @@ test "immediate data directives" {
 test "pointer data directives" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".data"
         \\.byte 0xFF
         \\p_ptr: .ptr target_sym
@@ -1127,10 +1108,10 @@ test "pointer data directives" {
 test "RType encoding" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\add $t0, $t1, $t2
         \\sll $s0, $s1, 5
@@ -1166,10 +1147,10 @@ test "RType encoding" {
 test "IType encoding" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\addi $t0, $a0, 42
         \\lci  $t1, $zero, 0x1234
@@ -1223,10 +1204,10 @@ test "IType encoding" {
 test "JType encoding" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\j 0x100
         \\jal 0x200
@@ -1256,10 +1237,10 @@ test "JType encoding" {
 test "pointer relocations on IType and JType" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\orh $t0, $zero, .hi16 target
         \\ori $t0, $t0, .lo16 target
@@ -1285,10 +1266,10 @@ test "pointer relocations on IType and JType" {
 test "relocations with nonzero addends create .rela sections in ELF" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".data"
         \\table: .word 10 20 30 40
         \\.section ".text"
@@ -1314,10 +1295,10 @@ test "relocations with nonzero addends create .rela sections in ELF" {
 test "ELF linking and relocation resolution of multiple reloc types" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".data"
         \\val: .word 0x12345678
         \\val_ptr: .ptr val
@@ -1398,10 +1379,10 @@ test "invalid alignment in pad directive" {
     var stderr = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer stderr.deinit();
 
-    var as = try Assembly.init(std.testing.allocator, &stderr.writer);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &stderr.writer);
     defer as.deinit();
 
-    const err = as.assembleEntireFrame(std.testing.io,
+    const err = as.assembleEntireFrame(
         \\.section ".data"
         \\.pad 4 4 (0)
     , "<test>");
@@ -1412,10 +1393,10 @@ test "invalid alignment in pad directive" {
 test "dynamic relocation in rtype aux" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".text"
         \\sll $t0, $t1, shift_sym
         \\shift_sym: add $zero, $zero, $zero
@@ -1430,10 +1411,10 @@ test "dynamic relocation in rtype aux" {
 test "multi-segment assembly ELF emission" {
     var yell: [64]u8 = undefined;
     var diag = std.Io.File.stderr().writer(std.testing.io, &yell);
-    var as = try Assembly.init(std.testing.allocator, &diag.interface);
+    var as = try Assembly.init(std.testing.allocator, std.testing.io, &diag.interface);
     defer as.deinit();
 
-    try as.assembleEntireFrame(std.testing.io,
+    try as.assembleEntireFrame(
         \\.section ".rodata"
         \\banner: .asciiz "overloaded record update"
         \\
